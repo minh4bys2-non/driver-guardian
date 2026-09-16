@@ -1,0 +1,33 @@
+﻿# Android
+.gradle/
+.idea/
+local.properties
+**/build/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment
+.env
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+
+# AI / Model files
+*.pt
+*.pth
+*.ckpt
+
+# Temporary files
+*.tmp
+*.temp

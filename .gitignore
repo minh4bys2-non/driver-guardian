@@ -1,20 +1,42 @@
-﻿# Android
+# Android
 .gradle/
+.kotlin/
 .idea/
 local.properties
 **/build/
+.externalNativeBuild/
+.cxx/
+*.apk
+*.aab
+*.jks
+*.keystore
 
 # Python
 .venv/
+venv/
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+*.egg-info/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+.coverage
+.coverage.*
+htmlcov/
+.ipynb_checkpoints/
 
 # Environment
 .env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
 
 # Logs
 *.log
+logs/
 
 # OS
 .DS_Store
@@ -27,6 +49,13 @@ Thumbs.db
 *.pt
 *.pth
 *.ckpt
+*.onnx
+*.tflite
+/ai/**/DataLabel_*/
+/ai/**/checkpoints*/
+/ai/**/runs/
+/ai/**/runtime/result/
+events.out.tfevents.*
 
 # Temporary files
 *.tmp

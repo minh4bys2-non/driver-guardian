@@ -1,62 +1,207 @@
-# Android
+# ==============================================================================
+# Driver Guardian .gitignore
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Android & Kotlin / JVM
+# ------------------------------------------------------------------------------
 .gradle/
+**/.gradle/
 .kotlin/
-.idea/
-local.properties
+**/.kotlin/
+build/
 **/build/
+out/
+**/out/
+local.properties
+
+# Android Studio & Gradle build outputs
+*.apk
+*.ap_
+*.aab
+*.dex
+*.class
+*.jar
+!gradle/wrapper/gradle-wrapper.jar
+
+# NDK / CMake native build artifacts
 .externalNativeBuild/
 .cxx/
-*.apk
-*.aab
+**/.cxx/
+**/CMakeFiles/
+**/CMakeCache.txt
+
+# Keystores & Signing keys
 *.jks
 *.keystore
+*.key
 
-# Python
+# Profiling & Diagnostics
+captures/
+*.hprof
+.navigation/
+lint/
+
+# ------------------------------------------------------------------------------
+# Python (Backend & AI)
+# ------------------------------------------------------------------------------
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
 .venv/
 venv/
-__pycache__/
-*.py[cod]
+env/
+ENV/
+env.bak/
+venv.bak/
+**/.venv/
+**/venv/
+
+# Packaging & Distribution
 *.egg-info/
+**/*.egg-info/
+*.egg
 dist/
+eggs/
+.eggs/
+
+# Testing & Coverage
 .pytest_cache/
+**/.pytest_cache/
 .mypy_cache/
+**/.mypy_cache/
 .ruff_cache/
-.cache/
+**/.ruff_cache/
 .coverage
 .coverage.*
 htmlcov/
+nosetests.xml
+coverage.xml
+
+# General caches
+.cache/
+**/.cache/
+.hypothesis/
+.tox/
+.nox/
+
+# Jupyter Notebook checkpoints
 .ipynb_checkpoints/
+**/.ipynb_checkpoints/
+*-checkpoint.ipynb
 
-# Environment
-.env
-.env.*
-!.env.example
-!.env.sample
-!.env.template
-
-# Logs
-*.log
-logs/
-
-# OS
-.DS_Store
-Thumbs.db
-
-# IDE
-.vscode/
-
-# AI / Model files
+# ------------------------------------------------------------------------------
+# AI Models, Weights & Datasets
+# ------------------------------------------------------------------------------
+# Model weights & serializations
 *.pt
 *.pth
 *.ckpt
 *.onnx
 *.tflite
-/ai/**/DataLabel_*/
-/ai/**/checkpoints*/
-/ai/**/runs/
-/ai/**/runtime/result/
-events.out.tfevents.*
+*.bin
+*.safetensors
+*.engine
+*.weights
+*.h5
+*.pkl
+*.pickle
+*.joblib
 
-# Temporary files
+# Checkpoints, training runs & data label directories
+**/checkpoints*/
+**/DataLabel_*/
+**/runs/
+**/runtime/result/
+dataset/
+datasets/
+**/dataset/
+**/datasets/
+
+# TensorBoard logs
+events.out.tfevents.*
+tensorboard/
+**/tensorboard/
+
+# ------------------------------------------------------------------------------
+# Backend, Database & Secrets
+# ------------------------------------------------------------------------------
+# Database files & dumps
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+*.db-wal
+*.dmp
+*.dpdump
+*.dump
+*.sql.gz
+
+# Certificates & SSL keys
+*.pem
+*.crt
+*.cer
+*.pfx
+*.p12
+
+# Environment variables
+.env
+.env.*
+*.env
+!.env.example
+!.env.sample
+!.env.template
+
+# ------------------------------------------------------------------------------
+# Logs
+# ------------------------------------------------------------------------------
+*.log
+logs/
+**/logs/
+
+# ------------------------------------------------------------------------------
+# IDEs & Code Editors
+# ------------------------------------------------------------------------------
+# JetBrains (IntelliJ, Android Studio, PyCharm)
+.idea/
+**/.idea/
+*.iml
+**/*.iml
+*.iws
+*.ipr
+cmake-build-*/
+
+# VS Code
+.vscode/
+**/.vscode/
+
+# Other editors
+*.sublime-workspace
+*.sublime-project
+
+# ------------------------------------------------------------------------------
+# Operating System & Temporary Files
+# ------------------------------------------------------------------------------
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+
+# Temporary & editor swap files
 *.tmp
 *.temp
+*~
+*.swp
+*.swo
+*.bak

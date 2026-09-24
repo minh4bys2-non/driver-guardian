@@ -5,10 +5,9 @@ import cv2
 import numpy as np
 import torch
 
-from src.model import NMSFreeDetector
-from train.dataloader_ import letterbox
-from utils.artifacts import validate_metadata
-
+from ai.ObjectDetection_2p6M.src.model import NMSFreeDetector
+from ai.ObjectDetection_2p6M.train_.dataloader_ import letterbox
+from ai.ObjectDetection_2p6M.utils.artifacts import validate_metadata
 
 class NMSFreeInference:
     def __init__(self, checkpoint_path, device=None, img_size=None, score_thres=0.25, max_det=300):
@@ -100,7 +99,7 @@ def run_camera_detection(detector, camera_id=0):
         cv2.destroyAllWindows()
 
 def main():
-    checkpoint_path = "/home/tranmanhduy/Workspace/ptithcm/TTTN/NewVersionObDetect/checkpoints/checkpoints/2bfb6cc36ef5ab822a944006c746e5d348d67e387501c9027df5b957cf124031/d9afe7f332a0080b29fdd068bbb94f32147807d062bc8dbfeb01f8b968f5ad22/train/best.pt"  # File .pt kèm architecture.json và categories.json.
+    checkpoint_path = "/home/tranmanhduy/Workspace/ptithcm/driver-guardian/ai/ObjectDetection_2p6M/checkpoints/checkpoints/2bfb6cc36ef5ab822a944006c746e5d348d67e387501c9027df5b957cf124031/de0c5b23e1ae749b972f10cb5f3e21e2ccf37bd334eb7a7c3091c460073ff310/finetune/best.pt"  # File .pt kèm architecture.json và categories.json.
     images = ["/home/tranmanhduy/Workspace/ptithcm/TTTN/NewVersionObDetect/inference/image.jpg"]  # Ví dụ: ["data/test.jpg"]; đặt camera_id=None khi dùng ảnh.
     camera_id = None
     device = "cuda"  # None: tự chọn CUDA/CPU.

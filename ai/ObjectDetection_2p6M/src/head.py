@@ -1,7 +1,7 @@
 import math
 import torch
 import torch.nn as nn
-from src.blocks import Conv, DWConv, DFL
+from ai.ObjectDetection_2p6M.src.blocks import Conv, DWConv, DFL
 
 class ScaleHead(nn.Module):
     def __init__(self, c, nc, reg_max=16):

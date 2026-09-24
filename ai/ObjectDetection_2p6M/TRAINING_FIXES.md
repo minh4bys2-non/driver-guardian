@@ -132,13 +132,13 @@ chưa match. Đây là metric nội bộ, không phải toàn bộ giao thức C
 Chạy từ thư mục gốc dự án, sau khi cấu hình đường dẫn dữ liệu:
 
 ```bash
-python -m train.training
-python -m finetune.finetune_engine
+python -m train_.training
+python -m finetune_.finetune_engine
 ```
 
 `FineTuneConfig` kế thừa nguyên các tham số model từ `TrainConfig`, giảm LR và
 số epochs, dùng thư mục dữ liệu/log riêng. Đặt `tfl_pretrained_pth` tới checkpoint
-đã ký ở đường dẫn mới bên trên. Chiến lược hai giai đoạn được đặt trong `finetune/finetune_config.py`:
+đã ký ở đường dẫn mới bên trên. Chiến lược hai giai đoạn được đặt trong `finetune_`:
 
 - `epochs=30`: tổng số epoch; `head_only_epochs=5`: số epoch giai đoạn 1.
 - Giai đoạn 1 đóng băng toàn bộ backbone/neck, kể cả BatchNorm; chỉ head học.
@@ -188,7 +188,7 @@ lần chạy toàn bộ; 2 tests pipeline CPU/CUDA đạt khi chạy lại fixtu
 ngay tại và sau mốc mở băng.
 
 
-## Tăng mẫu chứa class hiếm (`train/dataloader_.py`)
+## Tăng mẫu chứa class hiếm (`train_`)
 
 Training engine dùng `dataloaderStage1.py`. `dataloader.py` là loader thông thường.
 Cấu hình trong `src/config.py`, được `FineTuneConfig` kế thừa:
@@ -228,9 +228,9 @@ biến cùng xuất hiện trong ảnh; không bảo đảm các class có số 
 
 Validation luôn giữ phân phối dữ liệu gốc, không có tùy chọn tăng mẫu.
 Pretrain và fine-tune đều mặc định bật `train_class_sampling=True`, dùng chung
-`train/dataloader_.py` qua training engine. Pretrain đọc `data/class_sampling.jsonl`;
+`train_` qua training engine. Pretrain đọc `data/class_sampling.jsonl`;
 fine-tune đọc `data/finetune/class_sampling.jsonl` được cấu hình riêng trong
-`finetune/finetune_config.py`. File JSONL phải khớp categories của từng dataset.
+`finetune_`. File JSONL phải khớp categories của từng dataset.
 Loader kiểm tra file sampling trước khi xây index dữ liệu.
 
 Checkpoint ghi chữ ký hệ số và danh sách mẫu. Resume từ chối nếu nội dung

@@ -1,5 +1,5 @@
 import torch.nn as nn
-from src.blocks import DFL
+from ai.ObjectDetection_2p6M.src.blocks import DFL
 
 def _init_conv2d(m: nn.Conv2d):
     nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')

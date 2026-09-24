@@ -3,9 +3,9 @@ from dataclasses import dataclass, field
 @dataclass
 class TrainConfig:
     # ---- Data ----
-    # Labels và ảnh có thư mục gốc riêng, mỗi gốc gồm train/ và val/.
+    # Labels và ảnh có thư mục gốc riêng, mỗi gốc gồm train_/ và val/.
     labels_root: str = "/home/tranmanhduy/Workspace/ptithcm/TTTN/CNNModel/DataPretrain1/Object365/labels"
-    train_subdir: str = "train"
+    train_subdir: str = "train_"
     val_subdir: str = "val"
     images_info_filename: str = "images_info.jsonl"
     annotations_filename: str = "annotations.jsonl"
@@ -14,7 +14,7 @@ class TrainConfig:
     val_image_path_map_filename: str = "images_val.jsonl"
     
     images_root_dir: str = "/home/tranmanhduy/Workspace/ptithcm/TTTN/CNNModel/DataPretrain1/Object365/images"
-    images_train_subdir: str = "train"
+    images_train_subdir: str = "train_"
     images_val_subdir: str = "val"
     
     index_cache_dir: str = "/home/tranmanhduy/Workspace/ptithcm/TTTN/CNNModel/DataPretrain1/Object365/cache"     # nơi lưu byte-offset index (pickle cache)
@@ -22,8 +22,8 @@ class TrainConfig:
     max_load_retries: int = 10
     data_error_log_filename: str = "bad_samples_{split}.log"
 
-    skip_iscrowd: bool = True            # bỏ annotation iscrowd=1 khi train
-    skip_isfake: bool = True             # bỏ annotation isfake=1 khi train
+    skip_iscrowd: bool = True            # bỏ annotation iscrowd=1 khi train_
+    skip_isfake: bool = True             # bỏ annotation isfake=1 khi train_
     include_images_without_annotations: bool = False  # Giữ ảnh không còn nhãn hợp lệ sau lọc.
 
     img_size: int = 640
@@ -84,7 +84,7 @@ class TrainConfig:
     # ---- TensorBoard / Logging ----
     tb_log_dir: str = "runs"      # Thư mục lưu log TensorBoard
     log_dir: str = "./logs"       # Thư mục lưu file .log (text logging)
-    run_name: str = "train"       # Tiền tố tên file .log (train_{timestamp}.log)
+    run_name: str = "train_"       # Tiền tố tên file .log (train_{timestamp}.log)
     log_level: str = "INFO"
     log_stdout: bool = False
     log_window_size: int = 150
@@ -100,7 +100,7 @@ class TrainConfig:
     val_interval_steps: int = 1000 # số step giữa 2 lần validate
     save_ckpt_interval_steps: int = 1000 # số step giữa 2 lần lưu checkpoint định kỳ
     ckpt_dir: str = "./checkpoints"
-    resume: str = ""    # path checkpoint để resume (vd: checkpoints/last.pt), rỗng = train từ đầu
+    resume: str = ""    # path checkpoint để resume (vd: checkpoints/last.pt), rỗng = train_ từ đầu
     save_best_only: bool = False  # False -> lưu thêm checkpoint định kỳ
     ckpt_keep_last: int = 3       # số checkpoint định kỳ (theo global_step) giữ lại, <=0 = giữ hết
 

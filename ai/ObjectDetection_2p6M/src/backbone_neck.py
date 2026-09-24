@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from src.blocks import Conv, C2f, C2fCIB, SPPF, C2fPSA, SCDown
+from ai.ObjectDetection_2p6M.src.blocks import Conv, C2f, C2fCIB, SPPF, C2fPSA, SCDown
 
 class Backbone(nn.Module):
     def __init__(self, w=(64, 128, 256, 512, 1024), n=(3, 6, 6, 3)):

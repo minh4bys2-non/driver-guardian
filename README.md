@@ -4,7 +4,7 @@
 [![Topic](https://img.shields.io/badge/Topic-Driver%20Drowsiness%20Detection-blue.svg)](#-thông-tin-đề-tài)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-ee4c2c.svg)](https://pytorch.org/)
-[![FastAPI](https://img.shields.io/badge/FastAPI-0.100%2B-009688.svg)](https://fastapi.tiangolo.com/)
+[![API](https://img.shields.io/badge/API-0.100%2B-009688.svg)](https://api.tiangolo.com/)
 [![Android](https://img.shields.io/badge/Platform-Android%20Automotive%20%2F%20Mobile-green.svg)](https://source.android.com/devices/automotive)
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -32,7 +32,7 @@ Hệ thống được thiết kế hướng tới triển khai trên **thiết b
 flowchart LR
     Camera["📷 Cabin Camera"] --> EdgeAI["⚡ On-device AI Pipeline<br/>(MediaPipe + NMS-Free + HMM/FSM + LSTM)"]
     EdgeAI --> App["📱 Mobile / Android Automotive<br/>HUD & Cảnh báo đa phương thức"]
-    App -- Telemetry / Alarms --> Backend["🚀 FastAPI Backend"]
+    App -- Telemetry / Alarms --> Backend["🚀 API Backend"]
     Backend --> DB[("🗄️ Oracle Database")]
 ```
 
@@ -90,7 +90,7 @@ flowchart LR
    * Xuất mô hình chuẩn ONNX, tích hợp cơ chế kiểm tra chữ ký mã băm SHA-256 (`architecture.json`, `categories.json`) đảm bảo tính toàn vẹn mô hình.
 5. **Kiểm thử và hoàn thiện Prototype:**
    * Đánh giá hiệu năng trên các bộ dữ liệu tiêu chuẩn (NTHU-DDD, FI-DDD, VBDDD) và kiểm thử thực địa trong môi trường lái xe thực tế.
-   * Kết nối đồng bộ với FastAPI Backend và cơ sở dữ liệu Oracle Database quản lý thông tin xe, tài xế và lịch sử cảnh báo.
+   * Kết nối đồng bộ với API Backend và cơ sở dữ liệu Oracle Database quản lý thông tin xe, tài xế và lịch sử cảnh báo.
 
 ---
 
@@ -122,7 +122,7 @@ flowchart TD
     end
 
     subgraph Cloud["Hạ tầng trung tâm (Enterprise Backend)"]
-        AlertMgr -. "REST API / JSON DTO" .-> API["FastAPI Backend Server"]
+        AlertMgr -. "REST API / JSON DTO" .-> API["API Backend Server"]
         API --> Auth["Quản lý xác thực & Tài xế"]
         API --> Trip["Quản lý chuyến đi & Sự kiện vi phạm"]
         API --> DB[("Oracle Enterprise Database")]
@@ -177,7 +177,7 @@ driver-guardian/
 │
 ├── system/                            # [Hệ thống phần mềm ứng dụng]
 │   ├── android/                       # Ứng dụng Android / Android Automotive Client
-│   ├── backend/                       # Dịch vụ FastAPI REST API Server
+│   ├── backend/                       # Dịch vụ API REST API Server
 │   ├── database/                      # Cấu hình & Schema Oracle Database
 │   └── docs/                          # Tài liệu kỹ thuật hệ thống
 │
@@ -224,7 +224,7 @@ source venv/bin/activate
 # Cài đặt các thư viện cần thiết
 pip install --upgrade pip
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
-pip install opencv-python mediapipe onnxruntime numpy scipy fastapi uvicorn pydantic
+pip install opencv-python mediapipe onnxruntime numpy scipy api uvicorn pydantic
 ```
 
 ### 3. Chạy thử nghiệm nhánh Phân tích thể chất (Physical Branch)
@@ -248,7 +248,7 @@ cd ai/ObjectDetection_2p6M/runtime
 python3 inferenceOnnx.py --backbone backbone_neck.onnx --head head.onnx --source 0
 ```
 
-### 5. Khởi chạy FastAPI Backend
+### 5. Khởi chạy API Backend
 
 ```bash
 cd system/backend

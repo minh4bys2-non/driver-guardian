@@ -79,7 +79,7 @@ Không giống như các mô hình thông thường chỉ nạp file `.pt` đơn
 * Tên file mặc định trong repo là `model_mainfest.json` (chú ý ký tự `mainfest`).
 * File này cho phép khởi tạo mô hình một cách linh hoạt mà không cần hardcode tham số trong Python:
   ```python
-  model = NMSFreeDetector.from_config("checkpoints_ftCOCO/model_mainfest.json")
+  model = NMSFreeDetector.from_config("checkpoints/model_mainfest.json")
   ```
 * Nội dung chứa định nghĩa cấu hình mạng 24M:
   ```json
@@ -116,7 +116,7 @@ Không giống như các mô hình thông thường chỉ nạp file `.pt` đơn
 
 ## 4. Hướng Dẫn Sắp Xếp File Khi Tải Về
 
-Khi bạn clone repository từ GitHub, thư mục `checkpoints_ftCOCO/` sẽ **chưa có file `.pt`** (hoặc chưa tồn tại).
+Khi bạn clone repository từ GitHub, thư mục `checkpoints` sẽ **chưa có file `.pt`** (hoặc chưa tồn tại).
 
 ### Bước 1: Chuẩn bị thư mục và giải nén / đặt file
 Tùy theo nguồn nhận dữ liệu:
@@ -124,12 +124,12 @@ Tùy theo nguồn nhận dữ liệu:
 * **Nếu bạn nhận được file nén `checkpoints_ftCOCO.tar.xz`**:
   Chạy lệnh sau tại thư mục gốc `ai/ObjectDetection_24M`:
   ```bash
-  tar -xf checkpoints_ftCOCO.tar.xz
+  tar -xf checkpoints.tar.xz
   ```
-  Lệnh này sẽ tự động giải nén ra thư mục `checkpoints_ftCOCO/` với đầy đủ 3 file cần thiết.
+  Lệnh này sẽ tự động giải nén ra thư mục `checkpoints` với đầy đủ 3 file cần thiết.
 
 * **Nếu bạn tải các file lẻ từ Google Drive / Cloud Storage**:
-  Tạo thư mục `checkpoints_ftCOCO/` ngay trong `ai/ObjectDetection_24M/` và đặt 3 file vào:
+  Tạo thư mục `checkpoints` ngay trong `ai/ObjectDetection_24M/` và đặt 3 file vào:
   ```text
   ai/ObjectDetection_24M/
   └── checkpoints_ftCOCO/
@@ -140,9 +140,9 @@ Tùy theo nguồn nhận dữ liệu:
 
 ### Bước 2: Kiểm tra tính sẵn sàng của các file
 Đảm bảo các file sau đã có mặt trước khi chạy code:
-1. `checkpoints_ftCOCO/model_mainfest.json`
-2. `checkpoints_ftCOCO/categories.jsonl`
-3. `checkpoints_ftCOCO/ft_step00091000.pt`
+1. `checkpoints`
+2. `checkpoints`
+3. `checkpoints`
 
 ---
 
@@ -155,19 +155,19 @@ Mở file [infer.py](file:///home/tranmanhduy/Workspace/ptithcm/driver-guardian/
 
 ```python
 # Cấu hình đường dẫn phù hợp với vị trí repo của bạn
-config_path = "checkpoints_ftCOCO/model_mainfest.json"
-categories_path = "checkpoints_ftCOCO/categories.jsonl"
-checkpoint_path = "checkpoints_ftCOCO/ft_step00091000.pt"
+config_path = "checkpoints/model_mainfest.json"
+categories_path = "checkpoints/categories.jsonl"
+checkpoint_path = "checkpoints/ft_step00091000.pt"
 
 model = NMSFreeDetector.from_config(config_path)
 detector = NMSFreeInference(
-    model=model,
-    categories_path=categories_path,
-    img_size=480,
-    device="cuda",          # Chọn "cuda" hoặc "cpu"
-    checkpoint_path=checkpoint_path,
-    score_thres=0.25,
-    max_det=30,
+  model=model,
+  categories_path=categories_path,
+  img_size=480,
+  device="cuda",  # Chọn "cuda" hoặc "cpu"
+  checkpoint_path=checkpoint_path,
+  score_thres=0.25,
+  max_det=30,
 )
 ```
 
@@ -181,15 +181,15 @@ python -m src.runtime.infer
 Mở file [runcamera.py](file:///home/tranmanhduy/Workspace/ptithcm/driver-guardian/ai/ObjectDetection_24M/src/runtime/runcamera.py), kiểm tra phần cấu hình:
 
 ```python
-model = NMSFreeDetector()   # Hoặc NMSFreeDetector.from_config("checkpoints_ftCOCO/model_mainfest.json")
+model = NMSFreeDetector()  # Hoặc NMSFreeDetector.from_config("checkpoints/model_mainfest.json")
 detector = NMSFreeInference(
-    model=model,
-    categories_path="checkpoints_ftCOCO/categories.jsonl",
-    checkpoint_path="checkpoints_ftCOCO/ft_step00091000.pt",
-    img_size=480,
-    device="cuda",          # "cuda" hoặc "cpu"
-    score_thres=0.4,
-    use_nms=False
+  model=model,
+  categories_path="checkpoints/categories.jsonl",
+  checkpoint_path="checkpoints/ft_step00091000.pt",
+  img_size=480,
+  device="cuda",  # "cuda" hoặc "cpu"
+  score_thres=0.4,
+  use_nms=False
 )
 
 # Chạy với Webcam ID 0
@@ -208,7 +208,7 @@ python -m src.runtime.runcamera
 
 Nếu bạn chỉ tải được duy nhất file checkpoint `.pt` mà không có các file metadata đi kèm, bạn có thể tự tạo chúng theo mẫu dưới đây:
 
-### 6.1. Tạo file `checkpoints_ftCOCO/model_mainfest.json`
+### 6.1. Tạo file `checkpoints`
 Tạo file với nội dung chuẩn của mô hình 24M:
 ```json
 {
@@ -225,7 +225,7 @@ Tạo file với nội dung chuẩn của mô hình 24M:
 }
 ```
 
-### 6.2. Tạo file `checkpoints_ftCOCO/categories.jsonl`
+### 6.2. Tạo file `checkpoints`
 Mỗi dòng là một đối tượng JSON (chú ý đúng 80 lớp COCO, bắt đầu từ id 0):
 ```jsonl
 {"name": "aeroplane", "id": 0}
@@ -243,8 +243,8 @@ Mỗi dòng là một đối tượng JSON (chú ý đúng 80 lớp COCO, bắt 
 | Bước | Hành động | Chi tiết |
 | :--- | :--- | :--- |
 | **1** | Clone repository | `git clone ...` |
-| **2** | Giải nén hoặc tạo folder | Giải nén `checkpoints_ftCOCO.tar.xz` hoặc tạo folder `checkpoints_ftCOCO/` |
-| **3** | Đặt file checkpoint | Đặt `ft_step00091000.pt`, `model_mainfest.json`, `categories.jsonl` vào `checkpoints_ftCOCO/` |
+| **2** | Giải nén hoặc tạo folder | Giải nén `checkpoints_ftCOCO.tar.xz` hoặc tạo folder `checkpoints` |
+| **3** | Đặt file checkpoint | Đặt `ft_step00091000.pt`, `model_mainfest.json`, `categories.jsonl` vào `checkpoints` |
 | **4** | Cài đặt dependencies | `pip install torch torchvision opencv-python matplotlib numpy albumentations` |
 | **5** | Kiểm tra đường dẫn | Sửa đường dẫn file trong `src/runtime/infer.py` hoặc `runcamera.py` |
 | **6** | Chạy thử nghiệm | `python -m src.runtime.infer` |

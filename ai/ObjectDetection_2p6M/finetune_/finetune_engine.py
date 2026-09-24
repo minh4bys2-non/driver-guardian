@@ -1,11 +1,10 @@
 import logging
-
 import torch
 
-from finetune.finetune_config import FineTuneConfig
-from src.model import NMSFreeDetector
-from train.engine import get_optimizer, run_training
-from utils.artifacts import architecture, validate_metadata
+from ai.ObjectDetection_2p6M.finetune_.finetune_config import FineTuneConfig
+from ai.ObjectDetection_2p6M.src.model import NMSFreeDetector
+from ai.ObjectDetection_2p6M.train_.engine import get_optimizer, run_training
+from ai.ObjectDetection_2p6M.utils.artifacts import architecture, validate_metadata
 
 class FineTuneDetector(NMSFreeDetector):
     def train(self, mode=True):
@@ -32,9 +31,9 @@ def get_finetune_model(cfg: FineTuneConfig):
         model = FineTuneDetector(**source["architecture"], img_size=cfg.img_size)
         model.load_state_dict(checkpoint.get("ema") or checkpoint["model"])
         if source["categories_sha256"] != target["categories_sha256"]:
-            model.replace_head(nc=cfg.nc, img_size=cfg.img_size)
-            logging.getLogger("train").info(
-                "[finetune] Nạp backbone/neck pretrained, khởi tạo head mới: nc=%s -> %s; categories đã đổi",
+            model.replace_head(nc=cfg.nc, replace_all=False)
+            logging.getLogger("train_").info(
+                "[finetune_] Giữ pretrained, chỉ khởi tạo output cls mới: nc=%s -> %s; categories đã đổi",
                 source["architecture"]["nc"], cfg.nc)
 
     set_finetune_stage(model, cfg, 0)
@@ -46,8 +45,8 @@ def set_finetune_stage(model, cfg, epoch):
     model.head.requires_grad_(True)
     model.head.dfl.requires_grad_(False)
     model.train(model.training)
-    logging.getLogger("train").info(
-        "[finetune] epoch=%s stage=%s trunk_lr_factor=%s",
+    logging.getLogger("train_").info(
+        "[finetune_] epoch=%s stage=%s trunk_lr_factor=%s",
         epoch + 1, 1 if frozen else 2, 0 if frozen else cfg.trunk_lr_factor)
 
 def get_finetune_optimizer(model, cfg):

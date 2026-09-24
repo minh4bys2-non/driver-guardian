@@ -9,7 +9,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from src.config import TrainConfig
 
-_log = logging.getLogger("train")
+_log = logging.getLogger("train_")
 
 class TrainingLogger:
     """TensorBoard logger for training, model and system metrics."""
@@ -40,8 +40,8 @@ class TrainingLogger:
             if param.requires_grad
         }
 
-    def log_losses(self, items: dict, step: int, phase: str = "train") -> None:
-        if phase not in {"train", "val", "finetune_train", "finetune_val"}:
+    def log_losses(self, items: dict, step: int, phase: str = "train_") -> None:
+        if phase not in {"train_", "val", "finetune_train", "finetune_val"}:
             raise ValueError(f"Invalid phase: {phase}")
         groups = {
             "loss_total": {
@@ -60,7 +60,7 @@ class TrainingLogger:
         for name, values in groups.items():
             self.writer.add_scalars(f"{phase}/{name}", values, step)
 
-    def log_loss_ratios(self, items: dict, step: int, phase: str = "train") -> None:
+    def log_loss_ratios(self, items: dict, step: int, phase: str = "train_") -> None:
         total = items["loss"] + 1e-8
         self.writer.add_scalars(
             f"{phase}/loss_ratios",

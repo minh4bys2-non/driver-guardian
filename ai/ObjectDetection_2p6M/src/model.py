@@ -1,9 +1,9 @@
 import torch
 import torch.nn as nn
-from src.backbone_neck import Backbone, PAFPN
-from src.head import DetectHead
-from src.config import TrainConfig
-from utils.init_weights import initialize_weights, initialize_detection_head
+from ai.ObjectDetection_2p6M.src.backbone_neck import Backbone, PAFPN
+from ai.ObjectDetection_2p6M.src.head import DetectHead
+from ai.ObjectDetection_2p6M.src.config import TrainConfig
+from ai.ObjectDetection_2p6M.utils.init_weights import initialize_weights, initialize_detection_head
 import json
 
 class NMSFreeDetector(nn.Module):

@@ -7,7 +7,7 @@ Mô hình phát hiện đối tượng NMS-Free bằng PyTorch, gồm backbone, 
 - `src/`: kiến trúc mô hình, cấu hình và bộ đọc dữ liệu Object365.
 - `src/runtime/`: nhận diện trên ảnh và webcam.
 - `delete/`: mã huấn luyện cũ, hiện chưa đầy đủ module phụ thuộc.
-- `checkpoints_ftCOCO/`: trọng số và metadata mô hình, không đưa lên Git.
+- `checkpoints`: trọng số và metadata mô hình, không đưa lên Git.
 
 ## Chạy nhận diện
 

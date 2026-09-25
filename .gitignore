@@ -23,6 +23,7 @@ local.properties
 *.class
 *.jar
 !gradle/wrapper/gradle-wrapper.jar
+!**/gradle/wrapper/gradle-wrapper.jar
 
 # NDK / CMake native build artifacts
 .externalNativeBuild/

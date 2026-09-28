@@ -2,6 +2,7 @@ package com.example.driverguardian.ai.contract.drowsiness
 
 import com.example.driverguardian.ai.runtime.ModelMetadata
 import com.example.driverguardian.ai.runtime.RuntimeTensorType
+import org.jetbrains.annotations.TestOnly
 
 /** Validates the known semantic tensor contract without guessing ONNX node names. */
 class DrowsinessModelContract(private val mapping: DrowsinessInputMapping = DrowsinessInputMapping.Unresolved) : ModelContract {
@@ -45,5 +46,10 @@ class DrowsinessModelContract(private val mapping: DrowsinessInputMapping = Drow
         }
         val semanticValid = messages.isEmpty() && metadataStatus == MetadataStatus.VALID
         return ContractValidationResult(metadataStatus, if (semanticValid) SemanticStatus.RESOLVED else SemanticStatus.INVALID, messages)
+    }
+    @TestOnly
+    fun testQuickLogic() {
+        val result = "Hello"
+        println("Result: $result")
     }
 }

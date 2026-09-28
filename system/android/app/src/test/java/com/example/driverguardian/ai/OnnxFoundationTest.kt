@@ -46,6 +46,27 @@ class OnnxFoundationTest {
         assertEquals(ParityStatus.NOT_RUN, GoldenVectorRunner.compare(case, close, NumericalTolerance.Unconfigured).status)
     }
 
+    @Test fun parityRejectsMissingReferencesAndDuplicateActualOutputs() {
+        val tolerance = NumericalTolerance.Configured(0.001, 0.0)
+        val actual = RuntimeInferenceResult(1, listOf(output(floatArrayOf(1f))))
+        val empty = GoldenTestCase("empty", emptyMap(), emptyMap())
+        assertEquals(ParityStatus.ERROR, GoldenVectorRunner.compare(empty, actual, tolerance).status)
+        val reference = empty.copy(expectedOutputs = mapOf("score" to floatArrayOf(1f)))
+        val duplicate = actual.copy(outputs = listOf(output(floatArrayOf(2f)), output(floatArrayOf(1f))))
+        assertEquals(ParityStatus.ERROR, GoldenVectorRunner.compare(reference, duplicate, tolerance).status)
+        assertEquals(ParityStatus.ERROR, GoldenVectorRunner.compare(reference, actual.copy(outputs = emptyList()), tolerance).status)
+        assertEquals(ParityStatus.FAIL, GoldenVectorRunner.compare(reference, actual.copy(outputs = listOf(output(floatArrayOf(1f, 2f)))), tolerance).status)
+    }
+
+    @Test fun parityRejectsNonFiniteValues() {
+        val tolerance = NumericalTolerance.Configured(0.001, 0.0)
+        for (value in listOf(Float.NaN, Float.POSITIVE_INFINITY, Float.NEGATIVE_INFINITY)) {
+            val reference = GoldenTestCase("nonfinite", emptyMap(), mapOf("score" to floatArrayOf(value)))
+            val actual = RuntimeInferenceResult(1, listOf(output(floatArrayOf(value))))
+            assertEquals(ParityStatus.FAIL, GoldenVectorRunner.compare(reference, actual, tolerance).status)
+        }
+    }
+
     @Test fun previewIsTruncatedAtRequestedLimit() {
         val preview = TensorPreviewFactory.fromFloats(floatArrayOf(1f, 2f, 3f), 2)
         assertEquals(listOf("1.0", "2.0"), preview.values)

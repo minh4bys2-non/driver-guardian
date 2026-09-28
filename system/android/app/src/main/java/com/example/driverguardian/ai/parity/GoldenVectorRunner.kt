@@ -6,7 +6,9 @@ import com.example.driverguardian.ai.runtime.RuntimeInferenceResult
 object GoldenVectorRunner {
     fun compare(testCase: GoldenTestCase, actual: RuntimeInferenceResult, tolerance: NumericalTolerance): ParityResult {
         if (tolerance !is NumericalTolerance.Configured) return ParityResult(ParityStatus.NOT_RUN, message = "Numerical tolerance is unconfigured.")
+        if (testCase.expectedOutputs.isEmpty()) return ParityResult(ParityStatus.ERROR, message = "No expected outputs are configured.")
         val outputs = actual.outputs.associateBy { it.name }
+        if (outputs.size != actual.outputs.size) return ParityResult(ParityStatus.ERROR, message = "Actual output names are duplicated.")
         val comparisons = mutableListOf<OutputComparison>()
         for ((name, expected) in testCase.expectedOutputs) {
             val values = outputs[name]?.floatValues ?: return ParityResult(ParityStatus.ERROR, comparisons, "Float output '$name' is unavailable.")

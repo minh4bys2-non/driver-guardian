@@ -18,7 +18,7 @@ internal class OnnxModelSession private constructor(
     val metadata: ModelMetadata,
 ) : AutoCloseable {
 
-    fun run(inputs: Map<String, TensorData>): RuntimeResult<RuntimeInferenceResult> {
+    fun run(inputs: Map<String, TensorData>, captureFullOutputs: Boolean = false): RuntimeResult<RuntimeInferenceResult> {
         validateInputs(inputs)?.let { return RuntimeResult.Failure(it) }
         val nativeInputs = linkedMapOf<String, OnnxTensor>()
         return try {
@@ -37,7 +37,7 @@ internal class OnnxModelSession private constructor(
                     val actualShape = (entry.value.info as? TensorInfo)?.shape?.toList() ?: declared?.shape.orEmpty()
                     val floatCapture = (entry.value as? OnnxTensor)
                         ?.takeIf { declared?.type == RuntimeTensorType.FLOAT }
-                        ?.let(::captureFloats)
+                        ?.let { captureFloats(it, captureFullOutputs) }
                     val value = if (floatCapture == null) entry.value.value else null
                     RuntimeOutput(
                         name = entry.key,
@@ -70,6 +70,7 @@ internal class OnnxModelSession private constructor(
             val count = TensorShape.checkedElementCount(data.shape)
                 ?: return RuntimeError.TensorShapeMismatch(name, input.shape, data.shape)
             if (count != floatData.values.size.toLong()) return RuntimeError.TensorShapeMismatch(name, input.shape, data.shape)
+            if (count > Int.MAX_VALUE / Float.SIZE_BYTES) return RuntimeError.InferenceFailure("Input '$name' exceeds the byte buffer capacity")
         }
         return null
     }
@@ -86,8 +87,9 @@ internal class OnnxModelSession private constructor(
             if (modelBytes.isEmpty()) return RuntimeResult.Failure(RuntimeError.InvalidModel("Model bytes are empty"))
             val start = System.nanoTime()
             val options = OrtSession.SessionOptions()
+            var session: OrtSession? = null
             return try {
-                val session = environment.createSession(modelBytes, options)
+                session = environment.createSession(modelBytes, options)
                 val metadata = ModelMetadata(
                     modelName = modelName,
                     inputs = session.inputInfo.map { OrtTypeMapper.metadata(it.key, it.value) },
@@ -96,19 +98,20 @@ internal class OnnxModelSession private constructor(
                 )
                 RuntimeResult.Success(OnnxModelSession(environment, options, session, metadata))
             } catch (throwable: Throwable) {
+                runCatching { session?.close() }
                 runCatching { options.close() }
                 RuntimeResult.Failure(RuntimeError.SessionCreationFailure(throwable.message ?: "Could not create ONNX session", throwable))
             }
         }
 
-        private fun captureFloats(tensor: OnnxTensor): Pair<FloatArray?, TensorPreview> {
+        private fun captureFloats(tensor: OnnxTensor, captureFullOutputs: Boolean): Pair<FloatArray?, TensorPreview> {
             val buffer = tensor.floatBuffer
             val total = buffer.remaining()
             val previewCount = minOf(total, TensorPreviewFactory.DEFAULT_LIMIT)
             val previewValues = FloatArray(previewCount)
             buffer.duplicate().get(previewValues)
             val preview = TensorPreview(previewValues.map(Float::toString), total.toLong(), total > previewCount)
-            val full = if (total <= MAX_CAPTURED_FLOATS) FloatArray(total).also { buffer.duplicate().get(it) } else null
+            val full = if (captureFullOutputs || total <= MAX_CAPTURED_FLOATS) FloatArray(total).also { buffer.duplicate().get(it) } else null
             return full to preview
         }
     }

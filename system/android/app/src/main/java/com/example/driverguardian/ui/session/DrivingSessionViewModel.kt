@@ -77,7 +77,11 @@ class DrivingSessionViewModel(
                     it.copy(
                         activeSession = result.value,
                         lastEvent = null,
+                        completedSession = null,
+                        completedSessionEvents = emptyList(),
                         eventSubmissionState = EventSubmissionState.Idle,
+                        completionState = CompletionState.Idle,
+                        acknowledgementState = AcknowledgementState.Idle,
                         sessionSubmissionState = SessionSubmissionState.Success
                     )
                 }
@@ -90,6 +94,86 @@ class DrivingSessionViewModel(
 
     fun submitDangerEvent(confidence: Double?, durationMs: Int?) {
         submitEvent(DriverState.Danger, confidence, durationMs)
+    }
+
+    fun finishSession() {
+        val currentState = mutableUiState.value
+        val session = currentState.activeSession
+        if (session == null) {
+            mutableUiState.update { it.copy(completionState = CompletionState.Error("Chưa có phiên lái đang hoạt động.")) }
+            return
+        }
+        if (currentState.completionState == CompletionState.Submitting) return
+        val alreadyCompleted = currentState.completedSession?.takeIf { it.id == session.id }
+        mutableUiState.update { it.copy(completionState = CompletionState.Submitting) }
+        viewModelScope.launch {
+            if (alreadyCompleted != null) {
+                loadCompletedSessionEvents(alreadyCompleted)
+                return@launch
+            }
+            when (val completion = repository.completeSession(session.id)) {
+                is RepositoryResult.Error -> updateCompletionIfCurrent(session.id) {
+                    it.copy(completionState = CompletionState.Error(completion.message))
+                }
+                is RepositoryResult.Success -> {
+                    if (mutableUiState.value.activeSession?.id != session.id) return@launch
+                    mutableUiState.update {
+                        it.copy(
+                            activeSession = completion.value,
+                            completedSession = completion.value,
+                            completedSessionEvents = emptyList()
+                        )
+                    }
+                    loadCompletedSessionEvents(completion.value)
+                }
+            }
+        }
+    }
+
+    private suspend fun loadCompletedSessionEvents(completedSession: com.example.driverguardian.domain.model.DrivingSession) {
+        when (val events = repository.getSessionEvents(completedSession.id)) {
+            is RepositoryResult.Error -> updateCompletionIfCurrent(completedSession.id) {
+                it.copy(completionState = CompletionState.Error(events.message))
+            }
+            is RepositoryResult.Success -> updateCompletionIfCurrent(completedSession.id) {
+                it.copy(
+                    completedSessionEvents = events.value,
+                    completionState = CompletionState.Success
+                )
+            }
+        }
+    }
+
+    fun acknowledgeLastEvent() {
+        val event = mutableUiState.value.lastEvent
+        if (event == null) {
+            mutableUiState.update { it.copy(acknowledgementState = AcknowledgementState.Error("Không có cảnh báo cần xác nhận.")) }
+            return
+        }
+        if (mutableUiState.value.acknowledgementState == AcknowledgementState.Submitting) return
+        mutableUiState.update { it.copy(acknowledgementState = AcknowledgementState.Submitting) }
+        viewModelScope.launch {
+            when (val result = repository.acknowledgeEvent(event.id)) {
+                is RepositoryResult.Success -> mutableUiState.update {
+                    if (it.lastEvent?.id != event.id) it else it.copy(
+                        lastEvent = result.value,
+                        acknowledgementState = AcknowledgementState.Success
+                    )
+                }
+                is RepositoryResult.Error -> mutableUiState.update {
+                    if (it.lastEvent?.id != event.id) it else {
+                        it.copy(acknowledgementState = AcknowledgementState.Error(result.message))
+                    }
+                }
+            }
+        }
+    }
+
+    private inline fun updateCompletionIfCurrent(
+        sessionId: Int,
+        transform: (DrivingSessionUiState) -> DrivingSessionUiState
+    ) {
+        mutableUiState.update { if (it.activeSession?.id == sessionId) transform(it) else it }
     }
 
     fun submitEvent(driverState: DriverState, confidence: Double?, durationMs: Int?) {
@@ -137,6 +221,14 @@ class DrivingSessionViewModel(
 
     fun consumeEventSubmission() {
         mutableUiState.update { it.copy(eventSubmissionState = EventSubmissionState.Idle) }
+    }
+
+    fun consumeAcknowledgement() {
+        mutableUiState.update { it.copy(acknowledgementState = AcknowledgementState.Idle) }
+    }
+
+    fun consumeCompletion() {
+        mutableUiState.update { it.copy(completionState = CompletionState.Idle) }
     }
 }
 

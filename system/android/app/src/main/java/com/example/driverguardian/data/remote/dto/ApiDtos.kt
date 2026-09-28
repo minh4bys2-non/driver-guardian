@@ -4,6 +4,7 @@ import com.example.driverguardian.domain.model.Driver
 import com.example.driverguardian.domain.model.DrowsinessEvent
 import com.example.driverguardian.domain.model.DrivingSession
 import com.example.driverguardian.domain.model.ModelVersion
+import com.example.driverguardian.domain.model.TripSession
 import com.example.driverguardian.domain.model.Vehicle
 import com.google.gson.annotations.SerializedName
 
@@ -52,6 +53,26 @@ data class DrivingSessionResponseDto(
     @SerializedName("duration_seconds") val durationSeconds: Int,
     @SerializedName("total_alerts") val totalAlerts: Int,
     @SerializedName("status") val status: String,
+    @SerializedName("sync_status") val syncStatus: String,
+    @SerializedName("end_time") val endTime: String? = null,
+    @SerializedName("safety_score") val safetyScore: Double? = null
+)
+
+data class TripSessionResponseDto(
+    @SerializedName("session_id") val sessionId: Int,
+    @SerializedName("driver_id") val driverId: Int,
+    @SerializedName("driver_name") val driverName: String,
+    @SerializedName("vehicle_id") val vehicleId: Int,
+    @SerializedName("vehicle_name") val vehicleName: String?,
+    @SerializedName("plate_number") val plateNumber: String,
+    @SerializedName("model_version_id") val modelVersionId: Int?,
+    @SerializedName("version_name") val versionName: String?,
+    @SerializedName("start_time") val startTime: String,
+    @SerializedName("end_time") val endTime: String?,
+    @SerializedName("duration_seconds") val durationSeconds: Int,
+    @SerializedName("total_alerts") val totalAlerts: Int,
+    @SerializedName("safety_score") val safetyScore: Double?,
+    @SerializedName("status") val status: String,
     @SerializedName("sync_status") val syncStatus: String
 )
 
@@ -70,6 +91,10 @@ data class DrowsinessEventResponseDto(
     @SerializedName("driver_state") val driverState: String,
     @SerializedName("alert_level") val alertLevel: Int,
     @SerializedName("confidence") val confidence: Double?,
+    @SerializedName("drowsiness_score") val drowsinessScore: Double? = null,
+    @SerializedName("ear_value") val earValue: Double? = null,
+    @SerializedName("mar_value") val marValue: Double? = null,
+    @SerializedName("head_pose") val headPose: String? = null,
     @SerializedName("duration_ms") val durationMs: Int?,
     @SerializedName("acknowledged") val acknowledged: String,
     @SerializedName("sync_status") val syncStatus: String
@@ -78,5 +103,36 @@ data class DrowsinessEventResponseDto(
 fun DriverResponseDto.toDomain() = Driver(driverId, driverCode, fullName, phoneNumber, licenseNumber, status, createdAt)
 fun VehicleResponseDto.toDomain() = Vehicle(vehicleId, plateNumber, vehicleName, vehicleType, deviceCode, status, createdAt)
 fun ModelVersionResponseDto.toDomain() = ModelVersion(modelVersionId, versionName, modelType, fileName, description, isActive, deployedAt)
-fun DrivingSessionResponseDto.toDomain() = DrivingSession(sessionId, driverId, vehicleId, modelVersionId, startTime, durationSeconds, totalAlerts, status, syncStatus)
-fun DrowsinessEventResponseDto.toDomain() = DrowsinessEvent(eventId, sessionId, eventTime, driverState, alertLevel, confidence, durationMs, acknowledged, syncStatus)
+fun DrivingSessionResponseDto.toDomain() = DrivingSession(
+    id = sessionId,
+    driverId = driverId,
+    vehicleId = vehicleId,
+    modelVersionId = modelVersionId,
+    startTime = startTime,
+    durationSeconds = durationSeconds,
+    totalAlerts = totalAlerts,
+    status = status,
+    syncStatus = syncStatus,
+    endTime = endTime,
+    safetyScore = safetyScore
+)
+fun TripSessionResponseDto.toDomain() = TripSession(
+    sessionId, driverId, driverName, vehicleId, vehicleName, plateNumber,
+    modelVersionId, versionName, startTime, endTime, durationSeconds,
+    totalAlerts, safetyScore, status, syncStatus
+)
+fun DrowsinessEventResponseDto.toDomain() = DrowsinessEvent(
+    id = eventId,
+    sessionId = sessionId,
+    eventTime = eventTime,
+    driverState = driverState,
+    alertLevel = alertLevel,
+    confidence = confidence,
+    durationMs = durationMs,
+    acknowledged = acknowledged,
+    syncStatus = syncStatus,
+    drowsinessScore = drowsinessScore,
+    earValue = earValue,
+    marValue = marValue,
+    headPose = headPose
+)

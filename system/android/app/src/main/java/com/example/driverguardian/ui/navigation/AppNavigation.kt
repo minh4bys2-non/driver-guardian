@@ -51,6 +51,8 @@ import com.example.driverguardian.ui.screens.selection.SelectionScreen
 import com.example.driverguardian.ui.screens.settings.SettingsScreen
 import com.example.driverguardian.ui.screens.summary.TripSummaryScreen
 import com.example.driverguardian.ui.screens.system.SystemInfoScreen
+import com.example.driverguardian.ui.history.TripHistoryViewModel
+import com.example.driverguardian.ui.history.TripHistoryViewModelFactory
 import com.example.driverguardian.ui.session.DrivingSessionUiState
 import com.example.driverguardian.ui.session.DrivingSessionViewModel
 import com.example.driverguardian.ui.session.DrivingSessionViewModelFactory
@@ -59,14 +61,17 @@ import com.example.driverguardian.ui.session.DrivingSessionViewModelFactory
 fun DriverGuardianApp() {
     val navController = rememberNavController()
     val snackbarHostState = remember { SnackbarHostState() }
+    val repository = remember {
+        NetworkDriverGuardianRepository(ApiClient.create(BuildConfig.API_BASE_URL))
+    }
     val sessionViewModel: DrivingSessionViewModel = viewModel(
-        factory = remember {
-            DrivingSessionViewModelFactory(
-                NetworkDriverGuardianRepository(ApiClient.create(BuildConfig.API_BASE_URL))
-            )
-        }
+        factory = remember { DrivingSessionViewModelFactory(repository) }
+    )
+    val historyViewModel: TripHistoryViewModel = viewModel(
+        factory = remember { TripHistoryViewModelFactory(repository) }
     )
     val sessionUiState by sessionViewModel.uiState.collectAsStateWithLifecycle()
+    val historyUiState by historyViewModel.uiState.collectAsStateWithLifecycle()
     val backStackEntry by navController.currentBackStackEntryAsState()
     val currentRoute = backStackEntry?.destination?.route
     val showSidebar = currentRoute != Screen.DangerAlert.route
@@ -92,6 +97,8 @@ fun DriverGuardianApp() {
                         snackbarHostState = snackbarHostState,
                         sessionUiState = sessionUiState,
                         sessionViewModel = sessionViewModel,
+                        historyViewModel = historyViewModel,
+                        historyUiState = historyUiState,
                         modifier = Modifier
                             .weight(1f)
                             .fillMaxSize()
@@ -157,6 +164,8 @@ private fun AppNavHost(
     snackbarHostState: SnackbarHostState,
     sessionUiState: DrivingSessionUiState,
     sessionViewModel: DrivingSessionViewModel,
+    historyViewModel: TripHistoryViewModel,
+    historyUiState: com.example.driverguardian.ui.history.TripHistoryUiState,
     modifier: Modifier = Modifier
 ) {
     NavHost(
@@ -203,28 +212,45 @@ private fun AppNavHost(
                     sessionViewModel.consumeEventSubmission()
                     navController.safeNavigate(Screen.DangerAlert.route)
                 },
-                onFinishTrip = { navController.safeNavigate(Screen.TripSummary.route) }
+                onFinishTrip = sessionViewModel::finishSession,
+                onTripCompleted = {
+                    sessionViewModel.consumeCompletion()
+                    navController.safeNavigate(Screen.TripSummary.route)
+                }
             )
         }
         composable(Screen.DangerAlert.route) {
             DangerAlertScreen(
                 sessionState = sessionUiState,
                 snackbarHostState = snackbarHostState,
-                onDismiss = { navController.popBackStack() }
+                onAcknowledge = sessionViewModel::acknowledgeLastEvent,
+                onDismiss = {
+                    sessionViewModel.consumeAcknowledgement()
+                    navController.popBackStack()
+                }
             )
         }
         composable(Screen.TripSummary.route) {
             TripSummaryScreen(
+                sessionState = sessionUiState,
                 snackbarHostState = snackbarHostState,
                 onHome = { navController.safeNavigate(Screen.Home.route) },
-                onDetail = { navController.safeNavigate(Screen.TripDetail.createRoute("1")) }
+                onDetail = { id -> navController.safeNavigate(Screen.TripDetail.createRoute(id.toString())) }
             )
         }
         composable(Screen.TripHistory.route) {
-            TripHistoryScreen(onDetail = { navController.safeNavigate(Screen.TripDetail.createRoute(it)) })
+            TripHistoryScreen(
+                state = historyUiState,
+                onLoad = historyViewModel::loadHistory,
+                onDetail = { navController.safeNavigate(Screen.TripDetail.createRoute(it.toString())) }
+            )
         }
         composable(Screen.TripDetail.route) {
-            TripDetailScreen(id = it.arguments?.getString("id") ?: "1")
+            TripDetailScreen(
+                id = it.arguments?.getString("id")?.toIntOrNull(),
+                state = historyUiState,
+                onLoad = historyViewModel::loadDetail
+            )
         }
         composable(Screen.Analytics.route) {
             AnalyticsScreen()

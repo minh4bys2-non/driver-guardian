@@ -61,7 +61,11 @@ class BackendSmokeTest(unittest.IsolatedAsyncioTestCase):
                 "/vehicles",
                 "/model-versions/active",
                 "/sessions",
+                "/sessions/{session_id}",
+                "/sessions/{session_id}/complete",
+                "/sessions/{session_id}/events",
                 "/events",
+                "/events/{event_id}/acknowledge",
             },
         )
 

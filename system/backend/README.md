@@ -6,9 +6,8 @@ This service exposes the current Driver Guardian system APIs and persists
 driver, vehicle, model-version, driving-session, and drowsiness-event data in
 Oracle Database.
 
-The backend is intentionally independent from Android and AI code. This phase
-preserves the recovered API behavior and does not add session-end, history,
-alert-action, or analytics endpoints.
+The backend is intentionally independent from Android and AI code. It exposes
+the persisted driving-session lifecycle without inventing AI-derived scores.
 
 ## Architecture
 
@@ -78,7 +77,12 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 | GET | `/vehicles` | List vehicles |
 | GET | `/model-versions/active` | Get the active model version |
 | POST | `/sessions` | Create an active driving session |
+| POST | `/sessions/{session_id}/complete` | Complete an active session using one database timestamp |
+| GET | `/sessions` | List joined session history with optional driver/status filters |
+| GET | `/sessions/{session_id}` | Get joined session detail |
+| GET | `/sessions/{session_id}/events` | List persisted session events in chronological order |
 | POST | `/events` | Create a drowsiness event and increment session alerts |
+| POST | `/events/{event_id}/acknowledge` | Idempotently record driver confirmation |
 
 Database failures return generic client messages. Logs record only the
 exception type, not the exception text, to avoid exposing connection details or
@@ -109,6 +113,6 @@ script.
 - Oracle was not reachable during repository verification. Unit smoke tests
   remain valid without it; database integration is not verified.
 - No portable Oracle container or user-provisioning script is included.
-- The API currently has no session-end, trip-history, trip-detail,
-  alert-action, or analytics routes.
+- Safety-score calculation and analytics remain undefined. Existing nullable
+  database values are returned unchanged rather than derived by the API.
 - Android Retrofit integration is outside this phase.

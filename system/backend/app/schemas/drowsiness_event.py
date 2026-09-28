@@ -49,6 +49,10 @@ class DrowsinessEventResponse(BaseModel):
     driver_state: str
     alert_level: int
     confidence: float | None = None
+    drowsiness_score: float | None = None
+    ear_value: float | None = None
+    mar_value: float | None = None
+    head_pose: str | None = None
     duration_ms: int | None = None
     acknowledged: str
     sync_status: str

@@ -6,6 +6,7 @@ import com.example.driverguardian.domain.model.Driver
 import com.example.driverguardian.domain.model.DrowsinessEvent
 import com.example.driverguardian.domain.model.DrivingSession
 import com.example.driverguardian.domain.model.ModelVersion
+import com.example.driverguardian.domain.model.TripSession
 import com.example.driverguardian.domain.model.Vehicle
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -196,6 +197,106 @@ class DrivingSessionViewModelTest {
         assertEquals(2, viewModel.uiState.value.activeVehicle?.id)
     }
 
+    @Test
+    fun `finish loads persisted events before exposing success`() = runTest(dispatcher) {
+        val completed = DrivingSession(4, 1, 2, 3, "2026-09-28T00:00:00", 90, 1, "COMPLETED", "SYNCED", "2026-09-28T00:01:30", null)
+        val event = DrowsinessEvent(5, 4, "2026-09-28T00:01:00", "DANGER", 2, null, null, "N", "SYNCED")
+        val repository = FakeRepository(
+            completionResult = RepositoryResult.Success(completed),
+            sessionEventsResult = RepositoryResult.Success(listOf(event))
+        )
+        val viewModel = readyViewModel(repository)
+        viewModel.createSession()
+        advanceUntilIdle()
+        viewModel.finishSession()
+        advanceUntilIdle()
+        assertEquals(CompletionState.Success, viewModel.uiState.value.completionState)
+        assertEquals(completed, viewModel.uiState.value.completedSession)
+        assertEquals(listOf(event), viewModel.uiState.value.completedSessionEvents)
+    }
+
+    @Test
+    fun `duplicate finish taps make one request and failure stays explicit`() = runTest(dispatcher) {
+        val gate = CompletableDeferred<Unit>()
+        val repository = FakeRepository(
+            completionResult = RepositoryResult.Error("Không kết thúc được chuyến đi."),
+            completionGate = gate
+        )
+        val viewModel = readyViewModel(repository)
+        viewModel.createSession()
+        advanceUntilIdle()
+        viewModel.finishSession()
+        viewModel.finishSession()
+        runCurrent()
+        assertEquals(1, repository.completionCalls)
+        gate.complete(Unit)
+        advanceUntilIdle()
+        assertEquals(CompletionState.Error("Không kết thúc được chuyến đi."), viewModel.uiState.value.completionState)
+    }
+
+    @Test
+    fun `event load failure keeps completed session and retry does not complete twice`() = runTest(dispatcher) {
+        val completed = DrivingSession(4, 1, 2, 3, "2026-09-28T00:00:00", 90, 1, "COMPLETED", "SYNCED", "2026-09-28T00:01:30", null)
+        val event = DrowsinessEvent(5, 4, "2026-09-28T00:01:00", "DANGER", 2, null, null, "N", "SYNCED")
+        val repository = FakeRepository(
+            completionResult = RepositoryResult.Success(completed),
+            sessionEventsResult = RepositoryResult.Error("Không tải được sự kiện.")
+        )
+        val viewModel = readyViewModel(repository)
+        viewModel.createSession()
+        advanceUntilIdle()
+        viewModel.finishSession()
+        advanceUntilIdle()
+        assertEquals(completed, viewModel.uiState.value.completedSession)
+        assertEquals(CompletionState.Error("Không tải được sự kiện."), viewModel.uiState.value.completionState)
+
+        repository.sessionEventsResult = RepositoryResult.Success(listOf(event))
+        viewModel.finishSession()
+        advanceUntilIdle()
+        assertEquals(1, repository.completionCalls)
+        assertEquals(listOf(event), viewModel.uiState.value.completedSessionEvents)
+        assertEquals(CompletionState.Success, viewModel.uiState.value.completionState)
+    }
+
+    @Test
+    fun `stale completion cannot replace a newer active session`() = runTest(dispatcher) {
+        val gate = CompletableDeferred<Unit>()
+        val completed = DrivingSession(4, 1, 2, 3, "2026-09-28T00:00:00", 90, 0, "COMPLETED", "SYNCED", "2026-09-28T00:01:30", null)
+        val repository = FakeRepository(completionResult = RepositoryResult.Success(completed), completionGate = gate)
+        val viewModel = readyViewModel(repository)
+        viewModel.createSession()
+        advanceUntilIdle()
+        viewModel.finishSession()
+        runCurrent()
+        repository.sessionResult = RepositoryResult.Success(DrivingSession(8, 1, 2, 3, "2026-09-28T00:02:00", 0, 0, "ACTIVE", "SYNCED"))
+        viewModel.createSession()
+        advanceUntilIdle()
+        gate.complete(Unit)
+        advanceUntilIdle()
+        assertEquals(8, viewModel.uiState.value.activeSession?.id)
+        assertEquals(null, viewModel.uiState.value.completedSession)
+    }
+
+    @Test
+    fun `acknowledge is guarded and updates the last event only after success`() = runTest(dispatcher) {
+        val gate = CompletableDeferred<Unit>()
+        val acknowledged = DrowsinessEvent(5, 4, "2026-09-28T00:01:00", "DANGER", 2, null, null, "Y", "SYNCED")
+        val repository = FakeRepository(ackResult = RepositoryResult.Success(acknowledged), ackGate = gate)
+        val viewModel = readyViewModel(repository)
+        viewModel.createSession()
+        advanceUntilIdle()
+        viewModel.submitDangerEvent(null, null)
+        advanceUntilIdle()
+        viewModel.acknowledgeLastEvent()
+        viewModel.acknowledgeLastEvent()
+        runCurrent()
+        assertEquals(1, repository.ackCalls)
+        gate.complete(Unit)
+        advanceUntilIdle()
+        assertEquals(AcknowledgementState.Success, viewModel.uiState.value.acknowledgementState)
+        assertEquals("Y", viewModel.uiState.value.lastEvent?.acknowledged)
+    }
+
     private suspend fun TestScope.readyViewModel(repository: FakeRepository): DrivingSessionViewModel {
         val viewModel = DrivingSessionViewModel(repository)
         advanceUntilIdle()
@@ -213,13 +314,21 @@ private class FakeRepository(
     private val eventResult: RepositoryResult<DrowsinessEvent> = RepositoryResult.Success(DrowsinessEvent(5, 4, "2026-09-28T00:01:00", "DANGER", 2, null, null, "N", "SYNCED")),
     private val driverResult: RepositoryResult<List<Driver>>? = null,
     private val sessionGate: CompletableDeferred<Unit>? = null,
-    private val eventGate: CompletableDeferred<Unit>? = null
+    private val eventGate: CompletableDeferred<Unit>? = null,
+    private val completionResult: RepositoryResult<DrivingSession> = RepositoryResult.Error("Not configured"),
+    sessionEventsResult: RepositoryResult<List<DrowsinessEvent>> = RepositoryResult.Success(emptyList()),
+    private val ackResult: RepositoryResult<DrowsinessEvent> = RepositoryResult.Error("Not configured"),
+    private val completionGate: CompletableDeferred<Unit>? = null,
+    private val ackGate: CompletableDeferred<Unit>? = null
 ) : DriverGuardianRepository {
     var sessionResult = sessionResult
     var lastDriverState: String? = null
     var lastAlertLevel: Int? = null
     var sessionCalls = 0
     var eventCalls = 0
+    var completionCalls = 0
+    var ackCalls = 0
+    var sessionEventsResult = sessionEventsResult
 
     override suspend fun getDrivers() = driverResult ?: RepositoryResult.Success(drivers)
     override suspend fun getVehicles() = RepositoryResult.Success(vehicles)
@@ -228,6 +337,21 @@ private class FakeRepository(
         sessionCalls += 1
         sessionGate?.await()
         return sessionResult
+    }
+    override suspend fun completeSession(sessionId: Int): RepositoryResult<DrivingSession> {
+        completionCalls += 1
+        completionGate?.await()
+        return completionResult
+    }
+    override suspend fun getSessions(driverId: Int?, status: String?, limit: Int?): RepositoryResult<List<TripSession>> =
+        RepositoryResult.Error("Not configured")
+    override suspend fun getSession(sessionId: Int): RepositoryResult<TripSession> =
+        RepositoryResult.Error("Not configured")
+    override suspend fun getSessionEvents(sessionId: Int): RepositoryResult<List<DrowsinessEvent>> = sessionEventsResult
+    override suspend fun acknowledgeEvent(eventId: Int): RepositoryResult<DrowsinessEvent> {
+        ackCalls += 1
+        ackGate?.await()
+        return ackResult
     }
     override suspend fun createEvent(sessionId: Int, driverState: String, alertLevel: Int, confidence: Double?, durationMs: Int?): RepositoryResult<DrowsinessEvent> {
         eventCalls += 1

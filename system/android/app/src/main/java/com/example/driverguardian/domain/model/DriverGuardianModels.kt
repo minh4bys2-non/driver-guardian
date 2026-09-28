@@ -39,6 +39,26 @@ data class DrivingSession(
     val durationSeconds: Int,
     val totalAlerts: Int,
     val status: String,
+    val syncStatus: String,
+    val endTime: String? = null,
+    val safetyScore: Double? = null
+)
+
+data class TripSession(
+    val id: Int,
+    val driverId: Int,
+    val driverName: String,
+    val vehicleId: Int,
+    val vehicleName: String?,
+    val plateNumber: String,
+    val modelVersionId: Int?,
+    val versionName: String?,
+    val startTime: String,
+    val endTime: String?,
+    val durationSeconds: Int,
+    val totalAlerts: Int,
+    val safetyScore: Double?,
+    val status: String,
     val syncStatus: String
 )
 
@@ -51,5 +71,9 @@ data class DrowsinessEvent(
     val confidence: Double?,
     val durationMs: Int?,
     val acknowledged: String,
-    val syncStatus: String
+    val syncStatus: String,
+    val drowsinessScore: Double? = null,
+    val earValue: Double? = null,
+    val marValue: Double? = null,
+    val headPose: String? = null
 )

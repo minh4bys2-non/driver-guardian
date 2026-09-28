@@ -1,5 +1,6 @@
 package com.example.driverguardian.ui.screens.driving
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -20,11 +21,13 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import com.example.driverguardian.ui.session.DrivingSessionUiState
+import com.example.driverguardian.ui.session.AcknowledgementState
 import com.example.driverguardian.ui.theme.DangerRed
 import kotlinx.coroutines.launch
 
@@ -32,10 +35,23 @@ import kotlinx.coroutines.launch
 fun DangerAlertScreen(
     sessionState: DrivingSessionUiState,
     snackbarHostState: SnackbarHostState,
+    onAcknowledge: () -> Unit,
     onDismiss: () -> Unit
 ) {
     val scope = rememberCoroutineScope()
     val persistedEvent = sessionState.lastEvent
+    BackHandler {
+        if (persistedEvent != null && sessionState.acknowledgementState != AcknowledgementState.Submitting) {
+            onAcknowledge()
+        }
+    }
+    LaunchedEffect(sessionState.acknowledgementState) {
+        when (val state = sessionState.acknowledgementState) {
+            AcknowledgementState.Success -> onDismiss()
+            is AcknowledgementState.Error -> snackbarHostState.showSnackbar(state.message)
+            else -> Unit
+        }
+    }
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -68,7 +84,13 @@ fun DangerAlertScreen(
             modifier = Modifier.fillMaxWidth(0.82f),
             horizontalArrangement = Arrangement.spacedBy(14.dp)
         ) {
-            Button(onClick = onDismiss, modifier = Modifier.weight(1f).height(64.dp)) { Text("Tôi đã tỉnh táo") }
+            Button(
+                onClick = onAcknowledge,
+                enabled = persistedEvent != null && sessionState.acknowledgementState != AcknowledgementState.Submitting,
+                modifier = Modifier.weight(1f).height(64.dp)
+            ) {
+                Text(if (sessionState.acknowledgementState == AcknowledgementState.Submitting) "Đang xác nhận…" else "Tôi đã tỉnh táo")
+            }
             OutlinedButton(
                 onClick = { scope.launch { snackbarHostState.showSnackbar("Tìm trạm nghỉ đang được mô phỏng") } },
                 modifier = Modifier.weight(1f).height(64.dp)

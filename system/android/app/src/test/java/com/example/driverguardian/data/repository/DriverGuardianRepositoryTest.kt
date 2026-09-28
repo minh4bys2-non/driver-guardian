@@ -43,4 +43,14 @@ class DriverGuardianRepositoryTest {
         assertEquals(404, result.statusCode)
         assertEquals("Không tìm thấy mô hình đang hoạt động.", result.message)
     }
+
+    @Test
+    fun `complete session http failure is not converted to success`() = runTest {
+        server.enqueue(MockResponse().setResponseCode(500).setBody("{\"detail\":\"internal database failure\"}"))
+        val result = repository.completeSession(11)
+        assertTrue(result is RepositoryResult.Error)
+        result as RepositoryResult.Error
+        assertEquals(500, result.statusCode)
+        assertEquals("Máy chủ không thể xử lý yêu cầu.", result.message)
+    }
 }

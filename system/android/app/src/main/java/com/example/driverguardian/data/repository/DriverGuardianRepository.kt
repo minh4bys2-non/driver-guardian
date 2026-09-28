@@ -8,6 +8,7 @@ import com.example.driverguardian.domain.model.Driver
 import com.example.driverguardian.domain.model.DrowsinessEvent
 import com.example.driverguardian.domain.model.DrivingSession
 import com.example.driverguardian.domain.model.ModelVersion
+import com.example.driverguardian.domain.model.TripSession
 import com.example.driverguardian.domain.model.Vehicle
 import java.net.SocketTimeoutException
 import kotlinx.coroutines.CancellationException
@@ -27,6 +28,15 @@ interface DriverGuardianRepository {
     suspend fun getVehicles(): RepositoryResult<List<Vehicle>>
     suspend fun getActiveModelVersion(): RepositoryResult<ModelVersion>
     suspend fun createSession(driverId: Int, vehicleId: Int, modelVersionId: Int): RepositoryResult<DrivingSession>
+    suspend fun completeSession(sessionId: Int): RepositoryResult<DrivingSession>
+    suspend fun getSessions(
+        driverId: Int? = null,
+        status: String? = null,
+        limit: Int? = null
+    ): RepositoryResult<List<TripSession>>
+    suspend fun getSession(sessionId: Int): RepositoryResult<TripSession>
+    suspend fun getSessionEvents(sessionId: Int): RepositoryResult<List<DrowsinessEvent>>
+    suspend fun acknowledgeEvent(eventId: Int): RepositoryResult<DrowsinessEvent>
     suspend fun createEvent(
         sessionId: Int,
         driverState: String,
@@ -49,6 +59,26 @@ class NetworkDriverGuardianRepository(
     override suspend fun createSession(driverId: Int, vehicleId: Int, modelVersionId: Int) = request {
         api.createSession(DrivingSessionCreateDto(driverId, vehicleId, modelVersionId)).toDomain()
     }
+
+    override suspend fun completeSession(sessionId: Int) = request(
+        notFoundMessage = "Không tìm thấy chuyến đi cần kết thúc."
+    ) { api.completeSession(sessionId).toDomain() }
+
+    override suspend fun getSessions(driverId: Int?, status: String?, limit: Int?) = request {
+        api.getSessions(driverId, status, limit).map { it.toDomain() }
+    }
+
+    override suspend fun getSession(sessionId: Int) = request(
+        notFoundMessage = "Không tìm thấy chuyến đi."
+    ) { api.getSession(sessionId).toDomain() }
+
+    override suspend fun getSessionEvents(sessionId: Int) = request(
+        notFoundMessage = "Không tìm thấy chuyến đi."
+    ) { api.getSessionEvents(sessionId).map { it.toDomain() } }
+
+    override suspend fun acknowledgeEvent(eventId: Int) = request(
+        notFoundMessage = "Không tìm thấy cảnh báo."
+    ) { api.acknowledgeEvent(eventId).toDomain() }
 
     override suspend fun createEvent(
         sessionId: Int,

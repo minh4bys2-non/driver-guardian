@@ -84,6 +84,61 @@ class DriverGuardianApiContractTest {
         assertEquals(12, result.eventId)
     }
 
+    @Test
+    fun `POST complete session uses path without client timing body and preserves null score`() = runTest {
+        server.enqueue(jsonResponse("""{"session_id":11,"driver_id":7,"vehicle_id":8,"model_version_id":9,"start_time":"2026-09-28T01:02:03","end_time":"2026-09-28T02:02:03","duration_seconds":3600,"total_alerts":2,"safety_score":null,"status":"COMPLETED","sync_status":"SYNCED"}"""))
+        val result = api.completeSession(11)
+        val request = server.takeRequest()
+        assertEquals("POST", request.method)
+        assertEquals("/sessions/11/complete", request.path)
+        assertEquals(0L, request.bodySize)
+        assertEquals("COMPLETED", result.status)
+        assertNull(result.safetyScore)
+    }
+
+    @Test
+    fun `GET sessions sends driver filter and parses joined nullable response`() = runTest {
+        server.enqueue(jsonResponse("""[{"session_id":11,"driver_id":7,"driver_name":"Lan","vehicle_id":8,"vehicle_name":null,"plate_number":"51A","model_version_id":9,"version_name":"v1","start_time":"2026-09-28T01:02:03","end_time":null,"duration_seconds":0,"total_alerts":0,"safety_score":null,"status":"ACTIVE","sync_status":"SYNCED"}]"""))
+        val result = api.getSessions(driverId = 7)
+        assertEquals("/sessions?driver_id=7", server.takeRequest().path)
+        assertEquals("Lan", result.single().driverName)
+        assertNull(result.single().vehicleName)
+        assertNull(result.single().endTime)
+        assertNull(result.single().safetyScore)
+    }
+
+    @Test
+    fun `GET session detail uses real session id`() = runTest {
+        server.enqueue(jsonResponse("""{"session_id":11,"driver_id":7,"driver_name":"Lan","vehicle_id":8,"vehicle_name":"Bus","plate_number":"51A","model_version_id":9,"version_name":"v1","start_time":"2026-09-28T01:02:03","end_time":"2026-09-28T02:02:03","duration_seconds":3600,"total_alerts":2,"safety_score":null,"status":"COMPLETED","sync_status":"SYNCED"}"""))
+        val result = api.getSession(11)
+        assertEquals("/sessions/11", server.takeRequest().path)
+        assertEquals(11, result.sessionId)
+        assertEquals("51A", result.plateNumber)
+    }
+
+    @Test
+    fun `GET session events preserves all nullable metrics`() = runTest {
+        server.enqueue(jsonResponse("""[{"event_id":12,"session_id":11,"event_time":"2026-09-28T01:03:03","driver_state":"WARNING","alert_level":1,"confidence":null,"drowsiness_score":null,"ear_value":null,"mar_value":null,"head_pose":null,"duration_ms":null,"acknowledged":"N","sync_status":"SYNCED"}]"""))
+        val event = api.getSessionEvents(11).single()
+        assertEquals("/sessions/11/events", server.takeRequest().path)
+        assertNull(event.confidence)
+        assertNull(event.drowsinessScore)
+        assertNull(event.earValue)
+        assertNull(event.marValue)
+        assertNull(event.headPose)
+        assertNull(event.durationMs)
+    }
+
+    @Test
+    fun `POST acknowledge targets persisted event`() = runTest {
+        server.enqueue(jsonResponse("""{"event_id":12,"session_id":11,"event_time":"2026-09-28T01:03:03","driver_state":"DANGER","alert_level":2,"confidence":null,"drowsiness_score":null,"ear_value":null,"mar_value":null,"head_pose":null,"duration_ms":null,"acknowledged":"Y","sync_status":"SYNCED"}"""))
+        val result = api.acknowledgeEvent(12)
+        val request = server.takeRequest()
+        assertEquals("POST", request.method)
+        assertEquals("/events/12/acknowledge", request.path)
+        assertEquals("Y", result.acknowledged)
+    }
+
     private fun jsonResponse(body: String, code: Int = 200) = MockResponse()
         .setResponseCode(code)
         .setHeader("Content-Type", "application/json")

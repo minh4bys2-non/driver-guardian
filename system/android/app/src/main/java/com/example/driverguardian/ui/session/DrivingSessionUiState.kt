@@ -27,6 +27,20 @@ sealed interface EventSubmissionState {
     data class Error(val message: String) : EventSubmissionState
 }
 
+sealed interface CompletionState {
+    data object Idle : CompletionState
+    data object Submitting : CompletionState
+    data object Success : CompletionState
+    data class Error(val message: String) : CompletionState
+}
+
+sealed interface AcknowledgementState {
+    data object Idle : AcknowledgementState
+    data object Submitting : AcknowledgementState
+    data object Success : AcknowledgementState
+    data class Error(val message: String) : AcknowledgementState
+}
+
 enum class DriverState(val wireValue: String, val alertLevel: Int) {
     Warning("WARNING", 1),
     Danger("DANGER", 2)
@@ -41,8 +55,12 @@ data class DrivingSessionUiState(
     val selectedVehicleId: Int? = null,
     val activeSession: DrivingSession? = null,
     val lastEvent: DrowsinessEvent? = null,
+    val completedSession: DrivingSession? = null,
+    val completedSessionEvents: List<DrowsinessEvent> = emptyList(),
     val sessionSubmissionState: SessionSubmissionState = SessionSubmissionState.Idle,
-    val eventSubmissionState: EventSubmissionState = EventSubmissionState.Idle
+    val eventSubmissionState: EventSubmissionState = EventSubmissionState.Idle,
+    val completionState: CompletionState = CompletionState.Idle,
+    val acknowledgementState: AcknowledgementState = AcknowledgementState.Idle
 ) {
     val selectedDriver: Driver? get() = drivers.firstOrNull { it.id == selectedDriverId }
     val selectedVehicle: Vehicle? get() = vehicles.firstOrNull { it.id == selectedVehicleId }
@@ -50,4 +68,6 @@ data class DrivingSessionUiState(
     val activeVehicle: Vehicle? get() = activeSession?.let { session -> vehicles.firstOrNull { it.id == session.vehicleId } }
     val canContinue: Boolean
         get() = loadState == LoadState.Success && selectedDriver != null && selectedVehicle != null && activeModel != null
+    val summaryReady: Boolean
+        get() = completionState == CompletionState.Success && completedSession != null
 }

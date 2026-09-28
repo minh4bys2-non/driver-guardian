@@ -40,6 +40,7 @@ import com.example.driverguardian.ui.mock.DrivingUiState
 import com.example.driverguardian.ui.mock.MockData
 import com.example.driverguardian.ui.session.DrivingSessionUiState
 import com.example.driverguardian.ui.session.EventSubmissionState
+import com.example.driverguardian.ui.session.CompletionState
 import com.example.driverguardian.ui.theme.DriverGuardianTheme
 import com.example.driverguardian.ui.theme.SafeGreen
 import kotlinx.coroutines.launch
@@ -50,7 +51,8 @@ fun ActiveDrivingScreen(
     snackbarHostState: SnackbarHostState,
     onDangerDemo: () -> Unit,
     onDangerPersisted: () -> Unit,
-    onFinishTrip: () -> Unit
+    onFinishTrip: () -> Unit,
+    onTripCompleted: () -> Unit
 ) {
     val scope = rememberCoroutineScope()
     val drivingState = MockData.drivingNormal.copy(
@@ -68,12 +70,23 @@ fun ActiveDrivingScreen(
             else -> Unit
         }
     }
+    LaunchedEffect(sessionState.completionState) {
+        when (val completion = sessionState.completionState) {
+            CompletionState.Success -> onTripCompleted()
+            is CompletionState.Error -> snackbarHostState.showSnackbar(completion.message)
+            else -> Unit
+        }
+    }
     ActiveDrivingContent(
         state = drivingState,
         sessionLabel = sessionState.activeSession?.let { "Phiên #${it.id} • ${it.status} • ${it.syncStatus}" }
             ?: "Chưa có phiên backend",
         dangerEnabled = sessionState.activeSession != null && sessionState.eventSubmissionState != EventSubmissionState.Submitting,
         dangerSubmitting = sessionState.eventSubmissionState == EventSubmissionState.Submitting,
+        finishEnabled = sessionState.activeSession != null &&
+            (sessionState.activeSession.status == "ACTIVE" || sessionState.completedSession?.id == sessionState.activeSession.id) &&
+            sessionState.completionState != CompletionState.Submitting,
+        finishSubmitting = sessionState.completionState == CompletionState.Submitting,
         onPause = { scope.launch { snackbarHostState.showSnackbar("Đã tạm dừng trạng thái mô phỏng") } },
         onFinishTrip = onFinishTrip,
         onMockFeature = { scope.launch { snackbarHostState.showSnackbar("Chức năng đang được mô phỏng") } },
@@ -87,6 +100,8 @@ fun ActiveDrivingContent(
     sessionLabel: String,
     dangerEnabled: Boolean,
     dangerSubmitting: Boolean,
+    finishEnabled: Boolean,
+    finishSubmitting: Boolean,
     onPause: () -> Unit,
     onFinishTrip: () -> Unit,
     onMockFeature: () -> Unit,
@@ -172,9 +187,9 @@ fun ActiveDrivingContent(
                 Icon(Icons.Default.Pause, contentDescription = null)
                 Text("  Tạm dừng")
             }
-            Button(onClick = onFinishTrip, modifier = Modifier.weight(1f).height(56.dp)) {
+            Button(onClick = onFinishTrip, enabled = finishEnabled, modifier = Modifier.weight(1f).height(56.dp)) {
                 Icon(Icons.Default.Stop, contentDescription = null)
-                Text("  Kết thúc chuyến")
+                Text(if (finishSubmitting) "  Đang kết thúc…" else "  Kết thúc chuyến")
             }
             OutlinedButton(onClick = onMockFeature, modifier = Modifier.weight(1f).height(56.dp)) {
                 Icon(Icons.Default.MusicNote, contentDescription = null)
@@ -193,7 +208,7 @@ fun ActiveDrivingContent(
 private fun ActiveDrivingNormalPreview() {
     DriverGuardianTheme {
         Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).padding(20.dp)) {
-            ActiveDrivingContent(MockData.drivingNormal, "Phiên demo", true, false, {}, {}, {}, {})
+            ActiveDrivingContent(MockData.drivingNormal, "Phiên demo", true, false, true, false, {}, {}, {}, {})
         }
     }
 }
@@ -203,7 +218,7 @@ private fun ActiveDrivingNormalPreview() {
 private fun ActiveDrivingWarningPreview() {
     DriverGuardianTheme {
         Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).padding(20.dp)) {
-            ActiveDrivingContent(MockData.drivingWarning, "Phiên demo", true, false, {}, {}, {}, {})
+            ActiveDrivingContent(MockData.drivingWarning, "Phiên demo", true, false, true, false, {}, {}, {}, {})
         }
     }
 }
@@ -213,7 +228,7 @@ private fun ActiveDrivingWarningPreview() {
 private fun ActiveDrivingDangerPreview() {
     DriverGuardianTheme {
         Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).padding(20.dp)) {
-            ActiveDrivingContent(MockData.drivingDanger, "Phiên demo", true, false, {}, {}, {}, {})
+            ActiveDrivingContent(MockData.drivingDanger, "Phiên demo", true, false, true, false, {}, {}, {}, {})
         }
     }
 }

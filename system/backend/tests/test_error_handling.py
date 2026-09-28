@@ -90,6 +90,11 @@ class DatabaseErrorHandlingTest(unittest.IsolatedAsyncioTestCase):
                 500,
                 "Failed to create event",
             ),
+            ("GET", "/sessions", None, 500, "Failed to retrieve sessions"),
+            ("GET", "/sessions/1", None, 500, "Failed to retrieve driving session"),
+            ("POST", "/sessions/1/complete", None, 500, "Failed to complete driving session"),
+            ("GET", "/sessions/1/events", None, 500, "Failed to retrieve session events"),
+            ("POST", "/events/1/acknowledge", None, 500, "Failed to acknowledge event"),
         )
 
         for method, path, payload, status, detail in cases:

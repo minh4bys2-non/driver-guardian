@@ -28,6 +28,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -37,19 +38,42 @@ import com.example.driverguardian.ui.components.DashboardCard
 import com.example.driverguardian.ui.components.MetricCard
 import com.example.driverguardian.ui.mock.DrivingUiState
 import com.example.driverguardian.ui.mock.MockData
+import com.example.driverguardian.ui.session.DrivingSessionUiState
+import com.example.driverguardian.ui.session.EventSubmissionState
 import com.example.driverguardian.ui.theme.DriverGuardianTheme
 import com.example.driverguardian.ui.theme.SafeGreen
 import kotlinx.coroutines.launch
 
 @Composable
 fun ActiveDrivingScreen(
+    sessionState: DrivingSessionUiState,
     snackbarHostState: SnackbarHostState,
     onDangerDemo: () -> Unit,
+    onDangerPersisted: () -> Unit,
     onFinishTrip: () -> Unit
 ) {
     val scope = rememberCoroutineScope()
+    val drivingState = MockData.drivingNormal.copy(
+        driverName = sessionState.activeDriver?.fullName ?: "Không xác định tài xế phiên",
+        vehiclePlate = sessionState.activeVehicle?.plateNumber ?: "Không xác định phương tiện phiên",
+        drivingTime = sessionState.activeSession?.let { "${it.durationSeconds}s (khởi tạo)" } ?: "Chưa có",
+        alertCount = sessionState.activeSession?.totalAlerts ?: 0,
+        lastAlertAgo = sessionState.lastEvent?.let { "Vừa lưu #${it.id}" } ?: "Chưa có",
+        syncStatus = sessionState.activeSession?.syncStatus ?: "Chưa có phiên"
+    )
+    LaunchedEffect(sessionState.eventSubmissionState) {
+        when (val submission = sessionState.eventSubmissionState) {
+            is EventSubmissionState.Success -> onDangerPersisted()
+            is EventSubmissionState.Error -> snackbarHostState.showSnackbar(submission.message)
+            else -> Unit
+        }
+    }
     ActiveDrivingContent(
-        state = MockData.drivingNormal,
+        state = drivingState,
+        sessionLabel = sessionState.activeSession?.let { "Phiên #${it.id} • ${it.status} • ${it.syncStatus}" }
+            ?: "Chưa có phiên backend",
+        dangerEnabled = sessionState.activeSession != null && sessionState.eventSubmissionState != EventSubmissionState.Submitting,
+        dangerSubmitting = sessionState.eventSubmissionState == EventSubmissionState.Submitting,
         onPause = { scope.launch { snackbarHostState.showSnackbar("Đã tạm dừng trạng thái mô phỏng") } },
         onFinishTrip = onFinishTrip,
         onMockFeature = { scope.launch { snackbarHostState.showSnackbar("Chức năng đang được mô phỏng") } },
@@ -60,6 +84,9 @@ fun ActiveDrivingScreen(
 @Composable
 fun ActiveDrivingContent(
     state: DrivingUiState,
+    sessionLabel: String,
+    dangerEnabled: Boolean,
+    dangerSubmitting: Boolean,
     onPause: () -> Unit,
     onFinishTrip: () -> Unit,
     onMockFeature: () -> Unit,
@@ -73,7 +100,7 @@ fun ActiveDrivingContent(
         ) {
             Column {
                 Text("${state.driverName} • ${state.vehiclePlate}", style = MaterialTheme.typography.headlineMedium)
-                Text("Đang giám sát • 09:42 • Camera hoạt động", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.titleMedium)
+                Text(sessionLabel, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.titleMedium)
             }
             Icon(Icons.Default.Videocam, contentDescription = null, tint = SafeGreen, modifier = Modifier.size(42.dp))
         }
@@ -107,12 +134,14 @@ fun ActiveDrivingContent(
                     Spacer(Modifier.height(20.dp))
                     Text(state.statusMessage, style = MaterialTheme.typography.titleLarge)
                     Spacer(Modifier.height(14.dp))
-                    OutlinedButton(onClick = onDangerDemo) { Text("Demo cảnh báo nguy hiểm") }
+                    OutlinedButton(onClick = onDangerDemo, enabled = dangerEnabled) {
+                        Text(if (dangerSubmitting) "Đang lưu cảnh báo…" else "Demo cảnh báo nguy hiểm")
+                    }
                 }
             }
 
             Column(modifier = Modifier.weight(1.2f), verticalArrangement = Arrangement.spacedBy(14.dp)) {
-                DashboardCard("Thông số mẫu") {
+                DashboardCard("Thông số AI demo / mock") {
                     Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                         MetricCard("Buồn ngủ", "${state.prediction.drowsiness}%", Modifier.weight(1f), state.level.color)
                         MetricCard("Độ tin cậy", "${state.prediction.confidence}%", Modifier.weight(1f))
@@ -164,7 +193,7 @@ fun ActiveDrivingContent(
 private fun ActiveDrivingNormalPreview() {
     DriverGuardianTheme {
         Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).padding(20.dp)) {
-            ActiveDrivingContent(MockData.drivingNormal, {}, {}, {}, {})
+            ActiveDrivingContent(MockData.drivingNormal, "Phiên demo", true, false, {}, {}, {}, {})
         }
     }
 }
@@ -174,7 +203,7 @@ private fun ActiveDrivingNormalPreview() {
 private fun ActiveDrivingWarningPreview() {
     DriverGuardianTheme {
         Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).padding(20.dp)) {
-            ActiveDrivingContent(MockData.drivingWarning, {}, {}, {}, {})
+            ActiveDrivingContent(MockData.drivingWarning, "Phiên demo", true, false, {}, {}, {}, {})
         }
     }
 }
@@ -184,7 +213,7 @@ private fun ActiveDrivingWarningPreview() {
 private fun ActiveDrivingDangerPreview() {
     DriverGuardianTheme {
         Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).padding(20.dp)) {
-            ActiveDrivingContent(MockData.drivingDanger, {}, {}, {}, {})
+            ActiveDrivingContent(MockData.drivingDanger, "Phiên demo", true, false, {}, {}, {}, {})
         }
     }
 }

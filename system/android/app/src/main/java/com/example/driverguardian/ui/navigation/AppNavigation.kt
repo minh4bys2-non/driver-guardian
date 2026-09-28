@@ -32,6 +32,11 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.viewmodel.compose.viewModel
+import com.example.driverguardian.BuildConfig
+import com.example.driverguardian.data.remote.ApiClient
+import com.example.driverguardian.data.repository.NetworkDriverGuardianRepository
 import com.example.driverguardian.ui.components.AppSidebar
 import com.example.driverguardian.ui.screens.alerts.AlertHistoryScreen
 import com.example.driverguardian.ui.screens.analytics.AnalyticsScreen
@@ -46,11 +51,22 @@ import com.example.driverguardian.ui.screens.selection.SelectionScreen
 import com.example.driverguardian.ui.screens.settings.SettingsScreen
 import com.example.driverguardian.ui.screens.summary.TripSummaryScreen
 import com.example.driverguardian.ui.screens.system.SystemInfoScreen
+import com.example.driverguardian.ui.session.DrivingSessionUiState
+import com.example.driverguardian.ui.session.DrivingSessionViewModel
+import com.example.driverguardian.ui.session.DrivingSessionViewModelFactory
 
 @Composable
 fun DriverGuardianApp() {
     val navController = rememberNavController()
     val snackbarHostState = remember { SnackbarHostState() }
+    val sessionViewModel: DrivingSessionViewModel = viewModel(
+        factory = remember {
+            DrivingSessionViewModelFactory(
+                NetworkDriverGuardianRepository(ApiClient.create(BuildConfig.API_BASE_URL))
+            )
+        }
+    )
+    val sessionUiState by sessionViewModel.uiState.collectAsStateWithLifecycle()
     val backStackEntry by navController.currentBackStackEntryAsState()
     val currentRoute = backStackEntry?.destination?.route
     val showSidebar = currentRoute != Screen.DangerAlert.route
@@ -74,6 +90,8 @@ fun DriverGuardianApp() {
                     AppNavHost(
                         navController = navController,
                         snackbarHostState = snackbarHostState,
+                        sessionUiState = sessionUiState,
+                        sessionViewModel = sessionViewModel,
                         modifier = Modifier
                             .weight(1f)
                             .fillMaxSize()
@@ -137,6 +155,8 @@ private fun BottomAppNavigation(
 private fun AppNavHost(
     navController: NavHostController,
     snackbarHostState: SnackbarHostState,
+    sessionUiState: DrivingSessionUiState,
+    sessionViewModel: DrivingSessionViewModel,
     modifier: Modifier = Modifier
 ) {
     NavHost(
@@ -155,27 +175,42 @@ private fun AppNavHost(
         }
         composable(Screen.Selection.route) {
             SelectionScreen(
+                state = sessionUiState,
+                onSelectDriver = sessionViewModel::selectDriver,
+                onSelectVehicle = sessionViewModel::selectVehicle,
+                onRetry = sessionViewModel::refresh,
                 onCancel = { navController.safeNavigate(Screen.Home.route) },
                 onContinue = { navController.safeNavigate(Screen.PreTripCheck.route) }
             )
         }
         composable(Screen.PreTripCheck.route) {
             PreTripCheckScreen(
+                state = sessionUiState,
                 snackbarHostState = snackbarHostState,
-                onStartMonitoring = { navController.safeNavigate(Screen.ActiveDriving.route) }
+                onStartMonitoring = sessionViewModel::createSession,
+                onSessionCreated = {
+                    sessionViewModel.consumeSessionSubmission()
+                    navController.safeNavigate(Screen.ActiveDriving.route)
+                }
             )
         }
         composable(Screen.ActiveDriving.route) {
             ActiveDrivingScreen(
+                sessionState = sessionUiState,
                 snackbarHostState = snackbarHostState,
-                onDangerDemo = { navController.safeNavigate(Screen.DangerAlert.route) },
+                onDangerDemo = { sessionViewModel.submitDangerEvent(null, null) },
+                onDangerPersisted = {
+                    sessionViewModel.consumeEventSubmission()
+                    navController.safeNavigate(Screen.DangerAlert.route)
+                },
                 onFinishTrip = { navController.safeNavigate(Screen.TripSummary.route) }
             )
         }
         composable(Screen.DangerAlert.route) {
             DangerAlertScreen(
+                sessionState = sessionUiState,
                 snackbarHostState = snackbarHostState,
-                onDismiss = { navController.safeNavigate(Screen.ActiveDriving.route) }
+                onDismiss = { navController.popBackStack() }
             )
         }
         composable(Screen.TripSummary.route) {

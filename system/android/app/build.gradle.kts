@@ -1,5 +1,13 @@
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
+val driverGuardianApiBaseUrl = providers.gradleProperty("DRIVER_GUARDIAN_API_BASE_URL")
+    .orElse("http://10.0.2.2:8000/")
+    .get()
+    .let { if (it.endsWith("/")) it else "$it/" }
+val driverGuardianApiBaseUrlLiteral = "\"" + driverGuardianApiBaseUrl
+    .replace("\\", "\\\\")
+    .replace("\"", "\\\"") + "\""
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -16,10 +24,12 @@ android {
         targetSdk = 36
         versionCode = 1
         versionName = "1.0.0"
+        buildConfigField("String", "API_BASE_URL", driverGuardianApiBaseUrlLiteral)
     }
 
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 
     compileOptions {
@@ -47,7 +57,11 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-viewmodel-ktx:2.10.0")
     implementation("androidx.navigation:navigation-compose:2.9.6")
     implementation("com.microsoft.onnxruntime:onnxruntime-android:1.30.0")
+    implementation("com.squareup.retrofit2:retrofit:2.11.0")
+    implementation("com.squareup.retrofit2:converter-gson:2.11.0")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
     testImplementation("junit:junit:4.13.2")
+    testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.2")
 }

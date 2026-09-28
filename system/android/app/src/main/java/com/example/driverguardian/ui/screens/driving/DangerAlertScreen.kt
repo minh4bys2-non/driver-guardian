@@ -24,15 +24,18 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import com.example.driverguardian.ui.session.DrivingSessionUiState
 import com.example.driverguardian.ui.theme.DangerRed
 import kotlinx.coroutines.launch
 
 @Composable
 fun DangerAlertScreen(
+    sessionState: DrivingSessionUiState,
     snackbarHostState: SnackbarHostState,
     onDismiss: () -> Unit
 ) {
     val scope = rememberCoroutineScope()
+    val persistedEvent = sessionState.lastEvent
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -54,7 +57,13 @@ fun DangerAlertScreen(
             color = MaterialTheme.colorScheme.onSurface,
             style = MaterialTheme.typography.titleLarge
         )
-        Text("Mức cảnh báo: Nguy hiểm • Trạng thái kéo dài: 5 giây", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.titleMedium)
+        Text("Mức cảnh báo: Nguy hiểm • Confidence/thời lượng: không cung cấp (demo)", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.titleMedium)
+        Text(
+            persistedEvent?.let { "Đã lưu event #${it.id} • Phiên #${it.sessionId} • ${it.syncStatus}" }
+                ?: "Chưa xác nhận được event từ backend",
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            style = MaterialTheme.typography.titleMedium
+        )
         Row(
             modifier = Modifier.fillMaxWidth(0.82f),
             horizontalArrangement = Arrangement.spacedBy(14.dp)

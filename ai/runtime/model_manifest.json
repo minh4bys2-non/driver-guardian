@@ -1,0 +1,74 @@
+{
+  "system": "Driver Guardian",
+  "description": "Production ONNX Float32 Models for Driver Drowsiness Detection",
+  "format": "ONNX",
+  "precision": "Float32",
+  "opset_version": 17,
+  "classes": [
+    "Alert",
+    "Drowsy"
+  ],
+  "sample_interval_sec": 0.5,
+  "models": {
+    "end2end": {
+      "file": "driver_guardian_end2end.onnx",
+      "size_mb": 12.79,
+      "sha256": "3b0189550f7ed1ae53a620d143a8b1ed715f5e970b0977e0d44cfd6cb9680057",
+      "input_names": [
+        "video"
+      ],
+      "output_names": [
+        "logits"
+      ],
+      "input_shape": [
+        "batch_size",
+        "seq_len",
+        3,
+        640,
+        640
+      ]
+    },
+    "spatial_extractor": {
+      "file": "spatial_extractor.onnx",
+      "size_mb": 6.3,
+      "sha256": "63b22602f0d96c293402f6c5081b9aad408f22c264625a3c8e292bc26c7f64be",
+      "input_names": [
+        "image"
+      ],
+      "output_names": [
+        "features"
+      ],
+      "input_shape": [
+        "batch_size",
+        3,
+        640,
+        640
+      ],
+      "output_shape": [
+        "batch_size",
+        448
+      ]
+    },
+    "temporal_classifier": {
+      "file": "temporal_classifier.onnx",
+      "size_mb": 6.47,
+      "sha256": "1e29b9c50cde516248fd5b6d424840585a9f2f5f0d95f6dafa77192d14b48599",
+      "input_names": [
+        "features",
+        "h_0",
+        "c_0"
+      ],
+      "output_names": [
+        "logits",
+        "h_n",
+        "c_n"
+      ],
+      "input_shape": [
+        "batch_size",
+        1,
+        448
+      ]
+    }
+  },
+  "timestamp": "2026-09-26 14:17:59"
+}

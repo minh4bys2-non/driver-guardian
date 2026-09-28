@@ -110,6 +110,8 @@ coverage.xml
 *.pkl
 *.pickle
 *.joblib
+*.onnx
+*.rar
 
 # Checkpoints, training runs & data label directories
 **/checkpoints*/
@@ -120,6 +122,7 @@ dataset/
 datasets/
 **/dataset/
 **/datasets/
+**/extracted_features_pt
 
 # TensorBoard logs
 events.out.tfevents.*

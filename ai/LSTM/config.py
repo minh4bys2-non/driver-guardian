@@ -20,9 +20,8 @@ class TrainConfig:
     val_pt: str = "extracted_features_pt/features_sust_val.pt"  # Đường dẫn tệp tensor validation
     dataset_dir: str = r"D:\Project\AI\dataset\filtered_SUST\in_threshold"  # Đường dẫn tới thư mục video thô (filtered_SUST)
     seq_len: int = None  # Số lượng khung hình cố định cho mỗi video (120 cho SUST dataset)
-    sample_interval: float = 0.25  # Khoảng thời g
-    # ian t (giây) giữa 2 khung hình lấy mẫu (mặc định 0.5s)
-    image_size: Tuple[int, int] = (480, 480)  # Kích thước khung hình (Height, Width)
+    sample_interval: float = 0.25  # Khoảng thời gian t (giây) giữa 2 khung hình lấy mẫu (mặc định 0.5s)
+    image_size: Tuple[int, int] = (640, 640)  # Kích thước khung hình (Height, Width) theo backbone_neck.onnx
     video_exts: Tuple[str, ...] = (".avi", ".mp4", ".mkv")  # Các định dạng video hợp lệ
     train_ratio: float = 0.8  # Tỷ lệ chia tập huấn luyện (80% train, 20% validation)
     split_by_subject: bool = True  # Chia dataset theo người tham gia (Subject-independent split)
@@ -42,11 +41,11 @@ class TrainConfig:
     # ---- 3. MODEL ARCHITECTURE CONFIGURATION ----
     cnn_manifest_path: str = r"/outsrc/myCNN\checkpoints_ftCOCO\model_mainfest.json"
     cnn_weights_path: str = r"/outsrc/myCNN\checkpoints_ftCOCO\ft_step00091000.pt"
-    cnn_neck_channels: Tuple[int, int, int] = (224, 448, 640)  # Kênh thực tế của (p3, p4, p5) từ PAFPN
+    cnn_neck_channels: Tuple[int, int, int] = (64, 128, 256)  # Kênh thực tế của (p3, p4, p5) từ backbone_neck.onnx
     cnn_strides: Tuple[int, int, int] = (8, 16, 32)  # Strides tương ứng của (p3, p4, p5)
     cnn_num_features: int = 3  # Số lượng tầng đặc trưng đầu vào (p3, p4, p5)
-    cnn_out_channels: int = 1312  # Tổng số kênh khi ghép nối (224 + 448 + 640 = 1312)
-    cnn_spatial_size: Tuple[int, int] = (15, 15)  # Độ phân giải đặc trưng không gian tầng sâu nhất p5
+    cnn_out_channels: int = 448  # Tổng số kênh khi ghép nối (64 + 128 + 256 = 448)
+    cnn_spatial_size: Tuple[int, int] = (20, 20)  # Độ phân giải đặc trưng không gian tầng sâu nhất p5 (640 / 32 = 20)
     spatial_fusion: str = "concat"  # Phương thức kết hợp: 'concat' | 'sum' | 'mean'
     adapter_dropout: float = 0.1  # Tỷ lệ Dropout sau Spatial Feature Adapter
     use_norm: bool = True  # Sử dụng LayerNorm trong Spatial Adapter và Dropout trong FC head
@@ -93,16 +92,28 @@ class TrainConfig:
 
     def __post_init__(self):
         """Kiểm tra tính hợp lệ của tham số cấu hình và tự động điều chỉnh theo môi trường."""
-        # 1. Tự động nhận diện môi trường Kaggle
+        # 1. Tự động nhận diện môi trường Kaggle và tệp dữ liệu thực tế
         if os.path.exists("/kaggle"):
             if not os.path.exists(self.train_pt):
-                kaggle_train = "/kaggle/input/datasets/nyvantran6634/sust4ni1/features_sust_train.pt"
-                kaggle_val = "/kaggle/input/datasets/nyvantran6634/sust4ni1/features_sust_val.pt"
-                if os.path.exists(kaggle_train):
-                    self.train_pt = kaggle_train
-                    self.val_pt = kaggle_val
+                kaggle_merged_train = "/kaggle/input/datasets/nyvantran6634/sust4ni1/features_merged_train.pt"
+                kaggle_merged_val = "/kaggle/input/datasets/nyvantran6634/sust4ni1/features_merged_val.pt"
+                kaggle_sust_train = "/kaggle/input/datasets/nyvantran6634/sust4ni1/features_sust_train.pt"
+                kaggle_sust_val = "/kaggle/input/datasets/nyvantran6634/sust4ni1/features_sust_val.pt"
+                if os.path.exists(kaggle_merged_train):
+                    self.train_pt = kaggle_merged_train
+                    self.val_pt = kaggle_merged_val
+                elif os.path.exists(kaggle_sust_train):
+                    self.train_pt = kaggle_sust_train
+                    self.val_pt = kaggle_sust_val
             self.checkpoint_dir = "/kaggle/working/checkpoints"
             self.tb_log_dir = "/kaggle/working/runs"
+        else:
+            if not os.path.exists(self.train_pt):
+                cand_merged_train = "extracted_features_pt/features_merged_train.pt"
+                cand_merged_val = "extracted_features_pt/features_merged_val.pt"
+                if os.path.exists(cand_merged_train):
+                    self.train_pt = cand_merged_train
+                    self.val_pt = cand_merged_val
 
         # 2. Ràng buộc các tham số dữ liệu & dataloader
         if self.seq_len is not None:

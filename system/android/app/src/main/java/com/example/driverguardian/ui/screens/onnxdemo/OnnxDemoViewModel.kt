@@ -102,7 +102,7 @@ class OnnxDemoViewModel(application: Application) : AndroidViewModel(application
             mutableState.update { it.copy(runtimeState = RuntimeState.Running(metadata), goldenResults = emptyList()) }
             val results = withContext(Dispatchers.Default) {
                 suite.cases.map { testCase ->
-                    val parity = when (val run = engine.run(testCase.inputs)) {
+                    val parity = when (val run = engine.run(testCase.inputs, captureFullOutputs = true)) {
                         is RuntimeResult.Success -> GoldenVectorRunner.compare(testCase, run.value, suite.tolerance)
                         is RuntimeResult.Failure -> ParityResult(ParityStatus.ERROR, message = run.error.detail)
                     }

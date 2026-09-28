@@ -1,75 +1,135 @@
-# Driver Guardian Android
+# Driver Guardian — Kiến trúc ứng dụng Android
 
-Android Automotive demo dùng Jetpack Compose. Phần integration foundation kết nối luồng chuẩn bị chuyến đi với FastAPI, trong khi inference/camera và các chỉ số AI trên màn hình lái vẫn là demo rõ ràng.
+Ứng dụng Android viết bằng Kotlin và Jetpack Compose, tổ chức trong một module `:app`, với package gốc `com.example.driverguardian`. Mã nguồn chia thành hai phần chính: `ui` phụ trách giao diện và trạng thái hiển thị; `ai` phụ trách tensor, hợp đồng mô hình và suy luận ONNX trên thiết bị.
 
-## Kiến trúc integration
+Hiện tại, các màn hình nghiệp vụ dùng dữ liệu mô phỏng. Màn hình ONNX Demo có ViewModel và runtime riêng; pipeline backbone + neck đã có nhưng chưa nối vào màn hình giám sát chuyến đi.
 
-- `data/remote`: Retrofit API và DTO bám đúng JSON contract của FastAPI.
-- `data/repository`: ánh xạ DTO sang domain model và chuyển lỗi mạng/HTTP thành thông báo an toàn cho UI.
-- `domain/model`: `Driver`, `Vehicle`, `ModelVersion`, `DrivingSession`, `TripSession`, `DrowsinessEvent` với ID backend thật và nullable data được giữ nguyên.
-- `ui/session`: shared `DrivingSessionViewModel` + `StateFlow` giữ active session, completion và acknowledgement state.
-- `ui/history`: `TripHistoryViewModel` riêng tải history/detail/events và presentation mapper hiển thị giá trị thiếu bằng `—`.
-- `ui/screens`: Selection tải dữ liệu thật; PreTrip tạo session; ActiveDriving lưu demo danger event trước khi mở màn hình cảnh báo.
-
-Không có SQLite, fake backend, offline queue hoặc DI framework trong phase này.
-
-## FastAPI base URL
-
-Debug mặc định dùng địa chỉ host nhìn từ Android Emulator:
+## 1. Cấu trúc thư mục
 
 ```text
-http://10.0.2.2:8000/
+android/
+├── settings.gradle.kts             # Khai báo module :app và kho dependency
+├── build.gradle.kts                # Plugin Android, Kotlin và Compose
+├── gradle/                         # Gradle Wrapper
+├── scripts/                        # Công cụ tạo dữ liệu tham chiếu backbone + neck
+└── app/
+    ├── build.gradle.kts            # SDK, cấu hình ứng dụng và dependency
+    └── src/
+        ├── main/
+        │   ├── AndroidManifest.xml
+        │   ├── res/values/         # Tên ứng dụng và theme Android
+        │   ├── assets/
+        │   │   ├── models/         # Mô hình ONNX
+        │   │   └── onnx_test_vectors/ # Dữ liệu chuẩn cho ONNX Demo
+        │   └── java/com/example/driverguardian/
+        │       ├── MainActivity.kt
+        │       ├── ui/
+        │       │   ├── navigation/ # Route, NavHost và bố cục điều hướng
+        │       │   ├── screens/    # Màn hình theo chức năng
+        │       │   ├── components/ # Thành phần giao diện dùng chung
+        │       │   ├── theme/      # Màu sắc, typography, theme Compose
+        │       │   └── mock/       # Kiểu dữ liệu và dữ liệu mô phỏng
+        │       └── ai/
+        │           ├── detection/ # Pipeline backbone + neck
+        │           ├── runtime/   # Session ONNX, metadata, trạng thái và lỗi
+        │           ├── tensor/    # Tensor FLOAT, shape, dummy input và preview
+        │           ├── contract/drowsiness/ # Hợp đồng mô hình buồn ngủ
+        │           └── parity/    # Nạp và so sánh dữ liệu chuẩn
+        └── test/                  # Unit test cho các thành phần AI
 ```
 
-Override bằng Gradle property, không sửa source:
+## 2. Giao diện và điều hướng
 
-```powershell
-.\gradlew.bat :app:assembleDebug -PDRIVER_GUARDIAN_API_BASE_URL=http://192.168.1.10:8000/
+[MainActivity](app/src/main/java/com/example/driverguardian/MainActivity.kt) là điểm vào duy nhất, khởi tạo Compose theo thứ tự `DriverGuardianTheme → DriverGuardianApp`. Activity được cấu hình hiển thị ngang trong manifest.
+
+[AppNavigation](app/src/main/java/com/example/driverguardian/ui/navigation/AppNavigation.kt) quản lý `NavController`, `SnackbarHostState` và `AppNavHost`. Các route được khai báo trong [Screen](app/src/main/java/com/example/driverguardian/ui/navigation/Screen.kt). Mỗi màn hình nhận callback điều hướng từ NavHost.
+
+- Chiều rộng từ `720.dp`: dùng sidebar; nhỏ hơn: dùng thanh điều hướng dưới.
+- Màn hình cảnh báo nguy hiểm ẩn cả hai thanh điều hướng.
+- `safeNavigate()` dùng `launchSingleTop` để tránh tạo thêm bản sao của đích đang ở trên cùng back stack.
+- `ui/components` cung cấp card, nút, chỉ báo trạng thái và biểu đồ dùng chung; `ui/theme` định nghĩa giao diện sáng/tối.
+
+Luồng chuyến đi được tổ chức như sau:
+
+```mermaid
+flowchart LR
+    Home[Trang chủ] --> Selection[Chọn tài xế và xe]
+    Selection --> PreTrip[Kiểm tra trước chuyến đi]
+    PreTrip --> Driving[Giám sát chuyến đi]
+    Driving --> Danger[Cảnh báo demo]
+    Danger --> Driving
+    Driving --> Summary[Tổng kết chuyến đi]
+    Summary --> Detail[Chi tiết chuyến đi]
+    Summary --> Home
 ```
 
-Build tự thêm dấu `/` cuối nếu thiếu. Quyền `INTERNET` nằm trong main manifest; HTTP cleartext chỉ được bật trong debug manifest để phục vụ local development.
+Các nhóm màn hình còn lại gồm lịch sử chuyến đi, lịch sử cảnh báo, phân tích, cài đặt và thông tin hệ thống. Màn hình hệ thống dẫn tới ONNX Demo. Chi tiết chuyến đi nhận tham số qua route `trip_detail/{id}`.
 
-## Backend endpoints đang dùng
+## 3. Dữ liệu và quản lý trạng thái
 
-- `GET /drivers`
-- `GET /vehicles`
-- `GET /model-versions/active`
-- `POST /sessions`
-- `POST /events`
-- `POST /sessions/{id}/complete`
-- `GET /sessions`
-- `GET /sessions/{id}`
-- `GET /sessions/{id}/events`
-- `POST /events/{id}/acknowledge`
+Các màn hình nghiệp vụ đọc `MockData` và `AiAnalyticsMockData` trong `ui/mock`. Trạng thái giao diện như bộ lọc, lựa chọn xe và tùy chọn cài đặt được giữ cục bộ bằng state của Compose. Ứng dụng chưa có lớp repository hoặc cơ chế lưu trữ bền vững cho các dữ liệu này.
 
-Datetime được giữ dưới dạng `String` theo response hiện tại. `DrivingSession.modelVersionId`, event `confidence` và `durationMs` giữ nullable đúng backend contract. Mapping cảnh báo là `WARNING -> 1`, `DANGER -> 2`.
+Riêng ONNX Demo tổ chức theo Screen–ViewModel:
 
-## Luồng hiện tại
-
-1. Shared ViewModel tải drivers, vehicles và active model. Loading, empty và error được hiển thị; không fallback sang `MockData`.
-2. Người dùng chọn driver và vehicle thật. Chỉ có thể tiếp tục khi đủ hai lựa chọn và active model.
-3. PreTrip vẫn hiển thị các kiểm tra thiết bị mock nhưng hiển thị riêng trạng thái backend/model. Nút bắt đầu gọi `POST /sessions` và chỉ điều hướng khi thành công.
-4. ActiveDriving hiển thị driver, vehicle và session backend thật. Metric AI được ghi rõ là demo/mock.
-5. Demo danger gọi `POST /events` với `DANGER`, level `2`; DangerAlert chỉ đóng sau khi acknowledgement được backend xác nhận.
-6. Kết thúc chuyến gọi completion API; summary chỉ mở sau khi completed session và persisted events đã tải thành công.
-7. Summary, history và detail dùng session/event thật; null score/metric/end time hiển thị `—`, không tạo số mặc định.
-
-## Xử lý lỗi
-
-Repository trả kết quả lỗi rõ ràng cho connection refused, timeout, HTTP 4xx/5xx và response parsing. UI chỉ hiển thị thông báo tổng quát, không hiển thị stack trace hoặc nội dung lỗi database. Empty driver/vehicle list và active-model 404 chặn tạo session thay vì dùng dữ liệu giả.
-
-## Giới hạn hiện tại
-
-- Chưa có offline persistence/retry queue; mất mạng sẽ trả lỗi và người dùng thử lại thủ công.
-- Camera/inference runtime chưa được nối vào session flow; các metric AI và pre-trip hardware checks vẫn là mock.
-- Analytics, alert-history, home dashboard và các tiện ích map/music/report vẫn là mock hoặc chưa hỗ trợ; trip summary/history/detail không còn dùng `MockData`.
-- Backend hiện chưa tính `safety_score`; UI giữ và hiển thị `NULL` thành `—`.
-- Chưa tích hợp CameraX hoặc asset mô hình ONNX thật vào luồng lái xe production.
-
-## Build và test
-
-```powershell
-.\gradlew.bat :app:testDebugUnitTest :app:assembleDebug --console=plain --no-daemon
+```mermaid
+flowchart LR
+    Screen[OnnxDemoScreen] -->|Thao tác người dùng| VM[OnnxDemoViewModel]
+    VM -->|Nạp model và suy luận| Engine[OnnxRuntimeEngine]
+    VM -->|Kiểm tra hợp đồng| Contract[DrowsinessModelContract]
+    VM -->|Kiểm chứng kết quả| Parity[GoldenVectorLoader và Runner]
+    VM --> State[StateFlow OnnxDemoUiState]
+    State -->|collectAsState| Screen
 ```
 
-Contract tests dùng MockWebServer, không cần FastAPI hay Oracle đang chạy.
+[OnnxDemoViewModel](app/src/main/java/com/example/driverguardian/ui/screens/onnxdemo/OnnxDemoViewModel.kt) điều phối đọc assets trên `Dispatchers.IO`, nạp model và suy luận trên `Dispatchers.Default`. `OnnxDemoUiState` chứa trạng thái runtime, metadata, diagnostics, kết quả suy luận và kết quả kiểm chứng. ViewModel đóng runtime trong `onCleared()`.
+
+## 4. Các thành phần AI
+
+### Runtime ONNX
+
+[OnnxRuntimeEngine](app/src/main/java/com/example/driverguardian/ai/runtime/OnnxRuntimeEngine.kt) quản lý một session đang hoạt động và cung cấp `loadModel()`, `run()`, `close()`. Các thao tác được tuần tự hóa bằng khóa đồng bộ. Kết quả trả về qua `RuntimeResult.Success` hoặc `RuntimeResult.Failure`.
+
+`OnnxModelSession` kiểm tra tên input, kiểu dữ liệu, shape và số phần tử; chuyển `FloatTensor` thành tensor native; thực thi ONNX và sao chép đầu ra về Kotlin. Tensor native và kết quả native được đóng sau mỗi lần chạy. Khi đổi model, engine đóng session cũ và reset diagnostics.
+
+`RuntimeState` gồm `NotLoaded`, `Loading`, `Ready`, `Running`, `Failed`, `Closed`. `RuntimeDiagnostics` lưu phiên bản runtime, tên model, thời gian nạp, thời gian suy luận, số lượt chạy và lỗi gần nhất.
+
+### Tensor
+
+`FloatTensor` chứa shape và mảng `FloatArray`. `TensorShape` kiểm tra kích thước và chống tràn số khi đếm phần tử. `DummyTensorFactory` tạo input toàn số 0 theo metadata, có giới hạn cấp phát và yêu cầu kích thước cụ thể cho chiều động. `TensorPreviewFactory` tạo phần dữ liệu xem trước để hiển thị trên UI.
+
+### Pipeline backbone + neck
+
+[BackboneNeckPipeline](app/src/main/java/com/example/driverguardian/ai/detection/BackboneNeckPipeline.kt) sở hữu một engine riêng, nạp `assets/models/backbone_neck.onnx` và kiểm tra contract trước khi chạy.
+
+| Tensor | Kiểu | Shape |
+| --- | --- | --- |
+| Input `images` | FLOAT, NCHW | `[B, 3, 640, 640]` |
+| Output `p3` | FLOAT, NCHW | `[B, 64, 80, 80]` |
+| Output `p4` | FLOAT, NCHW | `[B, 128, 40, 40]` |
+| Output `p5` | FLOAT, NCHW | `[B, 256, 20, 20]` |
+
+`B` là batch size dương. Bên gọi cung cấp tensor ảnh RGB đã tiền xử lý và chia 255. Pipeline trả `BackboneNeckFeatures`, gồm toàn bộ ba feature map và thời gian suy luận. Các mảng đầu ra vẫn dùng được sau khi pipeline đóng.
+
+Pipeline chỉ trích xuất đặc trưng; chưa có detection head, giải mã bounding box hoặc nối với camera. Chủ sở hữu giữ pipeline để chạy nhiều lần trên luồng nền và gọi `close()` khi kết thúc vòng đời.
+
+### Hợp đồng mô hình buồn ngủ
+
+`DrowsinessModelContract` tách kiểm tra metadata khỏi ánh xạ ngữ nghĩa của các node:
+
+| Thành phần | Shape FLOAT kỳ vọng |
+| --- | --- |
+| Chuỗi mắt trái, mắt phải, miệng — mỗi input | `[1, 30, 3, 64, 64]` |
+| Chuỗi đặc trưng hình học | `[1, 30, 10]` |
+| Xác suất buồn ngủ | `[1, 1]` |
+
+`DrowsinessInputMapping` khai báo tên node cho từng input và output. ONNX Demo hiện dùng `Unresolved`; ba input ảnh cùng shape nên contract không tự suy đoán ý nghĩa của chúng. Thành phần này kiểm tra quy ước tensor, không thực hiện tiền xử lý ảnh hoặc tạo chuỗi khung hình.
+
+### Kiểm chứng số học
+
+`GoldenVectorAssetLoader` đọc manifest và tensor FLOAT32 little-endian từ assets, kiểm tra shape và tên tensor. `GoldenVectorRunner` so sánh đầu ra với dữ liệu chuẩn theo sai số tuyệt đối và tương đối, trả `PASS`, `FAIL`, `ERROR` hoặc `NOT_RUN`. ONNX Demo yêu cầu runtime lấy đầy đủ output khi chạy các phép so sánh này.
+
+## 5. Ranh giới tích hợp hiện tại
+
+Model backbone + neck nằm trong `app/src/main/assets/models`. Model buồn ngủ mà ONNX Demo yêu cầu tại `models/drowsiness_model.onnx` chưa có; `onnx_test_vectors` hiện chưa chứa bộ dữ liệu chuẩn.
+
+Phần AI và giao diện chuyến đi hiện hoạt động tách biệt. Các trạng thái giám sát, cảnh báo và phân tích trên màn hình vẫn lấy từ dữ liệu mô phỏng; chưa có luồng camera → tiền xử lý → suy luận → cập nhật trạng thái chuyến đi.

@@ -24,6 +24,8 @@ local.properties
 *.jar
 !gradle/wrapper/gradle-wrapper.jar
 
+!**/gradle/wrapper/gradle-wrapper.jar
+
 # NDK / CMake native build artifacts
 .externalNativeBuild/
 .cxx/
@@ -93,6 +95,7 @@ coverage.xml
 **/.ipynb_checkpoints/
 *-checkpoint.ipynb
 
+
 # ------------------------------------------------------------------------------
 # AI Models, Weights & Datasets
 # ------------------------------------------------------------------------------
@@ -112,6 +115,7 @@ coverage.xml
 *.joblib
 *.onnx
 *.rar
+
 
 # Checkpoints, training runs & data label directories
 **/checkpoints*/
@@ -208,3 +212,4 @@ Desktop.ini
 *.swp
 *.swo
 *.bak
+/paper

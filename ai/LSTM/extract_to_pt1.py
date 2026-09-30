@@ -56,8 +56,15 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
-# Ngăn chặn xung đột OpenMP runtime trên Windows
+# Thêm thư mục hiện tại vào sys.path để các tiến trình multiprocessing nạp module an toàn
+current_file_dir = str(Path(__file__).resolve().parent)
+if current_file_dir not in sys.path:
+    sys.path.insert(0, current_file_dir)
+
+# Ngăn chặn xung đột OpenMP runtime và tối ưu cấp phát bộ nhớ CUDA
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["ORT_LOG_LEVEL"] = "3"
 
 # Tích hợp theo dõi bộ nhớ qua psutil nếu có sẵn
 try:
@@ -68,6 +75,7 @@ except ImportError:
 
 import torch
 import torch.nn.functional as F
+import torch.multiprocessing as mp
 import numpy as np
 import cv2
 from tqdm import tqdm
@@ -109,7 +117,7 @@ else:
     DEFAULT_DATA_DIR = STRUCT_DATASET_DEFAULT_PATH
 
 DEFAULT_SEQ_LEN = getattr(TrainConfig, "seq_len", None)  # Mặc định None (chuỗi động)
-DEFAULT_SAMPLE_INTERVAL = getattr(TrainConfig, "sample_interval", 0.25)
+DEFAULT_SAMPLE_INTERVAL = 0.1  # Mặc định 0.1s (Target FPS = 10.0 theo kế hoạch tăng tốc)
 DEFAULT_IMAGE_SIZE = TrainConfig.image_size[0] if isinstance(TrainConfig.image_size, (tuple, list)) else TrainConfig.image_size
 DEFAULT_VIDEO_EXTS = ",".join(TrainConfig.video_exts) if isinstance(TrainConfig.video_exts, (tuple, list)) else ".mp4,.avi,.mkv,.mov"
 
@@ -149,9 +157,10 @@ def letterbox(image: np.ndarray, new_size: int = 640, color=(114, 114, 114)) -> 
 class CloneONNXCUDARuntime:
     """Quản lý suy luận ONNX Runtime trên GPU CUDA với I/O Binding (hỗ trợ CPU fallback)."""
 
-    def __init__(self, onnx_model_path: str, device_id: int = 0):
+    def __init__(self, onnx_model_path: str, device_id: int = 0, cudnn_algo: str = "EXHAUSTIVE"):
         self.onnx_model_path = str(onnx_model_path)
         self.device_id = device_id
+        self.cudnn_algo = str(cudnn_algo).upper()
 
         if not os.path.exists(self.onnx_model_path):
             raise FileNotFoundError(f"Không tìm thấy file ONNX: {self.onnx_model_path}")
@@ -163,7 +172,8 @@ class CloneONNXCUDARuntime:
         cuda_options = {
             "device_id": self.device_id,
             "arena_extend_strategy": "kNextPowerOfTwo",
-            "cudnn_conv_algo_search": "HEURISTIC",
+            "cudnn_conv_algo_search": self.cudnn_algo,
+            "cudnn_conv_use_max_workspace": "1",
             "do_copy_in_default_stream": True,
         }
         providers = [
@@ -227,13 +237,14 @@ class CloneONNXCUDARuntime:
 def read_and_sample_video_frames(
         video_path: Path,
         seq_len: Optional[int] = None,
-        sample_interval: float = 0.25,
+        sample_interval: float = 0.1,
         img_size: int = 640
 ) -> Tuple[List[np.ndarray], int]:
     """
     Đọc nhanh video clip, letterbox sang kích thước cố định và định dạng RGB (uint8).
+    Áp dụng Sequential Stream Decoding một chiều (loại bỏ hoàn toàn cap.set overhead).
     Đồng bộ logic lấy mẫu thời gian:
-    - Cứ mỗi khoảng thời gian sample_interval (mặc định 0.25s) lấy 1 khung hình qua frame_step = sample_interval * fps.
+    - Cứ mỗi khoảng thời gian sample_interval (mặc định 0.1s - Target FPS 10.0) lấy 1 khung hình qua frame_step = sample_interval * fps.
     - Nếu seq_len is None: Lấy toàn bộ các khung hình thực tế của clip theo chu kỳ t (không padding).
     - Nếu seq_len is not None: Pad lặp lại khung hình cuối cùng hoặc cắt ngắn về đúng seq_len.
 
@@ -253,38 +264,7 @@ def read_and_sample_video_frames(
     frame_step = max(sample_interval * fps, 1.0)
     frames = []
 
-    if total_frames <= 0:
-        # Fallback đọc tuần tự nếu header không ghi tổng số frame
-        raw_frames = []
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            raw_frames.append(frame)
-        cap.release()
-
-        n_raw = len(raw_frames)
-        if n_raw == 0:
-            raise ValueError(f"Video không chứa khung hình nào: {video_path}")
-
-        indices = []
-        k = 0
-        while True:
-            idx = int(round(k * frame_step))
-            if idx >= n_raw:
-                break
-            indices.append(idx)
-            k += 1
-            if seq_len is not None and len(indices) >= seq_len:
-                break
-
-        for idx in indices:
-            rgb = cv2.cvtColor(raw_frames[idx], cv2.COLOR_BGR2RGB)
-            lb = letterbox(rgb, new_size=img_size)
-            frames.append(lb)
-
-        del raw_frames
-    else:
+    if total_frames > 0:
         indices = []
         k = 0
         while True:
@@ -296,24 +276,72 @@ def read_and_sample_video_frames(
             if seq_len is not None and len(indices) >= seq_len:
                 break
 
-        for idx in indices:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        if len(indices) == 0 and total_frames > 0:
+            indices = [0]
+
+        indices_set = set(indices)
+        max_target_idx = max(indices) if indices else 0
+
+        cur_idx = 0
+        while cur_idx <= max_target_idx:
             ret, frame = cap.read()
-            if ret:
+            if not ret:
+                break
+            if cur_idx in indices_set:
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                lb = letterbox(rgb, new_size=img_size)
-                frames.append(lb)
-            else:
-                blank = np.zeros((img_size, img_size, 3), dtype=np.uint8)
-                frames.append(blank)
+                frames.append(letterbox(rgb, new_size=img_size))
+            cur_idx += 1
         cap.release()
+
+        actual_frames = len(frames)
+        if actual_frames == 0:
+            actual_frames = 1
+            frames = [np.zeros((img_size, img_size, 3), dtype=np.uint8)]
+
+        # Chỉ thực hiện padding nếu seq_len được chỉ định cụ thể
+        if seq_len is not None:
+            while len(frames) < seq_len:
+                frames.append(frames[-1].copy())
+            frames = frames[:seq_len]
+
+        return frames, actual_frames
+
+    # Fallback đọc tuần tự nếu header không ghi tổng số frame (stream không rõ độ dài)
+    raw_frames = []
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        raw_frames.append(frame)
+    cap.release()
+
+    n_raw = len(raw_frames)
+    if n_raw == 0:
+        raise ValueError(f"Video không chứa khung hình nào: {video_path}")
+
+    indices = []
+    k = 0
+    while True:
+        idx = int(round(k * frame_step))
+        if idx >= n_raw:
+            break
+        indices.append(idx)
+        k += 1
+        if seq_len is not None and len(indices) >= seq_len:
+            break
+
+    for idx in indices:
+        rgb = cv2.cvtColor(raw_frames[idx], cv2.COLOR_BGR2RGB)
+        lb = letterbox(rgb, new_size=img_size)
+        frames.append(lb)
+
+    del raw_frames
 
     actual_frames = len(frames)
     if actual_frames == 0:
         actual_frames = 1
         frames = [np.zeros((img_size, img_size, 3), dtype=np.uint8)]
 
-    # Chỉ thực hiện padding nếu seq_len được chỉ định cụ thể
     if seq_len is not None:
         while len(frames) < seq_len:
             frames.append(frames[-1].copy())
@@ -325,18 +353,18 @@ def read_and_sample_video_frames(
 def forward_video_chunks(
         frames_rgb: List[np.ndarray],
         runner: CloneONNXCUDARuntime,
-        chunk_size: int = 24,
+        chunk_size: int = 64,
         device: str = "cuda:0",
-        use_fp16: bool = False
+        use_fp16: bool = True
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Forward danh sách khung hình RGB qua mô hình ONNX theo từng mini-chunk
     kết hợp Adaptive Average Pooling (1, 1).
 
-    Cơ chế tối ưu RAM (Streaming Mini-Chunk):
-    - KHÔNG tạo Tensor 4D toàn bộ video [T, 3, 640, 640] trong RAM.
-    - Chỉ chuyển đổi NumPy sang Tensor float32 đúng cho từng mini-chunk (chunk_size frames).
-    - Áp dụng Early FP16 ngay sau pooling nếu use_fp16=True để tiết kiệm 50% RAM.
+    Cơ chế tối ưu hóa tốc độ & RAM:
+    - Truyền trực tiếp mảng NumPy uint8 qua bus PCIe (giảm 75% tải bus so với Float32).
+    - Chuẩn hóa .float().div_(255.0) song song trực tiếp trên GPU CUDA Tensor Cores.
+    - Áp dụng Early FP16 ngay sau pooling nếu use_fp16=True để tiết kiệm 50% RAM/Disk.
 
     Returns:
         p3_tensor: [T, 64] on CPU (float16 nếu use_fp16, ngược lại float32)
@@ -364,10 +392,12 @@ def forward_video_chunks(
     p3_chunks, p4_chunks, p5_chunks = [], [], []
     for i in range(0, seq_len, chunk_size):
         chunk_frames = frames_rgb[i : i + chunk_size]
-        # Chỉ chuyển đổi đúng chunk_size ảnh sang Tensor Float32 trong RAM
+        # Gom mảng uint8 dạng NCHW
         chunk_np = np.stack([np.ascontiguousarray(f.transpose(2, 0, 1)) for f in chunk_frames], axis=0)
-        chunk_tensor = torch.from_numpy(chunk_np).float() / 255.0
-        chunk_tensor = chunk_tensor.to(target_device, non_blocking=True)
+        # Chuyển uint8 sang GPU qua PCIe (tiết kiệm 75% PCIe bandwidth)
+        chunk_tensor = torch.from_numpy(chunk_np).to(target_device, non_blocking=True)
+        # Chuẩn hóa trên GPU
+        chunk_tensor = chunk_tensor.float().div_(255.0)
 
         outs = runner.forward(chunk_tensor)
 
@@ -398,11 +428,11 @@ def extract_single_video_features(
         video_path: Path,
         runner: CloneONNXCUDARuntime,
         seq_len: Optional[int] = None,
-        sample_interval: float = 0.25,
+        sample_interval: float = 0.1,
         img_size: int = 640,
-        chunk_size: int = 24,
+        chunk_size: int = 64,
         device: str = "cuda:0",
-        use_fp16: bool = False,
+        use_fp16: bool = True,
         augmenter: Optional[DetectionAugmenter] = None,
         aug_seed: Optional[int] = None
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
@@ -639,12 +669,12 @@ def consolidate_split_features(
         cache_files: List[Path],
         output_pt_path: Path,
         seq_len: Optional[int] = None,
-        sample_interval: float = 0.25,
-        use_fp16: bool = False,
+        sample_interval: float = 0.1,
+        use_fp16: bool = True,
         is_augmented_split: bool = False,
         num_aug: int = 0,
         actual_include_original: bool = True,
-        shard_size: Optional[int] = None
+        shard_size: Optional[int] = 5000
 ) -> None:
     """
     Pha 2: Đóng gói các đặc trưng từ cache trên đĩa thành tệp .pt hoàn chỉnh.
@@ -799,17 +829,17 @@ def process_split_set(
         output_pt_path: Path,
         cache_dir: Path,
         seq_len: Optional[int] = None,
-        sample_interval: float = 0.25,
+        sample_interval: float = 0.1,
         img_size: int = 640,
-        chunk_size: int = 24,
-        use_fp16: bool = False,
+        chunk_size: int = 64,
+        use_fp16: bool = True,
         augmenter: Optional[DetectionAugmenter] = None,
-        num_aug: int = 0,
+        num_aug: int = 4,
         include_original: bool = True,
         base_seed: int = 42,
         force_recompute: bool = False,
         gc_interval: int = 50,
-        shard_size: Optional[int] = None,
+        shard_size: Optional[int] = 5000,
         skip_package: bool = False
 ) -> None:
     """
@@ -832,12 +862,19 @@ def process_split_set(
     split_cache_dir = cache_dir / split_name
     split_cache_dir.mkdir(parents=True, exist_ok=True)
 
-    # Khởi động trước (Warm-up) mô hình
-    print("[+] Khởi động (Warm-up) ONNX Execution Provider...")
+    # Khởi động trước (Warm-up) mô hình: warm up cả batch chính và batch dư nếu có (ví dụ 64 và 36 cho 100 frames)
+    print(f"[+] Khởi động (Warm-up) ONNX cuDNN Execution Provider (batch={chunk_size})...")
     warmup_device = f"cuda:{runner.device_id}" if (runner.use_cuda and torch.cuda.is_available()) else "cpu"
-    dummy = torch.zeros(chunk_size, 3, img_size, img_size, device=warmup_device)
-    runner.forward(dummy)
-    del dummy
+    dummy_main = torch.zeros(chunk_size, 3, img_size, img_size, device=warmup_device)
+    runner.forward(dummy_main)
+    del dummy_main
+    remainder = (seq_len % chunk_size) if (seq_len is not None and seq_len % chunk_size != 0) else (100 % chunk_size)
+    if remainder > 0 and remainder != chunk_size:
+        dummy_rem = torch.zeros(remainder, 3, img_size, img_size, device=warmup_device)
+        runner.forward(dummy_rem)
+        del dummy_rem
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     print("[+] Khởi động hoàn tất!")
 
     cache_files_for_packaging: List[Path] = []
@@ -993,6 +1030,368 @@ def process_split_set(
 
 
 # ==============================================================================
+# 5.1. TIẾN TRÌNH CON ĐA GPU (MULTI-GPU WORKER LOOP & DISPATCHER)
+# ==============================================================================
+def gpu_worker_loop(
+        worker_id: int,
+        gpu_id: int,
+        task_queue,
+        result_queue,
+        onnx_model_path: str,
+        split_cache_dir_str: str,
+        seq_len: Optional[int] = None,
+        sample_interval: float = 0.1,
+        img_size: int = 640,
+        chunk_size: int = 64,
+        use_fp16: bool = True,
+        augment_enabled: bool = False,
+        num_aug: int = 4,
+        include_original: bool = True,
+        base_seed: int = 42,
+        aug_config: Optional[dict] = None,
+        force_recompute: bool = False,
+        gc_interval: int = 50,
+        cudnn_algo: str = "EXHAUSTIVE"
+):
+    """
+    Vòng lặp worker chạy độc lập trên 1 GPU CUDA riêng biệt trong hồ đa tiến trình.
+    Thực hiện trích xuất theo 5 chiến lược kỹ thuật tăng tốc đột phá:
+    1. Sequential Stream Decoding một chiều (loại bỏ cap.set).
+    2. Tái sử dụng raw_frames cho toàn bộ num_aug trong RAM (In-Memory Augmentation).
+    3. Mở rộng batch chunk_size (mặc định 64/100).
+    4. Uint8 H2D PCIe Transfer + chuẩn hóa song song trên GPU CUDA cores.
+    5. Cache-First Fault Tolerance & Intermediate Commit.
+    """
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.set_device(gpu_id)
+        device_str = f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu"
+
+        runner = CloneONNXCUDARuntime(onnx_model_path=onnx_model_path, device_id=gpu_id, cudnn_algo=cudnn_algo)
+        # Khởi động trước (Warm-up) mô hình: warm up cả chunk_size và batch dư (ví dụ 64 và 36)
+        dummy_main = torch.zeros(chunk_size, 3, img_size, img_size, device=device_str)
+        runner.forward(dummy_main)
+        del dummy_main
+        remainder = (seq_len % chunk_size) if (seq_len is not None and seq_len % chunk_size != 0) else (100 % chunk_size)
+        if remainder > 0 and remainder != chunk_size:
+            dummy_rem = torch.zeros(remainder, 3, img_size, img_size, device=device_str)
+            runner.forward(dummy_rem)
+            del dummy_rem
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        augmenter = None
+        if augment_enabled and num_aug > 0:
+            cfg_dict = aug_config if aug_config else dict(DEFAULT_AUG_CONFIG)
+            augmenter = DetectionAugmenter(cfg_dict)
+
+        split_cache_dir = Path(split_cache_dir_str)
+        split_cache_dir.mkdir(parents=True, exist_ok=True)
+        is_augmented = (augmenter is not None and num_aug > 0)
+        actual_include_original = include_original if is_augmented else True
+
+        result_queue.put({"type": "ready", "worker_id": worker_id, "gpu_id": gpu_id})
+        processed_count = 0
+
+        while True:
+            task = task_queue.get()
+            if task is None:
+                break
+
+            video_path_str, label, clip_id, video_id, dataset, subject_id = task
+            video_path = Path(video_path_str)
+
+            targets = []
+            if actual_include_original:
+                targets.append({"sub_id": video_id, "is_aug": False, "aug_idx": 0, "seed": None})
+            if is_augmented:
+                for k in range(1, num_aug + 1):
+                    aug_id = f"{video_id}_aug{k}"
+                    aug_seed = (base_seed + int(hashlib.md5(aug_id.encode("utf-8")).hexdigest()[:8], 16)) % (2 ** 31 - 1)
+                    targets.append({"sub_id": aug_id, "is_aug": True, "aug_idx": k, "seed": aug_seed})
+
+            needed_targets = []
+            for t in targets:
+                cache_file = split_cache_dir / f"{t['sub_id']}.pt"
+                if force_recompute or not cache_file.exists():
+                    needed_targets.append(t)
+                else:
+                    try:
+                        cdata = torch.load(cache_file, map_location="cpu")
+                        c_interval = cdata.get("sample_interval", None)
+                        if c_interval is not None and abs(c_interval - sample_interval) > 1e-4:
+                            needed_targets.append(t)
+                    except Exception:
+                        needed_targets.append(t)
+
+            if len(needed_targets) == 0:
+                result_queue.put({
+                    "type": "done",
+                    "worker_id": worker_id,
+                    "gpu_id": gpu_id,
+                    "video_id": video_id,
+                    "status": "cached",
+                    "targets": [t["sub_id"] for t in targets]
+                })
+                continue
+
+            try:
+                # Đọc và giải mã video gốc DUY NHẤT 1 LẦN (In-Memory Augmentation)
+                raw_frames, actual_frames = read_and_sample_video_frames(
+                    video_path=video_path,
+                    seq_len=seq_len,
+                    sample_interval=sample_interval,
+                    img_size=img_size
+                )
+
+                for t in needed_targets:
+                    if t["is_aug"]:
+                        aug_frames, _, _, _ = augmenter.augment_video(frames=raw_frames, seed=t["seed"])
+                        p3, p4, p5 = forward_video_chunks(
+                            frames_rgb=aug_frames,
+                            runner=runner,
+                            chunk_size=chunk_size,
+                            device=device_str,
+                            use_fp16=use_fp16
+                        )
+                        del aug_frames
+                    else:
+                        p3, p4, p5 = forward_video_chunks(
+                            frames_rgb=raw_frames,
+                            runner=runner,
+                            chunk_size=chunk_size,
+                            device=device_str,
+                            use_fp16=use_fp16
+                        )
+
+                    cache_file = split_cache_dir / f"{t['sub_id']}.pt"
+                    torch.save({
+                        "video_id": t["sub_id"],
+                        "clip_id": clip_id,
+                        "label": label,
+                        "p3": p3,
+                        "p4": p4,
+                        "p5": p5,
+                        "actual_frames": actual_frames,
+                        "sample_interval": sample_interval,
+                        "is_augmented": t["is_aug"],
+                        "aug_seed": t["seed"],
+                        "dataset": dataset,
+                        "subject_id": subject_id
+                    }, cache_file)
+                    del p3, p4, p5
+
+                del raw_frames
+                processed_count += 1
+
+                if processed_count % gc_interval == 0:
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+                result_queue.put({
+                    "type": "done",
+                    "worker_id": worker_id,
+                    "gpu_id": gpu_id,
+                    "video_id": video_id,
+                    "status": "extracted",
+                    "targets": [t["sub_id"] for t in targets]
+                })
+
+            except Exception as e:
+                result_queue.put({
+                    "type": "error",
+                    "worker_id": worker_id,
+                    "gpu_id": gpu_id,
+                    "video_id": video_id,
+                    "error": str(e)
+                })
+
+    except Exception as fatal_e:
+        result_queue.put({
+            "type": "fatal_error",
+            "worker_id": worker_id,
+            "gpu_id": gpu_id,
+            "error": str(fatal_e)
+        })
+
+
+def run_multi_gpu_extraction(
+        split_name: str,
+        items: List[VideoClipItem],
+        device_ids: List[int],
+        onnx_path: Path,
+        output_dir: Path,
+        cache_dir: Path,
+        seq_len: Optional[int] = None,
+        sample_interval: float = 0.1,
+        img_size: int = 640,
+        chunk_size: int = 64,
+        use_fp16: bool = True,
+        augment_enabled: bool = False,
+        num_aug: int = 4,
+        include_original: bool = True,
+        base_seed: int = 42,
+        aug_config: Optional[dict] = None,
+        force_recompute: bool = False,
+        gc_interval: int = 50,
+        shard_size: Optional[int] = 5000,
+        skip_package: bool = False,
+        output_pt_path: Optional[Path] = None,
+        cudnn_algo: str = "EXHAUSTIVE"
+) -> List[Path]:
+    """
+    Điều phối trích xuất đặc trưng song song trên tất cả các GPU CUDA được chỉ định (ví dụ: Kaggle 2x Tesla T4).
+    Sử dụng hàng đợi công việc Task Queue và giám sát tiến độ thời gian thực qua tqdm.
+    """
+    num_workers = len(device_ids)
+    split_cache_dir = cache_dir / split_name
+    split_cache_dir.mkdir(parents=True, exist_ok=True)
+
+    print("\n" + "=" * 80)
+    print(f"[*] BẮT ĐẦU PHA 1: TRÍCH XUẤT ĐA GPU CHO PHÂN TẬP: {split_name.upper()} ({len(items)} CLIPS)")
+    print(f"[*] Thiết bị tham gia : {num_workers} GPUs ({['CUDA:' + str(i) for i in device_ids]})")
+    print(f"[*] Khoảng lấy mẫu     : t = {sample_interval}s (Target FPS = {1.0 / sample_interval:.1f})")
+    print(f"[*] Mini-chunk size   : {chunk_size} frames/batch")
+    print(f"[*] Precision         : {'Float16 (Tiết kiệm 50% RAM/Disk)' if use_fp16 else 'Float32'}")
+    print(f"[*] Tăng cường dữ liệu: {'BẬT (Số bản=' + str(num_aug) + ')' if augment_enabled else 'TẮT'}")
+    print(f"[*] cuDNN Conv Algo   : {cudnn_algo}")
+    print(f"[*] Thư mục Cache     : {split_cache_dir.resolve()}")
+    print("=" * 80)
+
+    ctx = mp.get_context("spawn")
+    task_queue = ctx.Queue()
+    result_queue = ctx.Queue()
+
+    # Nạp toàn bộ task vào queue
+    for it in items:
+        task_queue.put((
+            str(it.video_path),
+            it.label,
+            it.clip_id,
+            it.video_id,
+            it.dataset,
+            it.subject_id
+        ))
+    for _ in range(num_workers):
+        task_queue.put(None)  # Tín hiệu kết thúc cho từng worker
+
+    workers = []
+    for worker_id, gpu_id in enumerate(device_ids):
+        p = ctx.Process(
+            target=gpu_worker_loop,
+            kwargs=dict(
+                worker_id=worker_id,
+                gpu_id=gpu_id,
+                task_queue=task_queue,
+                result_queue=result_queue,
+                onnx_model_path=str(onnx_path),
+                split_cache_dir_str=str(split_cache_dir),
+                seq_len=seq_len,
+                sample_interval=sample_interval,
+                img_size=img_size,
+                chunk_size=chunk_size,
+                use_fp16=use_fp16,
+                augment_enabled=augment_enabled,
+                num_aug=num_aug if augment_enabled else 0,
+                include_original=include_original,
+                base_seed=base_seed,
+                aug_config=aug_config,
+                force_recompute=force_recompute,
+                gc_interval=gc_interval,
+                cudnn_algo=cudnn_algo
+            )
+        )
+        p.start()
+        workers.append(p)
+
+    # Chờ tất cả worker gửi tín hiệu ready
+    ready_count = 0
+    while ready_count < num_workers:
+        msg = result_queue.get()
+        if msg.get("type") == "ready":
+            ready_count += 1
+            print(f"    -> Worker {msg['worker_id']} sẵn sàng trên GPU CUDA:{msg['gpu_id']}")
+        elif msg.get("type") == "fatal_error":
+            print(f"[FATAL ERROR] Worker {msg['worker_id']} trên GPU CUDA:{msg['gpu_id']} lỗi: {msg['error']}")
+            for p in workers:
+                p.terminate()
+            raise RuntimeError(f"Worker khởi động thất bại: {msg['error']}")
+
+    print(f"[+] Tất cả {num_workers} GPU Workers đã sẵn sàng! Bắt đầu xử lý song song...")
+
+    pbar = tqdm(total=len(items), desc=f"[{split_name.upper()} - {num_workers} GPUs]")
+    cached_count, extracted_count, error_count, completed_videos = 0, 0, 0, 0
+    collected_cache_files: List[Path] = []
+
+    while completed_videos < len(items):
+        msg = result_queue.get()
+        msg_type = msg.get("type")
+
+        if msg_type == "done":
+            completed_videos += 1
+            status = msg.get("status")
+            if status == "cached":
+                cached_count += 1
+            else:
+                extracted_count += 1
+
+            for target_id in msg.get("targets", []):
+                cf = split_cache_dir / f"{target_id}.pt"
+                if cf.exists():
+                    collected_cache_files.append(cf)
+
+            ram_gb = get_current_ram_gb()
+            pbar.set_postfix({
+                "Mới": extracted_count,
+                "Cache": cached_count,
+                "Lỗi": error_count,
+                "RAM": f"{ram_gb:.2f}GB"
+            })
+            pbar.update(1)
+
+        elif msg_type == "error":
+            completed_videos += 1
+            error_count += 1
+            print(f"\n[WARN] Lỗi khi xử lý video {msg.get('video_id')} (GPU CUDA:{msg.get('gpu_id')}): {msg.get('error')}")
+            pbar.update(1)
+
+        elif msg_type == "fatal_error":
+            print(f"\n[FATAL] Worker {msg.get('worker_id')} (GPU CUDA:{msg.get('gpu_id')}) dừng đột ngột: {msg.get('error')}")
+            break
+
+    pbar.close()
+
+    for p in workers:
+        p.join()
+
+    print(f"[+] Hoàn tất Pha 1 ({split_name.upper()}): {completed_videos} videos | Mới: {extracted_count}, Cache: {cached_count}, Lỗi: {error_count}")
+
+    if len(collected_cache_files) == 0:
+        print(f"[WARN] Không có mẫu nào được thu thập cho phân tập {split_name.upper()}!")
+        return []
+
+    # Pha 2: Đóng gói
+    if skip_package or output_pt_path is None:
+        print(f"[*] Bỏ qua pha đóng gói theo tùy chọn --skip_package. Tệp cache tại: {split_cache_dir.resolve()}")
+        return collected_cache_files
+
+    consolidate_split_features(
+        split_name=split_name,
+        cache_files=collected_cache_files,
+        output_pt_path=output_pt_path,
+        seq_len=seq_len,
+        sample_interval=sample_interval,
+        use_fp16=use_fp16,
+        is_augmented_split=augment_enabled,
+        num_aug=num_aug if augment_enabled else 0,
+        actual_include_original=include_original,
+        shard_size=shard_size
+    )
+    return collected_cache_files
+
+
+# ==============================================================================
 # 6. ĐIỂM VÀO CHÍNH (MAIN ENTRY POINT)
 # ==============================================================================
 def parse_seq_len(val: Any) -> Optional[int]:
@@ -1006,9 +1405,22 @@ def parse_seq_len(val: Any) -> Optional[int]:
         raise argparse.ArgumentTypeError(f"seq_len phải là số nguyên dương hoặc None, nhận được: {val}")
 
 
+def parse_device_ids(val: Any) -> List[int]:
+    """Phân giải danh sách GPU index khả dụng, tự động phát hiện trên hệ thống."""
+    if not torch.cuda.is_available():
+        return [0]
+    total_gpus = torch.cuda.device_count()
+    if val is None or str(val).strip().lower() in ("auto", "none", "all", ""):
+        return list(range(total_gpus)) if total_gpus > 0 else [0]
+    if isinstance(val, (list, tuple)):
+        return [int(x) for x in val]
+    parts = [int(p.strip()) for p in str(val).split(",") if p.strip()]
+    return parts if parts else [0]
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Trích xuất đặc trưng video ra file .pt theo cấu trúc thư mục struct_dataset.md (Tối ưu hóa RAM)"
+        description="Trích xuất đặc trưng video ra file .pt theo cấu trúc thư mục struct_dataset.md (Tối ưu hóa Tốc độ & RAM)"
     )
     # Cấu hình đường dẫn dữ liệu
     parser.add_argument("--data_dir", type=str, default=DEFAULT_DATA_DIR,
@@ -1041,25 +1453,32 @@ def main():
 
     # Tham số phần cứng & kích thước ảnh
     parser.add_argument("--img_size", type=int, default=DEFAULT_IMAGE_SIZE, help="Kích thước resize letterbox (mặc định: 640)")
-    parser.add_argument("--chunk_size", type=int, default=24, help="Batch size khi forward ONNX (mặc định: 24)")
-    parser.add_argument("--device_id", type=int, default=0, help="CUDA device index (mặc định: 0)")
+    parser.add_argument("--chunk_size", type=int, default=64, help="Batch size khi forward ONNX (mặc định: 64)")
+    parser.add_argument("--device_ids", type=str, default="auto",
+                        help="Danh sách GPU index (ví dụ: '0,1' hoặc 'auto' để tự động phát hiện toàn bộ GPU)")
+    parser.add_argument("--device_id", type=int, default=None,
+                        help="[Tương thích cũ] CUDA device index đơn lẻ (nếu truyền, ghi đè --device_ids)")
     parser.add_argument("--limit", type=int, default=None,
                         help="Giới hạn số lượng video clip mỗi tập để chạy thử nghiệm (ví dụ: --limit 10)")
-    parser.add_argument("--fp16", action="store_true", help="Lưu đặc trưng dạng float16 (giảm 50%% dung lượng)")
+    parser.add_argument("--fp16", action=argparse.BooleanOptionalAction, default=True,
+                        help="Lưu đặc trưng dạng float16 (giảm 50%% dung lượng Disk/RAM, mặc định: True)")
+    parser.add_argument("--cudnn_algo", type=str, default="EXHAUSTIVE",
+                        choices=["EXHAUSTIVE", "HEURISTIC", "DEFAULT"],
+                        help="Thuật toán cuDNN conv search (mặc định: EXHAUSTIVE, tránh fallback chậm)")
 
     # Tùy chọn tối ưu hóa RAM & Đóng gói nâng cao
     parser.add_argument("--gc_interval", type=int, default=50,
                         help="Chu kỳ số clip thực hiện gc.collect() và empty_cache() (mặc định: 50)")
-    parser.add_argument("--shard_size", type=int, default=None,
-                        help="Số lượng mẫu tối đa trên mỗi tệp .pt phân mảnh (mặc định: None - Gộp 1 file duy nhất)")
+    parser.add_argument("--shard_size", type=int, default=5000,
+                        help="Số lượng mẫu tối đa trên mỗi tệp .pt phân mảnh (mặc định: 5000)")
     parser.add_argument("--skip_package", "--cache_only", action="store_true", default=False,
                         help="Chỉ trích xuất đặc trưng vào thư mục cache, bỏ qua pha gộp file .pt cuối cùng")
 
     # Tham số tăng cường dữ liệu (Data Augmentation) từ augment.py
     parser.add_argument("--augment", action=argparse.BooleanOptionalAction, default=True,
                         help="Bật/tắt tăng cường dữ liệu từ augment.py (mặc định: True)")
-    parser.add_argument("--num_aug", type=int, default=1,
-                        help="Số bản sao tăng cường cho mỗi video trong tập áp dụng augment (mặc định: 1)")
+    parser.add_argument("--num_aug", type=int, default=4,
+                        help="Số bản sao tăng cường cho mỗi video trong tập áp dụng augment (mặc định: 4)")
     parser.add_argument("--include_original", action=argparse.BooleanOptionalAction, default=True,
                         help="Giữ lại video gốc bên cạnh các bản sao tăng cường (mặc định: True)")
     parser.add_argument("--augment_splits", type=str, default="train",
@@ -1092,10 +1511,16 @@ def main():
     train_pt_path = output_dir / args.train_name
     val_pt_path = output_dir / args.val_name
 
+    # Xác định danh sách GPU xử lý
+    if args.device_id is not None:
+        device_ids = [args.device_id]
+    else:
+        device_ids = parse_device_ids(args.device_ids)
+
     print("=" * 75)
-    print("      HỆ THỐNG TRÍCH XUẤT ĐẶC TRƯNG LOCAL SANG PYTORCH TENSOR (.PT)      ")
+    print("      HỆ THỐNG TRÍCH XUẤT ĐẶC TRƯNG TĂNG TỐC SANG PYTORCH TENSOR (.PT)    ")
     print("      THEO ĐỊNH DẠNG CẤU TRÚC THƯ MỤC CHUẨN (STRUCT_DATASET.MD)         ")
-    print("      KÈM CƠ CHẾ TỐI ƯU HÓA BỘ NHỚ RAM NÂNG CAO (ZERO RAM ACCUMULATION)  ")
+    print("      KẾT HỢP DUAL-GPU WORKER POOL & SEQUENTIAL STREAM DECODING          ")
     print("=" * 75)
     print(f"[*] Dataset Directory : {data_dir.resolve()}")
     print(f"[*] Metadata Split    : {split_file_path.resolve() if split_file_path else 'Tự động phát hiện (Auto-detect)'}")
@@ -1107,6 +1532,8 @@ def main():
     print(f"[*] Sequence Length   : {args.seq_len if args.seq_len is not None else 'None (Cách 1: List[torch.Tensor] tự nhiên)'}")
     print(f"[*] Chunk Size        : {args.chunk_size}")
     print(f"[*] Precision         : {'Float16 (Tiết kiệm 50% RAM/Disk)' if args.fp16 else 'Float32'}")
+    print(f"[*] Thiết bị GPU xử lý: {device_ids} ({len(device_ids)} GPU song song)")
+    print(f"[*] cuDNN Conv Algo   : {args.cudnn_algo}")
     print(f"[*] GC Interval       : Mỗi {args.gc_interval} clips")
     print(f"[*] Shard Size        : {args.shard_size if args.shard_size else 'Không phân mảnh (Gộp 1 file duy nhất)'}")
     print(f"[*] Skip Package      : {'BẬT (Chỉ lưu cache)' if args.skip_package else 'TẮT (Đóng gói tệp .pt)'}")
@@ -1150,20 +1577,22 @@ def main():
         }, f, indent=4, ensure_ascii=False)
     print(f"[+] Đã lưu thông tin kiểm định phân bổ tại: {split_info_save_path.resolve()}")
 
-    # 2. Khởi tạo ONNX Runtime
-    runner = CloneONNXCUDARuntime(str(onnx_path), device_id=args.device_id)
-
-    # Tự động đồng bộ img_size theo yêu cầu của mô hình ONNX nếu có
+    # 2. Kiểm tra input shape của mô hình ONNX an toàn qua CPU (không chạm context CUDA của parent)
     actual_img_size = args.img_size
-    if runner.expected_h is not None and runner.expected_h > 0:
-        if actual_img_size != runner.expected_h:
-            print(f"[!] Tự động điều chỉnh img_size từ {actual_img_size} -> {runner.expected_h} để khớp với input của mô hình ONNX.")
-            actual_img_size = runner.expected_h
+    try:
+        cpu_sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+        in_meta = cpu_sess.get_inputs()[0]
+        if len(in_meta.shape) > 2 and isinstance(in_meta.shape[2], int):
+            if actual_img_size != in_meta.shape[2]:
+                print(f"[!] Tự động điều chỉnh img_size từ {actual_img_size} -> {in_meta.shape[2]} để khớp với mô hình ONNX.")
+                actual_img_size = in_meta.shape[2]
+        del cpu_sess
+    except Exception:
+        pass
 
-    # 3. Khởi tạo DetectionAugmenter nếu bật augmentation
-    augmenter = None
+    # 3. Chuẩn bị cấu hình augmentation nếu bật
+    aug_cfg = dict(DEFAULT_AUG_CONFIG)
     if args.augment and args.num_aug > 0 and len(augment_splits) > 0:
-        aug_cfg = dict(DEFAULT_AUG_CONFIG)
         if args.aug_config:
             aug_cfg_path = Path(args.aug_config)
             if aug_cfg_path.exists():
@@ -1173,55 +1602,114 @@ def main():
                 print(f"[+] Đã nạp cấu hình augment tùy chỉnh từ: {aug_cfg_path}")
             else:
                 print(f"[WARN] Không tìm thấy file {aug_cfg_path}, dùng cấu hình mặc định từ augment.py")
-        augmenter = DetectionAugmenter(aug_cfg)
-        print(f"[+] Đã khởi tạo DetectionAugmenter với cấu hình:\n    {aug_cfg}")
 
-    # 4. Trích xuất tuần tự cho Train và Validation với quản lý bộ nhớ RAM tối ưu
+    # 4. Trích xuất đặc trưng cho Train và Validation
+    # Sử dụng Multi-GPU parallel worker pool nếu có từ 2 GPU trở lên, hoặc chạy trực tiếp nếu đơn GPU
+    use_multi_gpu = len(device_ids) > 1
+
     if "train" in active_splits and len(train_items) > 0:
         should_augment_train = args.augment and ("train" in augment_splits)
-        process_split_set(
-            split_name="train",
-            items=train_items,
-            runner=runner,
-            output_pt_path=train_pt_path,
-            cache_dir=cache_dir,
-            seq_len=args.seq_len,
-            sample_interval=args.sample_interval,
-            img_size=actual_img_size,
-            chunk_size=args.chunk_size,
-            use_fp16=args.fp16,
-            augmenter=augmenter if should_augment_train else None,
-            num_aug=args.num_aug if should_augment_train else 0,
-            include_original=args.include_original,
-            base_seed=args.aug_seed,
-            force_recompute=args.force_recompute,
-            gc_interval=args.gc_interval,
-            shard_size=args.shard_size,
-            skip_package=args.skip_package
-        )
+        if use_multi_gpu:
+            run_multi_gpu_extraction(
+                split_name="train",
+                items=train_items,
+                device_ids=device_ids,
+                onnx_path=onnx_path,
+                output_dir=output_dir,
+                cache_dir=cache_dir,
+                seq_len=args.seq_len,
+                sample_interval=args.sample_interval,
+                img_size=actual_img_size,
+                chunk_size=args.chunk_size,
+                use_fp16=args.fp16,
+                augment_enabled=should_augment_train,
+                num_aug=args.num_aug if should_augment_train else 0,
+                include_original=args.include_original,
+                base_seed=args.aug_seed,
+                aug_config=aug_cfg if should_augment_train else None,
+                force_recompute=args.force_recompute,
+                gc_interval=args.gc_interval,
+                shard_size=args.shard_size,
+                skip_package=args.skip_package,
+                output_pt_path=train_pt_path,
+                cudnn_algo=args.cudnn_algo
+            )
+        else:
+            runner = CloneONNXCUDARuntime(str(onnx_path), device_id=device_ids[0], cudnn_algo=args.cudnn_algo)
+            augmenter = DetectionAugmenter(aug_cfg) if should_augment_train else None
+            process_split_set(
+                split_name="train",
+                items=train_items,
+                runner=runner,
+                output_pt_path=train_pt_path,
+                cache_dir=cache_dir,
+                seq_len=args.seq_len,
+                sample_interval=args.sample_interval,
+                img_size=actual_img_size,
+                chunk_size=args.chunk_size,
+                use_fp16=args.fp16,
+                augmenter=augmenter,
+                num_aug=args.num_aug if should_augment_train else 0,
+                include_original=args.include_original,
+                base_seed=args.aug_seed,
+                force_recompute=args.force_recompute,
+                gc_interval=args.gc_interval,
+                shard_size=args.shard_size,
+                skip_package=args.skip_package
+            )
+            del runner
 
     if "val" in active_splits and len(val_items) > 0:
         should_augment_val = args.augment and ("val" in augment_splits)
-        process_split_set(
-            split_name="val",
-            items=val_items,
-            runner=runner,
-            output_pt_path=val_pt_path,
-            cache_dir=cache_dir,
-            seq_len=args.seq_len,
-            sample_interval=args.sample_interval,
-            img_size=actual_img_size,
-            chunk_size=args.chunk_size,
-            use_fp16=args.fp16,
-            augmenter=augmenter if should_augment_val else None,
-            num_aug=args.num_aug if should_augment_val else 0,
-            include_original=args.include_original,
-            base_seed=args.aug_seed,
-            force_recompute=args.force_recompute,
-            gc_interval=args.gc_interval,
-            shard_size=args.shard_size,
-            skip_package=args.skip_package
-        )
+        if use_multi_gpu:
+            run_multi_gpu_extraction(
+                split_name="val",
+                items=val_items,
+                device_ids=device_ids,
+                onnx_path=onnx_path,
+                output_dir=output_dir,
+                cache_dir=cache_dir,
+                seq_len=args.seq_len,
+                sample_interval=args.sample_interval,
+                img_size=actual_img_size,
+                chunk_size=args.chunk_size,
+                use_fp16=args.fp16,
+                augment_enabled=should_augment_val,
+                num_aug=args.num_aug if should_augment_val else 0,
+                include_original=args.include_original,
+                base_seed=args.aug_seed,
+                aug_config=aug_cfg if should_augment_val else None,
+                force_recompute=args.force_recompute,
+                gc_interval=args.gc_interval,
+                shard_size=args.shard_size,
+                skip_package=args.skip_package,
+                output_pt_path=val_pt_path,
+                cudnn_algo=args.cudnn_algo
+            )
+        else:
+            runner = CloneONNXCUDARuntime(str(onnx_path), device_id=device_ids[0], cudnn_algo=args.cudnn_algo)
+            augmenter = DetectionAugmenter(aug_cfg) if should_augment_val else None
+            process_split_set(
+                split_name="val",
+                items=val_items,
+                runner=runner,
+                output_pt_path=val_pt_path,
+                cache_dir=cache_dir,
+                seq_len=args.seq_len,
+                sample_interval=args.sample_interval,
+                img_size=actual_img_size,
+                chunk_size=args.chunk_size,
+                use_fp16=args.fp16,
+                augmenter=augmenter,
+                num_aug=args.num_aug if should_augment_val else 0,
+                include_original=args.include_original,
+                base_seed=args.aug_seed,
+                force_recompute=args.force_recompute,
+                gc_interval=args.gc_interval,
+                shard_size=args.shard_size,
+                skip_package=args.skip_package
+            )
+            del runner
 
     print("\n" + "=" * 75)
     print("      [HOÀN TẤT GIAI ĐOẠN 1] TRÍCH XUẤT ĐẶC TRƯNG THÀNH CÔNG!     ")
@@ -1229,13 +1717,24 @@ def main():
     print(f"1. Cấu hình phân bổ : {split_info_save_path.resolve()}")
     if not args.skip_package:
         if "train" in active_splits:
-            print(f"2. File Train Tensor: {train_pt_path.resolve()}")
+            if train_pt_path.exists():
+                print(f"2. File Train Tensor: {train_pt_path.resolve()}")
+            else:
+                shards = sorted(output_dir.glob(f"{train_pt_path.stem}_part*.pt"))
+                if shards:
+                    print(f"2. Shards Train Tensor: {len(shards)} shards tại {output_dir.resolve()} (chỉ mục: {train_pt_path.stem}_shards_index.json)")
         if "val" in active_splits:
-            print(f"3. File Val Tensor  : {val_pt_path.resolve()}")
+            if val_pt_path.exists():
+                print(f"3. File Val Tensor  : {val_pt_path.resolve()}")
+            else:
+                shards = sorted(output_dir.glob(f"{val_pt_path.stem}_part*.pt"))
+                if shards:
+                    print(f"3. Shards Val Tensor  : {len(shards)} shards tại {output_dir.resolve()}")
     else:
         print(f"2. Toàn bộ tệp cache được lưu trữ tại: {cache_dir.resolve()}")
     print("=" * 75)
 
 
 if __name__ == "__main__":
+    mp.freeze_support()
     main()

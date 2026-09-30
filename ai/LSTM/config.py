@@ -20,7 +20,7 @@ class TrainConfig:
     val_pt: str = "extracted_features_pt/features_sust_val.pt"  # Đường dẫn tệp tensor validation
     dataset_dir: str = r"D:\Project\AI\dataset\filtered_SUST\in_threshold"  # Đường dẫn tới thư mục video thô (filtered_SUST)
     seq_len: int = None  # Số lượng khung hình cố định cho mỗi video (120 cho SUST dataset)
-    sample_interval: float = 0.25  # Khoảng thời gian t (giây) giữa 2 khung hình lấy mẫu (mặc định 0.5s)
+    sample_interval: float = 0.1  # Khoảng thời gian t (giây) giữa 2 khung hình lấy mẫu (Target FPS = 10.0)
     image_size: Tuple[int, int] = (640, 640)  # Kích thước khung hình (Height, Width) theo backbone_neck.onnx
     video_exts: Tuple[str, ...] = (".avi", ".mp4", ".mkv")  # Các định dạng video hợp lệ
     train_ratio: float = 0.8  # Tỷ lệ chia tập huấn luyện (80% train, 20% validation)

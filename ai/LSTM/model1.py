@@ -9,7 +9,7 @@ from config import TrainConfig
 
 
 # ==============================================================================
-# SPATIAL FEATURE ADAPTER & DEEP LSTM CLASSIFIER ARCHITECTURE
+# SPATIAL FEATURE ADAPTER & DEEP GRU CLASSIFIER ARCHITECTURE
 # ==============================================================================
 class SpatialFeatureAdapter(nn.Module):
     """
@@ -155,7 +155,7 @@ class SpatialFeatureAdapter(nn.Module):
 
             # Xếp chồng theo dim=-2 để tương thích cả 2D [B, S, D] lẫn 3D [B, T, S, D]
             stacked_v = torch.stack(v_list, dim=-2)
-            fused = (stacked_v * weights).sum(dim=-2)           # [..., out_dim]
+            fused = (stacked_v * weights).sum(dim=-2)  # [..., out_dim]
             fused = self.dropout(fused)
 
             if return_weights:
@@ -179,10 +179,10 @@ class SpatialFeatureAdapter(nn.Module):
             return fused
 
 
-class DeepLSTMClassifier(nn.Module):
+class DeepGRUClassifier(nn.Module):
     """
-    Mô hình phân loại chuỗi thời gian Deep LSTM 3 lớp xếp chồng:
-    Đầu vào: (p3, p4, p5) -> Spatial Adapter (out_dim) -> LSTM (3 layers) -> FC Head (num_classes).
+    Mô hình phân loại chuỗi thời gian Deep GRU 3 lớp xếp chồng:
+    Đầu vào: (p3, p4, p5) -> Spatial Adapter (out_dim) -> GRU (3 layers) -> FC Head (num_classes).
     """
 
     def __init__(
@@ -209,7 +209,7 @@ class DeepLSTMClassifier(nn.Module):
             fusion=fusion,
             dropout=adapter_dropout
         )
-        self.lstm = nn.LSTM(
+        self.gru = nn.GRU(
             input_size=input_dim,
             hidden_size=hidden_dim,
             num_layers=num_layers,
@@ -221,10 +221,15 @@ class DeepLSTMClassifier(nn.Module):
             nn.Linear(hidden_dim, num_classes)
         )
 
+    @property
+    def lstm(self) -> nn.GRU:
+        """Alias tương thích ngược cho các đoạn mã cũ gọi model.lstm."""
+        return self.gru
+
     @classmethod
-    def from_checkpoint(cls, checkpoint_path: Union[str, Path], map_location: str = "cpu") -> "DeepLSTMClassifier":
+    def from_checkpoint(cls, checkpoint_path: Union[str, Path], map_location: str = "cpu") -> "DeepGRUClassifier":
         """
-        Khởi tạo DeepLSTMClassifier và nạp trọng số trực tiếp từ file checkpoint (.pth/.pt).
+        Khởi tạo DeepGRUClassifier và nạp trọng số trực tiếp từ file checkpoint (.pth/.pt).
         Tự động nhận diện cấu hình lưu trong checkpoint và nạp khớp chính xác 100%.
         """
         path = Path(checkpoint_path)
@@ -237,9 +242,11 @@ class DeepLSTMClassifier(nn.Module):
         # Tự động nhận diện cấu hình lưu từ checkpoint
         cfg_dict = ckpt.get("config", {})
 
-        if "lstm.weight_ih_l0" in state_dict:
-            input_dim = state_dict["lstm.weight_ih_l0"].shape[1]
-            hidden_dim = state_dict["lstm.weight_ih_l0"].shape[0] // 4
+        # Tự động nhận diện input_dim và hidden_dim cho GRU (chia cho 3 vì GRU có 3 cổng)
+        weight_key = next((k for k in ("gru.weight_ih_l0", "lstm.weight_ih_l0") if k in state_dict), None)
+        if weight_key:
+            input_dim = state_dict[weight_key].shape[1]
+            hidden_dim = state_dict[weight_key].shape[0] // 3
         else:
             input_dim = int(cfg_dict.get("input_dim", 256))
             hidden_dim = int(cfg_dict.get("hidden_dim", 256))
@@ -251,12 +258,13 @@ class DeepLSTMClassifier(nn.Module):
         else:
             num_classes = int(cfg_dict.get("num_classes", 2))
 
-        # Đếm số lớp của LSTM
+        # Đếm số lớp của GRU
         layer_indices = set()
         for k in state_dict.keys():
-            if k.startswith("lstm.weight_ih_l"):
-                idx = int(k.replace("lstm.weight_ih_l", ""))
-                layer_indices.add(idx)
+            if k.startswith("gru.weight_ih_l") or k.startswith("lstm.weight_ih_l"):
+                idx_str = k.split("weight_ih_l")[-1]
+                if idx_str.isdigit():
+                    layer_indices.add(int(idx_str))
         num_layers = len(layer_indices) if layer_indices else int(cfg_dict.get("num_layers", 3))
 
         # Tự động nhận diện kiến trúc adapter
@@ -291,6 +299,14 @@ class DeepLSTMClassifier(nn.Module):
         else:
             spatial_in_channels = cfg_dict.get("cnn_neck_channels", (64, 128, 256))
 
+        # Tự động map lại các key 'lstm.' sang 'gru.' nếu checkpoint cũ lưu tiền tố 'lstm.'
+        remapped_state_dict = {}
+        for k, v in state_dict.items():
+            if k.startswith("lstm."):
+                remapped_state_dict[k.replace("lstm.", "gru.", 1)] = v
+            else:
+                remapped_state_dict[k] = v
+
         model = cls(
             input_dim=input_dim,
             hidden_dim=hidden_dim,
@@ -301,13 +317,13 @@ class DeepLSTMClassifier(nn.Module):
         )
         if map_location is not None:
             model = model.to(map_location)
-        model.load_state_dict(state_dict, strict=False)
+        model.load_state_dict(remapped_state_dict, strict=False)
         model.eval()
         return model
 
     @classmethod
-    def from_config(cls, config: Any) -> "DeepLSTMClassifier":
-        """Khởi tạo DeepLSTMClassifier trực tiếp từ đối tượng TrainConfig."""
+    def from_config(cls, config: Any) -> "DeepGRUClassifier":
+        """Khởi tạo DeepGRUClassifier trực tiếp từ đối tượng TrainConfig."""
         spatial_in_channels = getattr(config, "cnn_neck_channels", getattr(config, "cnn_out_channels", (64, 128, 256)))
         fusion = getattr(config, "spatial_fusion", getattr(config, "fusion", "concat"))
         adapter_dropout = getattr(config, "adapter_dropout", 0.1)
@@ -328,23 +344,35 @@ class DeepLSTMClassifier(nn.Module):
             self,
             features: Union[Tuple[torch.Tensor, ...], List[torch.Tensor], torch.Tensor],
             *args: torch.Tensor,
-            hc: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+            h_0: Optional[Union[torch.Tensor, Tuple[torch.Tensor, ...]]] = None,
+            hc: Optional[Union[torch.Tensor, Tuple[torch.Tensor, ...]]] = None,
             return_sequence: bool = True,
-            return_weights: bool = False
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+            return_weights: bool = False,
+            return_state: bool = False
+    ) -> Union[torch.Tensor, Tuple[Any, ...]]:
         """
-        Quá trình lan truyền xuôi của DeepLSTMClassifier.
+        Quá trình lan truyền xuôi của DeepGRUClassifier.
 
         Args:
             features: Bộ 3 đặc trưng (p3, p4, p5) hoặc Tensor chuỗi thời gian.
             *args: Các tensor đặc trưng p4, p5 nếu gọi model(p3, p4, p5).
-            hc: Trạng thái ẩn ban đầu (h_0, c_0) của LSTM (phục vụ streaming inference).
+            h_0: Trạng thái ẩn ban đầu của GRU [num_layers, B, hidden_dim] (phục vụ streaming inference).
+            hc: Tham số tương thích ngược nếu truyền tên biến hc cũ.
             return_sequence: True -> trả về logits cho toàn chuỗi [B, T, num_classes].
                              False -> chỉ trả về frame cuối cùng [B, num_classes].
             return_weights: True -> trả về thêm trọng số attention không gian.
+            return_state: True -> trả về thêm trạng thái ẩn h_n phục vụ streaming inference.
         """
         if len(args) > 0:
             features = (features, *args)
+
+        # Hỗ trợ tương thích ngược nếu gọi tham số hc
+        if hc is not None and h_0 is None:
+            h_0 = hc
+
+        # An toàn: GRU chỉ nhận Tensor h_0, nếu truyền nhầm tuple (h, c) thì lấy h_0
+        if isinstance(h_0, tuple):
+            h_0 = h_0[0]
 
         # 1. Chuyển đổi đặc trưng không gian qua adapter
         if return_weights:
@@ -357,19 +385,22 @@ class DeepLSTMClassifier(nn.Module):
         if x.dim() == 2:
             x = x.unsqueeze(1)
 
-        # 2. Trích xuất đặc trưng chuỗi thời gian qua Deep LSTM
-        lstm_out, _ = self.lstm(x, hc)
+        # 2. Trích xuất đặc trưng chuỗi thời gian qua Deep GRU
+        gru_out, h_n = self.gru(x, h_0)
 
         # 3. Phân loại theo sequence hoặc frame cuối cùng
         if return_sequence:
-            logits = self.fc_out(lstm_out)  # [B, T, num_classes]
+            logits = self.fc_out(gru_out)  # [B, T, num_classes]
         else:
-            logits = self.fc_out(lstm_out[:, -1, :])  # [B, num_classes]
+            logits = self.fc_out(gru_out[:, -1, :])  # [B, num_classes]
 
+        outputs = [logits]
         if return_weights:
-            return logits, weights
+            outputs.append(weights)
+        if return_state:
+            outputs.append(h_n)
 
-        return logits
+        return tuple(outputs) if len(outputs) > 1 else logits
 
 
 if __name__ == "__main__":
@@ -379,7 +410,7 @@ if __name__ == "__main__":
         sys.stdout.reconfigure(encoding="utf-8")
 
     print("=" * 75)
-    print("[*] KIỂM TRA MÔ HÌNH SPATIAL FEATURE ADAPTER & DEEP LSTM CLASSIFIER")
+    print("[*] KIỂM TRA MÔ HÌNH SPATIAL FEATURE ADAPTER & DEEP GRU CLASSIFIER")
     print("=" * 75)
 
     # 1. Kiểm thử với Tensor 2D [Batch, Channels]
@@ -411,34 +442,51 @@ if __name__ == "__main__":
     assert fused_3d.shape == (4, 120, 256)
     assert alpha_3d.shape == (4, 120, 3)
 
-    # 3. Kiểm thử DeepLSTMClassifier toàn diện
-    model = DeepLSTMClassifier(input_dim=256, hidden_dim=256, num_layers=3, num_classes=2, fusion="attention")
+    # 3. Kiểm thử DeepGRUClassifier toàn diện (chế độ Sequence, Clip, Attention Weights và Hidden State)
+    model = DeepGRUClassifier(input_dim=256, hidden_dim=256, num_layers=3, num_classes=2, fusion="attention")
 
     out_seq, w_seq = model((f1_3d, f2_3d, f3_3d), return_sequence=True, return_weights=True)
     out_vid = model((f1_3d, f2_3d, f3_3d), return_sequence=False)
 
-    print(f"\n[+] Kiểm thử DeepLSTMClassifier:")
+    # Kiểm thử Streaming & Trạng thái ẩn h_0, h_n
+    h_init = torch.zeros(3, batch_size, 256)
+    out_stream, h_next = model((f1_3d, f2_3d, f3_3d), h_0=h_init, return_sequence=False, return_state=True)
+
+    # Kiểm thử tương thích ngược khi truyền tuple (h, c) cũ
+    out_compat = model((f1_3d, f2_3d, f3_3d), hc=(h_init, h_init), return_sequence=False)
+
+    print(f"\n[+] Kiểm thử DeepGRUClassifier:")
     print(f"    - Logits (Sequence Mode): {list(out_seq.shape)} (Mong đợi [4, 120, 2])")
     print(f"    - Logits (Clip Mode)    : {list(out_vid.shape)} (Mong đợi [4, 2])")
     print(f"    - Attention Weights     : {list(w_seq.shape)} (Mong đợi [4, 120, 3])")
+    print(f"    - Streaming h_next shape: {list(h_next.shape)} (Mong đợi [3, 4, 256])")
+    print(f"    - Tuple hc backward-comp: {list(out_compat.shape)} (Mong đợi [4, 2])")
     assert out_seq.shape == (4, 120, 2)
     assert out_vid.shape == (4, 2)
     assert w_seq.shape == (4, 120, 3)
+    assert h_next.shape == (3, 4, 256)
+    assert out_compat.shape == (4, 2)
 
     # 4. Kiểm thử các phương thức Fusion khác nhau
     for f_mode in ["concat", "sum", "mean", "attention"]:
-        m_fusion = DeepLSTMClassifier(fusion=f_mode)
+        m_fusion = DeepGRUClassifier(fusion=f_mode)
         out = m_fusion((f1_3d, f2_3d, f3_3d))
         print(f"    - Fusion [{f_mode:<9}]: Output shape = {list(out.shape)}")
         assert out.shape == (4, 120, 2)
 
     # 5. Kiểm thử nạp Checkpoint thực tế (nếu tồn tại)
-    ckpt_path = Path("lstm_experiment_results/checkpoints/best_lstm.pth")
-    if ckpt_path.exists():
-        ckpt_model = DeepLSTMClassifier.from_checkpoint(ckpt_path)
-        print(f"\n[+] Nạp thành công checkpoint thực tế '{ckpt_path}'!")
-        print(f"    - Tổng tham số mô hình nạp: {sum(p.numel() for p in ckpt_model.parameters()):,}")
+    for ckpt_candidate in [
+        "gru_experiment_results/checkpoints/best_gru.pth",
+        "gru_experiment_results/checkpoints/best_lstm.pth"
+    ]:
+        ckpt_path = Path(ckpt_candidate)
+        if ckpt_path.exists():
+            ckpt_model = DeepGRUClassifier.from_checkpoint(ckpt_path)
+            print(f"\n[+] Nạp thành công checkpoint thực tế '{ckpt_path}'!")
+            print(f"    - Tổng tham số mô hình nạp: {sum(p.numel() for p in ckpt_model.parameters()):,}")
+            break
 
     print("\n" + "=" * 75)
     print("[+] TẤT CẢ KIỂM THỬ ĐÃ HOÀN TẤT VÀ VƯỢT QUA 100% THÀNH CÔNG!")
     print("=" * 75)
+

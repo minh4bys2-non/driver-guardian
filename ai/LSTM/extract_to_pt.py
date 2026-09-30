@@ -9,7 +9,7 @@ Mục đích:
        để đảm bảo không rò rỉ dữ liệu khuôn mặt giữa Train và Val (No Data Leakage).
     3. Lấy mẫu khung hình theo chu kỳ thời gian thực cố định t (sample_interval = 0.5s)
        đồng bộ 100% với MyLSTMDataset trong dataset.py.
-    4. Trích xuất đặc trưng không gian (p3, p4, p5) qua mô hình ONNX CUDA ('clone.onnx')
+    4. Trích xuất đặc trưng không gian (p3: 64, p4: 128, p5: 256) qua mô hình ONNX ('backbone_neck.onnx')
        kết hợp Adaptive Average Pooling (1, 1) và CUDA I/O Binding Zero-Copy.
     5. Hỗ trợ cơ chế Resume / Cache thông minh theo từng video.
     6. Đóng gói kết quả:
@@ -70,8 +70,8 @@ DEFAULT_TRAIN_RATIO = TrainConfig.train_ratio
 # ==============================================================================
 # 1. TIỀN XỬ LÝ ẢNH & RUNTIME ONNX VỚI CUDA ZERO-COPY
 # ==============================================================================
-def letterbox(image: np.ndarray, new_size: int = 480, color=(114, 114, 114)) -> np.ndarray:
-    """Resize ảnh giữ nguyên tỉ lệ (aspect ratio) với padding đồng màu."""
+def letterbox(image: np.ndarray, new_size: int = 640, color=(114, 114, 114)) -> np.ndarray:
+    """Resize ảnh giữ nguyên tỉ lệ (aspect ratio) với padding đồng màu (mặc định 640x640)."""
     h, w = image.shape[:2]
     scale = min(new_size / h, new_size / w)
     new_w = max(1, int(round(w * scale)))
@@ -86,7 +86,7 @@ def letterbox(image: np.ndarray, new_size: int = 480, color=(114, 114, 114)) -> 
 
 
 class CloneONNXCUDARuntime:
-    """Quản lý suy luận ONNX Runtime trên GPU CUDA với I/O Binding."""
+    """Quản lý suy luận ONNX Runtime trên GPU CUDA với I/O Binding (hỗ trợ CPU fallback)."""
 
     def __init__(self, onnx_model_path: str, device_id: int = 0):
         self.onnx_model_path = str(onnx_model_path)
@@ -119,29 +119,45 @@ class CloneONNXCUDARuntime:
 
         active = self.session.get_providers()
         print(f"[+] Active Providers: {active}")
-        if "CUDAExecutionProvider" not in active:
-            raise RuntimeError("CUDAExecutionProvider chưa được kích hoạt!")
+        self.use_cuda = "CUDAExecutionProvider" in active
+        if not self.use_cuda:
+            print(f"[WARN] CUDAExecutionProvider không khả dụng. Fallback sang CPUExecutionProvider.")
 
-        self.input_name = self.session.get_inputs()[0].name
+        input_meta = self.session.get_inputs()[0]
+        self.input_name = input_meta.name
+        self.expected_h = input_meta.shape[2] if len(input_meta.shape) > 2 and isinstance(input_meta.shape[2], int) else None
+        self.expected_w = input_meta.shape[3] if len(input_meta.shape) > 3 and isinstance(input_meta.shape[3], int) else None
         self.output_names = [o.name for o in self.session.get_outputs()]
 
     def forward(self, input_tensor: torch.Tensor) -> List[torch.Tensor]:
-        """Suy luận trực tiếp từ PyTorch CUDA Tensor sang PyTorch CUDA Tensors (Zero-copy DLPack)."""
-        io_binding = self.session.io_binding()
-        io_binding.bind_input(
-            name=self.input_name,
-            device_type="cuda",
-            device_id=self.device_id,
-            element_type=np.float32,
-            shape=tuple(input_tensor.shape),
-            buffer_ptr=input_tensor.data_ptr(),
-        )
-        for out_name in self.output_names:
-            io_binding.bind_output(out_name, device_type="cuda", device_id=self.device_id)
+        """Suy luận trực tiếp: Zero-copy CUDA I/O Binding nếu có CUDA, hoặc session.run thông thường nếu CPU."""
+        if self.use_cuda:
+            if not input_tensor.is_cuda:
+                input_tensor = input_tensor.to(f"cuda:{self.device_id}", non_blocking=True)
+            if not input_tensor.is_contiguous():
+                input_tensor = input_tensor.contiguous()
 
-        self.session.run_with_iobinding(io_binding)
-        raw_outputs = io_binding.get_outputs()
-        return [torch.from_dlpack(out) for out in raw_outputs]
+            io_binding = self.session.io_binding()
+            io_binding.bind_input(
+                name=self.input_name,
+                device_type="cuda",
+                device_id=self.device_id,
+                element_type=np.float32,
+                shape=tuple(input_tensor.shape),
+                buffer_ptr=input_tensor.data_ptr(),
+            )
+            for out_name in self.output_names:
+                io_binding.bind_output(out_name, device_type="cuda", device_id=self.device_id)
+
+            self.session.run_with_iobinding(io_binding)
+            raw_outputs = io_binding.get_outputs()
+            return [torch.from_dlpack(out) for out in raw_outputs]
+        else:
+            np_in = input_tensor.detach().cpu().numpy()
+            if not np_in.flags.c_contiguous:
+                np_in = np.ascontiguousarray(np_in)
+            outs = self.session.run(self.output_names, {self.input_name: np_in})
+            return [torch.from_numpy(out) for out in outs]
 
 
 # ==============================================================================
@@ -191,7 +207,7 @@ def read_and_sample_video_frames(
         video_path: Path,
         seq_len: Optional[int] = None,
         sample_interval: float = 0.5,
-        img_size: int = 480
+        img_size: int = 640
 ) -> Tuple[List[np.ndarray], int]:
     """
     Đọc nhanh video tuần tự, letterbox sang kích thước cố định và định dạng RGB (uint8).
@@ -290,13 +306,13 @@ def forward_video_chunks(
         device: str = "cuda:0"
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Forward danh sách khung hình RGB qua mô hình ONNX CUDA theo từng mini-chunk
+    Forward danh sách khung hình RGB qua mô hình ONNX theo từng mini-chunk
     kết hợp Adaptive Average Pooling (1, 1). Hỗ trợ độ dài chuỗi linh hoạt bất kỳ.
 
     Returns:
-        p3_tensor: [T, 224] on CPU
-        p4_tensor: [T, 448] on CPU
-        p5_tensor: [T, 640] on CPU
+        p3_tensor: [T, 64] on CPU
+        p4_tensor: [T, 128] on CPU
+        p5_tensor: [T, 256] on CPU
     """
     seq_len = len(frames_rgb)
     tensor_list = [
@@ -305,19 +321,27 @@ def forward_video_chunks(
     ]
     video_tensor = torch.stack(tensor_list, dim=0)  # [T, 3, H, W]
 
+    # Ánh xạ index theo tên output thực tế ('p3', 'p4', 'p5')
+    name_to_idx = {name: i for i, name in enumerate(runner.output_names)}
+    idx_p3 = name_to_idx.get("p3", 0)
+    idx_p4 = name_to_idx.get("p4", 1)
+    idx_p5 = name_to_idx.get("p5", 2)
+
+    target_device = device if (runner.use_cuda and torch.cuda.is_available()) else "cpu"
+
     # Forward theo mini-chunks để tiết kiệm VRAM và tăng tốc
     p3_chunks, p4_chunks, p5_chunks = [], [], []
     for i in range(0, seq_len, chunk_size):
-        chunk = video_tensor[i: i + chunk_size].to(device, non_blocking=True)
+        chunk = video_tensor[i: i + chunk_size].to(target_device, non_blocking=True)
         outs = runner.forward(chunk)
-        # outs[0]: [B, 224, 60, 60], outs[1]: [B, 448, 30, 30], outs[2]: [B, 640, 15, 15]
-        p3_chunks.append(F.adaptive_avg_pool2d(outs[0], (1, 1)).flatten(1).cpu())
-        p4_chunks.append(F.adaptive_avg_pool2d(outs[1], (1, 1)).flatten(1).cpu())
-        p5_chunks.append(F.adaptive_avg_pool2d(outs[2], (1, 1)).flatten(1).cpu())
+        # outs: p3=[B, 64, 80, 80], p4=[B, 128, 40, 40], p5=[B, 256, 20, 20]
+        p3_chunks.append(F.adaptive_avg_pool2d(outs[idx_p3], (1, 1)).flatten(1).cpu())
+        p4_chunks.append(F.adaptive_avg_pool2d(outs[idx_p4], (1, 1)).flatten(1).cpu())
+        p5_chunks.append(F.adaptive_avg_pool2d(outs[idx_p5], (1, 1)).flatten(1).cpu())
 
-    p3_tensor = torch.cat(p3_chunks, dim=0)  # [T, 224]
-    p4_tensor = torch.cat(p4_chunks, dim=0)  # [T, 448]
-    p5_tensor = torch.cat(p5_chunks, dim=0)  # [T, 640]
+    p3_tensor = torch.cat(p3_chunks, dim=0)  # [T, 64]
+    p4_tensor = torch.cat(p4_chunks, dim=0)  # [T, 128]
+    p5_tensor = torch.cat(p5_chunks, dim=0)  # [T, 256]
     return p3_tensor, p4_tensor, p5_tensor
 
 
@@ -326,7 +350,7 @@ def extract_single_video_features(
         runner: CloneONNXCUDARuntime,
         seq_len: Optional[int] = None,
         sample_interval: float = 0.5,
-        img_size: int = 480,
+        img_size: int = 640,
         chunk_size: int = 24,
         device: str = "cuda:0",
         augmenter: Optional[DetectionAugmenter] = None,
@@ -337,9 +361,9 @@ def extract_single_video_features(
     forward ONNX theo chunk và pool về 1D.
 
     Returns:
-        p3_tensor: [T, 224] on CPU
-        p4_tensor: [T, 448] on CPU
-        p5_tensor: [T, 640] on CPU
+        p3_tensor: [T, 64] on CPU
+        p4_tensor: [T, 128] on CPU
+        p5_tensor: [T, 256] on CPU
         actual_frame_count: số khung hình thực tế trong video
     """
     frames_rgb, actual_frames = read_and_sample_video_frames(
@@ -542,7 +566,7 @@ def process_split_set(
         cache_dir: Path,
         seq_len: Optional[int] = None,
         sample_interval: float = 0.5,
-        img_size: int = 480,
+        img_size: int = 640,
         chunk_size: int = 24,
         use_fp16: bool = False,
         augmenter: Optional[DetectionAugmenter] = None,
@@ -577,7 +601,8 @@ def process_split_set(
 
     # Khởi động trước (Warm-up) mô hình
     print("[+] Khởi động (Warm-up) ONNX Execution Provider...")
-    dummy = torch.zeros(chunk_size, 3, img_size, img_size, device=f"cuda:{runner.device_id}")
+    warmup_device = f"cuda:{runner.device_id}" if (runner.use_cuda and torch.cuda.is_available()) else "cpu"
+    dummy = torch.zeros(chunk_size, 3, img_size, img_size, device=warmup_device)
     runner.forward(dummy)
     print("[+] Khởi động hoàn tất!")
 
@@ -698,15 +723,15 @@ def process_split_set(
 
     if seq_len is None:
         print(f"    -> Áp dụng CÁCH 1: Lưu trữ List[torch.Tensor] (chuỗi động không padding)...")
-        final_p3 = p3_all  # List[Tensor [T_i, 224]]
-        final_p4 = p4_all  # List[Tensor [T_i, 448]]
-        final_p5 = p5_all  # List[Tensor [T_i, 640]]
+        final_p3 = p3_all  # List[Tensor [T_i, 64]]
+        final_p4 = p4_all  # List[Tensor [T_i, 128]]
+        final_p5 = p5_all  # List[Tensor [T_i, 256]]
         is_var_len = True
     else:
         print(f"    -> Đóng gói Tensor 3D cố định kích thước [{len(p3_all)}, {seq_len}, C]...")
-        final_p3 = torch.stack(p3_all, dim=0)  # [N, seq_len, 224]
-        final_p4 = torch.stack(p4_all, dim=0)  # [N, seq_len, 448]
-        final_p5 = torch.stack(p5_all, dim=0)  # [N, seq_len, 640]
+        final_p3 = torch.stack(p3_all, dim=0)  # [N, seq_len, 64]
+        final_p4 = torch.stack(p4_all, dim=0)  # [N, seq_len, 128]
+        final_p5 = torch.stack(p5_all, dim=0)  # [N, seq_len, 256]
         is_var_len = False
 
     if use_fp16:
@@ -779,7 +804,7 @@ def main():
     parser.add_argument("--video_exts", type=str, default=DEFAULT_VIDEO_EXTS,
                         help=f"Danh sách phần mở rộng video hỗ trợ (mặc định: {DEFAULT_VIDEO_EXTS})")
     parser.add_argument("--onnx_path", type=str,
-                        default=r"outsrc\myCNN\checkpoints_ftCOCO\clone.onnx",
+                        default=r"D:\Project\DATN\driver-guardian\ai\LSTM\backbone_neck.onnx",
                         help="Đường dẫn file mô hình ONNX")
     parser.add_argument("--output_dir", type=str, default="extracted_features_pt",
                         help="Thư mục xuất kết quả")
@@ -880,6 +905,13 @@ def main():
     # 2. Khởi tạo ONNX Runtime
     runner = CloneONNXCUDARuntime(str(onnx_path), device_id=args.device_id)
 
+    # Tự động đồng bộ img_size theo yêu cầu của mô hình ONNX nếu có
+    actual_img_size = args.img_size
+    if runner.expected_h is not None and runner.expected_h > 0:
+        if actual_img_size != runner.expected_h:
+            print(f"[!] Tự động điều chỉnh img_size từ {actual_img_size} -> {runner.expected_h} để khớp với input của mô hình ONNX.")
+            actual_img_size = runner.expected_h
+
     # 3. Khởi tạo DetectionAugmenter nếu bật augmentation
     augmenter = None
     if args.augment and args.num_aug > 0 and len(augment_splits) > 0:
@@ -906,7 +938,7 @@ def main():
         cache_dir=cache_dir,
         seq_len=args.seq_len,
         sample_interval=args.sample_interval,
-        img_size=args.img_size,
+        img_size=actual_img_size,
         chunk_size=args.chunk_size,
         use_fp16=args.fp16,
         augmenter=augmenter if should_augment_train else None,
@@ -925,7 +957,7 @@ def main():
         cache_dir=cache_dir,
         seq_len=args.seq_len,
         sample_interval=args.sample_interval,
-        img_size=args.img_size,
+        img_size=actual_img_size,
         chunk_size=args.chunk_size,
         use_fp16=args.fp16,
         augmenter=augmenter if should_augment_val else None,

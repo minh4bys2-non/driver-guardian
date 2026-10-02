@@ -25,6 +25,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.dp
 import androidx.navigation.NavHostController
@@ -56,9 +57,12 @@ import com.example.driverguardian.ui.history.TripHistoryViewModelFactory
 import com.example.driverguardian.ui.session.DrivingSessionUiState
 import com.example.driverguardian.ui.session.DrivingSessionViewModel
 import com.example.driverguardian.ui.session.DrivingSessionViewModelFactory
+import com.example.driverguardian.ui.monitoring.MonitoringViewModel
+import com.example.driverguardian.ui.monitoring.MonitoringViewModelFactory
 
 @Composable
 fun DriverGuardianApp() {
+    val context = LocalContext.current
     val navController = rememberNavController()
     val snackbarHostState = remember { SnackbarHostState() }
     val repository = remember {
@@ -69,6 +73,9 @@ fun DriverGuardianApp() {
     )
     val historyViewModel: TripHistoryViewModel = viewModel(
         factory = remember { TripHistoryViewModelFactory(repository) }
+    )
+    val monitoringViewModel: MonitoringViewModel = viewModel(
+        factory = remember { MonitoringViewModelFactory(context) }
     )
     val sessionUiState by sessionViewModel.uiState.collectAsStateWithLifecycle()
     val historyUiState by historyViewModel.uiState.collectAsStateWithLifecycle()
@@ -99,6 +106,7 @@ fun DriverGuardianApp() {
                         sessionViewModel = sessionViewModel,
                         historyViewModel = historyViewModel,
                         historyUiState = historyUiState,
+                        monitoringViewModel = monitoringViewModel,
                         modifier = Modifier
                             .weight(1f)
                             .fillMaxSize()
@@ -166,6 +174,7 @@ private fun AppNavHost(
     sessionViewModel: DrivingSessionViewModel,
     historyViewModel: TripHistoryViewModel,
     historyUiState: com.example.driverguardian.ui.history.TripHistoryUiState,
+    monitoringViewModel: MonitoringViewModel,
     modifier: Modifier = Modifier
 ) {
     NavHost(
@@ -206,6 +215,7 @@ private fun AppNavHost(
         composable(Screen.ActiveDriving.route) {
             ActiveDrivingScreen(
                 sessionState = sessionUiState,
+                monitoringViewModel = monitoringViewModel,
                 snackbarHostState = snackbarHostState,
                 onDangerDemo = { sessionViewModel.submitDangerEvent(null, null) },
                 onDangerPersisted = {

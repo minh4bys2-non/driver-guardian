@@ -1,6 +1,18 @@
 # Driver Guardian Android
 
-Android Automotive demo dùng Jetpack Compose. Phần integration foundation kết nối luồng chuẩn bị chuyến đi với FastAPI, trong khi inference/camera và các chỉ số AI trên màn hình lái vẫn là demo rõ ràng.
+Android Automotive demo dùng Jetpack Compose. Phần integration foundation kết nối luồng chuẩn bị chuyến đi với FastAPI; nhánh physical monitoring dùng CameraX, MediaPipe Face Landmarker và cảm biến định hướng thiết bị. Mô hình ONNX buồn ngủ và fusion vẫn là phần tương lai.
+
+## MediaPipe Face Landmarker asset
+
+Ứng dụng chỉ tải asset đã commit tại `app/src/main/assets/face_landmarker.task`; không tải model lúc runtime và không có mock fallback.
+
+- Nguồn chính thức: `https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task`
+- Model bundle: MediaPipe Face Landmarker, biến thể `float16`; endpoint upstream dùng revision alias `latest` (không công bố revision ID riêng trong URL)
+- Ngày tải (UTC): 2026-09-30
+- Kích thước: 3,758,596 bytes
+- SHA-256: `64184e229b263107bc2b804c6625db1341ff2bb731874b0bcc2fe6544e0bc9ff`
+
+Bytes được giữ nguyên theo bản tải từ nguồn chính thức. Runtime dùng `RunningMode.LIVE_STREAM`, `numFaces = 1`; thiếu hoặc hỏng asset là lỗi khởi tạo rõ ràng.
 
 ## Kiến trúc integration
 
@@ -49,7 +61,7 @@ Datetime được giữ dưới dạng `String` theo response hiện tại. `Dri
 1. Shared ViewModel tải drivers, vehicles và active model. Loading, empty và error được hiển thị; không fallback sang `MockData`.
 2. Người dùng chọn driver và vehicle thật. Chỉ có thể tiếp tục khi đủ hai lựa chọn và active model.
 3. PreTrip vẫn hiển thị các kiểm tra thiết bị mock nhưng hiển thị riêng trạng thái backend/model. Nút bắt đầu gọi `POST /sessions` và chỉ điều hướng khi thành công.
-4. ActiveDriving hiển thị driver, vehicle và session backend thật. Metric AI được ghi rõ là demo/mock.
+4. ActiveDriving hiển thị driver, vehicle và session backend thật. Camera/physical/device-motion là dữ liệu runtime; không ánh xạ thành kết luận WARNING/DANGER tự động.
 5. Demo danger gọi `POST /events` với `DANGER`, level `2`; DangerAlert chỉ đóng sau khi acknowledgement được backend xác nhận.
 6. Kết thúc chuyến gọi completion API; summary chỉ mở sau khi completed session và persisted events đã tải thành công.
 7. Summary, history và detail dùng session/event thật; null score/metric/end time hiển thị `—`, không tạo số mặc định.
@@ -61,10 +73,10 @@ Repository trả kết quả lỗi rõ ràng cho connection refused, timeout, HT
 ## Giới hạn hiện tại
 
 - Chưa có offline persistence/retry queue; mất mạng sẽ trả lỗi và người dùng thử lại thủ công.
-- Camera/inference runtime chưa được nối vào session flow; các metric AI và pre-trip hardware checks vẫn là mock.
+- Drowsiness ONNX runtime chưa được nối vào camera pipeline; `MonitoringSnapshot` không phải ONNX tensor contract và chưa có fusion/classifier.
 - Analytics, alert-history, home dashboard và các tiện ích map/music/report vẫn là mock hoặc chưa hỗ trợ; trip summary/history/detail không còn dùng `MockData`.
 - Backend hiện chưa tính `safety_score`; UI giữ và hiển thị `NULL` thành `—`.
-- Chưa tích hợp CameraX hoặc asset mô hình ONNX thật vào luồng lái xe production.
+- Camera trước trên emulator phụ thuộc virtual-camera support; trạng thái thiếu camera/cảm biến được hiển thị rõ, không giả lập metric.
 
 ## Build và test
 

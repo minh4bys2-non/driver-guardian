@@ -21,26 +21,41 @@ import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavHostController
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
-import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.driverguardian.BuildConfig
+import com.example.driverguardian.data.auth.EncryptedTokenStore
+import com.example.driverguardian.data.auth.GoogleAuthManager
+import com.example.driverguardian.data.auth.SessionManager
 import com.example.driverguardian.data.remote.ApiClient
+import com.example.driverguardian.data.repository.NetworkAuthRepository
 import com.example.driverguardian.data.repository.NetworkDriverGuardianRepository
+import com.example.driverguardian.domain.model.UserProfile
+import com.example.driverguardian.ui.auth.AuthUiState
+import com.example.driverguardian.ui.auth.AuthViewModel
+import com.example.driverguardian.ui.auth.AuthViewModelFactory
 import com.example.driverguardian.ui.components.AppSidebar
+import com.example.driverguardian.ui.history.TripHistoryViewModel
+import com.example.driverguardian.ui.history.TripHistoryViewModelFactory
+import com.example.driverguardian.ui.monitoring.MonitoringViewModel
+import com.example.driverguardian.ui.monitoring.MonitoringViewModelFactory
 import com.example.driverguardian.ui.screens.alerts.AlertHistoryScreen
 import com.example.driverguardian.ui.screens.analytics.AnalyticsScreen
+import com.example.driverguardian.ui.screens.auth.LoginScreen
 import com.example.driverguardian.ui.screens.driving.ActiveDrivingScreen
 import com.example.driverguardian.ui.screens.driving.DangerAlertScreen
 import com.example.driverguardian.ui.screens.history.TripDetailScreen
@@ -52,22 +67,28 @@ import com.example.driverguardian.ui.screens.selection.SelectionScreen
 import com.example.driverguardian.ui.screens.settings.SettingsScreen
 import com.example.driverguardian.ui.screens.summary.TripSummaryScreen
 import com.example.driverguardian.ui.screens.system.SystemInfoScreen
-import com.example.driverguardian.ui.history.TripHistoryViewModel
-import com.example.driverguardian.ui.history.TripHistoryViewModelFactory
 import com.example.driverguardian.ui.session.DrivingSessionUiState
 import com.example.driverguardian.ui.session.DrivingSessionViewModel
 import com.example.driverguardian.ui.session.DrivingSessionViewModelFactory
-import com.example.driverguardian.ui.monitoring.MonitoringViewModel
-import com.example.driverguardian.ui.monitoring.MonitoringViewModelFactory
+import kotlinx.coroutines.launch
 
 @Composable
 fun DriverGuardianApp() {
     val context = LocalContext.current
+    val coroutineScope = rememberCoroutineScope()
     val navController = rememberNavController()
     val snackbarHostState = remember { SnackbarHostState() }
-    val repository = remember {
-        NetworkDriverGuardianRepository(ApiClient.create(BuildConfig.API_BASE_URL))
-    }
+
+    val tokenStore = remember { EncryptedTokenStore(context) }
+    val sessionManager = remember { SessionManager(tokenStore) }
+    val api = remember { ApiClient.create(BuildConfig.API_BASE_URL, sessionManager) }
+    val authRepository = remember { NetworkAuthRepository(api, sessionManager) }
+    val authViewModel: AuthViewModel = viewModel(
+        factory = remember { AuthViewModelFactory(authRepository) }
+    )
+    val authUiState by authViewModel.uiState.collectAsStateWithLifecycle()
+
+    val repository = remember { NetworkDriverGuardianRepository(api) }
     val sessionViewModel: DrivingSessionViewModel = viewModel(
         factory = remember { DrivingSessionViewModelFactory(repository) }
     )
@@ -77,11 +98,54 @@ fun DriverGuardianApp() {
     val monitoringViewModel: MonitoringViewModel = viewModel(
         factory = remember { MonitoringViewModelFactory(context) }
     )
+
     val sessionUiState by sessionViewModel.uiState.collectAsStateWithLifecycle()
     val historyUiState by historyViewModel.uiState.collectAsStateWithLifecycle()
     val backStackEntry by navController.currentBackStackEntryAsState()
     val currentRoute = backStackEntry?.destination?.route
-    val showSidebar = currentRoute != Screen.DangerAlert.route
+
+    val isAuthFlow = currentRoute == Screen.Login.route
+    val showSidebar = currentRoute != Screen.DangerAlert.route && !isAuthFlow
+
+    val currentUserProfile: UserProfile? = when (val state = authUiState) {
+        is AuthUiState.Authenticated -> state.user
+        is AuthUiState.UnlinkedDriver -> state.user
+        else -> null
+    }
+
+    LaunchedEffect(Unit) {
+        authViewModel.restoreSession()
+    }
+
+    LaunchedEffect(authUiState) {
+        when (val state = authUiState) {
+            is AuthUiState.Authenticated -> {
+                sessionViewModel.setAuthenticatedDriver(state.user.driver)
+                if (currentRoute == Screen.Login.route) {
+                    navController.navigate(Screen.Home.route) {
+                        popUpTo(Screen.Login.route) { inclusive = true }
+                    }
+                }
+            }
+            is AuthUiState.Unauthenticated -> {
+                sessionViewModel.setAuthenticatedDriver(null)
+                if (currentRoute != null && currentRoute != Screen.Login.route) {
+                    navController.navigate(Screen.Login.route) {
+                        popUpTo(0) { inclusive = true }
+                    }
+                }
+            }
+            is AuthUiState.UnlinkedDriver -> {
+                sessionViewModel.setAuthenticatedDriver(null)
+                if (currentRoute != null && currentRoute != Screen.Login.route) {
+                    navController.navigate(Screen.Login.route) {
+                        popUpTo(0) { inclusive = true }
+                    }
+                }
+            }
+            else -> {}
+        }
+    }
 
     Surface(
         modifier = Modifier.fillMaxSize(),
@@ -96,7 +160,9 @@ fun DriverGuardianApp() {
                     if (useSidebar) {
                         AppSidebar(
                             currentRoute = currentRoute,
-                            onNavigate = { route -> navController.safeNavigate(route) }
+                            onNavigate = { route -> navController.safeNavigate(route) },
+                            userProfile = currentUserProfile,
+                            onLogout = { authViewModel.logout() }
                         )
                     }
                     AppNavHost(
@@ -107,14 +173,18 @@ fun DriverGuardianApp() {
                         historyViewModel = historyViewModel,
                         historyUiState = historyUiState,
                         monitoringViewModel = monitoringViewModel,
+                        authUiState = authUiState,
+                        authViewModel = authViewModel,
+                        currentUserProfile = currentUserProfile,
+                        startDestination = if (sessionManager.isAuthenticated()) Screen.Home.route else Screen.Login.route,
                         modifier = Modifier
                             .weight(1f)
                             .fillMaxSize()
                             .padding(
-                                start = 16.dp,
-                                top = 16.dp,
-                                end = 16.dp,
-                                bottom = if (showSidebar && !useSidebar) 96.dp else 16.dp
+                                start = if (isAuthFlow) 0.dp else 16.dp,
+                                top = if (isAuthFlow) 0.dp else 16.dp,
+                                end = if (isAuthFlow) 0.dp else 16.dp,
+                                bottom = if (isAuthFlow) 0.dp else if (showSidebar && !useSidebar) 96.dp else 16.dp
                             )
                     )
                 }
@@ -175,20 +245,54 @@ private fun AppNavHost(
     historyViewModel: TripHistoryViewModel,
     historyUiState: com.example.driverguardian.ui.history.TripHistoryUiState,
     monitoringViewModel: MonitoringViewModel,
+    authUiState: AuthUiState,
+    authViewModel: AuthViewModel,
+    currentUserProfile: UserProfile?,
+    startDestination: String,
     modifier: Modifier = Modifier
 ) {
+    val context = LocalContext.current
+    val coroutineScope = rememberCoroutineScope()
+    val googleAuthManager = remember {
+        GoogleAuthManager(context, BuildConfig.GOOGLE_SERVER_CLIENT_ID)
+    }
+
     NavHost(
         navController = navController,
-        startDestination = Screen.Home.route,
+        startDestination = startDestination,
         modifier = modifier
     ) {
+        composable(Screen.Login.route) {
+            LoginScreen(
+                state = authUiState,
+                onLoginWithGoogle = {
+                    coroutineScope.launch {
+                        val result = googleAuthManager.getGoogleIdToken()
+                        result.onSuccess { idToken ->
+                            authViewModel.loginWithGoogle(idToken)
+                        }.onFailure { error ->
+                            val msg = error.localizedMessage ?: "Đăng nhập Google thất bại"
+                            authViewModel.clearError()
+                            snackbarHostState.showSnackbar(msg)
+                        }
+                    }
+                },
+                onLogout = { authViewModel.logout() },
+                onRetry = { authViewModel.clearError() }
+            )
+        }
         composable(Screen.Home.route) {
+            val driverDisplayName = currentUserProfile?.driver?.fullName
+                ?: currentUserProfile?.displayName
+                ?: "Tài xế"
             HomeScreen(
                 onStartTrip = { navController.safeNavigate(Screen.Selection.route) },
                 onHistory = { navController.safeNavigate(Screen.TripHistory.route) },
                 onAnalytics = { navController.safeNavigate(Screen.Analytics.route) },
                 onPreTrip = { navController.safeNavigate(Screen.PreTripCheck.route) },
-                onSettings = { navController.safeNavigate(Screen.Settings.route) }
+                onSettings = { navController.safeNavigate(Screen.Settings.route) },
+                driverName = driverDisplayName,
+                onLogout = { authViewModel.logout() }
             )
         }
         composable(Screen.Selection.route) {

@@ -77,3 +77,25 @@ data class DrowsinessEvent(
     val marValue: Double? = null,
     val headPose: String? = null
 )
+
+data class DriverSummary(
+    val driverId: Int,
+    val driverCode: String,
+    val fullName: String
+)
+
+data class UserProfile(
+    val userId: Int,
+    val email: String,
+    val displayName: String?,
+    val avatarUrl: String?,
+    val role: String,
+    val driver: DriverSummary?
+)
+
+data class AuthTokens(
+    val accessToken: String,
+    val refreshToken: String,
+    val tokenType: String = "bearer",
+    val expiresIn: Int = 1800
+)

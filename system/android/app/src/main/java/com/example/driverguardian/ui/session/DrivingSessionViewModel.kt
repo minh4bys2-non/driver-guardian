@@ -5,6 +5,7 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.example.driverguardian.data.repository.DriverGuardianRepository
 import com.example.driverguardian.data.repository.RepositoryResult
+import com.example.driverguardian.domain.model.DriverSummary
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -16,14 +17,32 @@ class DrivingSessionViewModel(
 ) : ViewModel() {
     private val mutableUiState = MutableStateFlow(DrivingSessionUiState())
     val uiState: StateFlow<DrivingSessionUiState> = mutableUiState.asStateFlow()
+    private var currentAuthDriver: DriverSummary? = null
 
     init {
         refresh()
     }
 
+    fun setAuthenticatedDriver(driver: DriverSummary?) {
+        currentAuthDriver = driver
+        mutableUiState.update { state ->
+            val updatedDriverId = driver?.driverId ?: state.selectedDriverId
+            state.copy(
+                authenticatedDriver = driver,
+                selectedDriverId = updatedDriverId
+            )
+        }
+    }
+
     fun refresh() {
         viewModelScope.launch {
-            mutableUiState.value = DrivingSessionUiState(loadState = LoadState.Loading)
+            val authDriver = currentAuthDriver ?: mutableUiState.value.authenticatedDriver
+            val preselectedDriverId = authDriver?.driverId ?: mutableUiState.value.selectedDriverId
+            mutableUiState.value = DrivingSessionUiState(
+                loadState = LoadState.Loading,
+                authenticatedDriver = authDriver,
+                selectedDriverId = preselectedDriverId
+            )
             val driversResult = repository.getDrivers()
             val vehiclesResult = repository.getVehicles()
             val modelResult = repository.getActiveModelVersion()
@@ -38,7 +57,8 @@ class DrivingSessionViewModel(
             val drivers = (driversResult as RepositoryResult.Success).value
             val vehicles = (vehiclesResult as RepositoryResult.Success).value
             val model = (modelResult as RepositoryResult.Success).value
-            val loadState = if (drivers.isEmpty() || vehicles.isEmpty()) {
+            val hasDriver = authDriver != null || drivers.isNotEmpty()
+            val loadState = if (!hasDriver || vehicles.isEmpty()) {
                 LoadState.Empty("Chưa có đủ tài xế hoặc phương tiện để bắt đầu chuyến đi.")
             } else {
                 LoadState.Success
@@ -47,7 +67,9 @@ class DrivingSessionViewModel(
                 loadState = loadState,
                 drivers = drivers,
                 vehicles = vehicles,
-                activeModel = model
+                activeModel = model,
+                authenticatedDriver = authDriver,
+                selectedDriverId = preselectedDriverId
             )
         }
     }

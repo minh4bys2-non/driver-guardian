@@ -49,7 +49,9 @@ fun HomeScreen(
     onHistory: () -> Unit,
     onAnalytics: () -> Unit,
     onPreTrip: () -> Unit,
-    onSettings: () -> Unit
+    onSettings: () -> Unit,
+    driverName: String = MockData.currentDriver.name,
+    onLogout: (() -> Unit)? = null
 ) {
     BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
         val compact = maxWidth < 900.dp
@@ -62,7 +64,7 @@ fun HomeScreen(
         ) {
             if (compact) {
                 Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                    HeaderText(MockData.currentDriver.name)
+                    HeaderText(driverName)
                     PrimaryActionButton(
                         text = "Bắt đầu chuyến đi",
                         onClick = onStartTrip,
@@ -75,7 +77,7 @@ fun HomeScreen(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    HeaderText(MockData.currentDriver.name, modifier = Modifier.weight(1f))
+                    HeaderText(driverName, modifier = Modifier.weight(1f))
                     Spacer(modifier = Modifier.width(16.dp))
                     PrimaryActionButton(
                         text = "Bắt đầu chuyến đi",
@@ -87,12 +89,12 @@ fun HomeScreen(
 
             if (compact) {
                 Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
-                    DriverCard(Modifier.fillMaxWidth())
+                    DriverCard(driverName, onLogout, Modifier.fillMaxWidth())
                     VehicleCard(onStartTrip, Modifier.fillMaxWidth())
                 }
             } else {
                 Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-                    DriverCard(Modifier.weight(1f))
+                    DriverCard(driverName, onLogout, Modifier.weight(1f))
                     VehicleCard(onStartTrip, Modifier.weight(1f))
                 }
             }
@@ -121,7 +123,7 @@ fun HomeScreen(
                     Button(onClick = onHistory, modifier = Modifier.weight(1f).height(54.dp)) { Text("Xem lịch sử") }
                     Button(onClick = onAnalytics, modifier = Modifier.weight(1f).height(54.dp)) { Text("Xem phân tích") }
                     Button(onClick = onPreTrip, modifier = Modifier.weight(1f).height(54.dp)) { Text("Kiểm tra hệ thống") }
-                    Button(onClick = onSettings, modifier = Modifier.weight(1f).height(54.dp)) { Text("Cài đặt cảnh báo") }
+                    Button(onClick = onSettings, modifier = Modifier.weight(1f).height(54.dp)) { Text("Cài đặt") }
                 }
             }
         }
@@ -137,10 +139,10 @@ private fun HeaderText(driverName: String, modifier: Modifier = Modifier) {
 }
 
 @Composable
-private fun DriverCard(modifier: Modifier = Modifier) {
+private fun DriverCard(driverName: String, onLogout: (() -> Unit)?, modifier: Modifier = Modifier) {
     val driver = MockData.currentDriver
 
-    DashboardCard("Hồ sơ của tôi", modifier = modifier) {
+    DashboardCard("Hồ sơ tài xế", modifier = modifier) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Box(
                 modifier = Modifier
@@ -152,12 +154,16 @@ private fun DriverCard(modifier: Modifier = Modifier) {
                 Icon(Icons.Default.Person, contentDescription = null, tint = SafeGreen, modifier = Modifier.size(38.dp))
             }
             Column(modifier = Modifier.padding(start = 16.dp).weight(1f)) {
-                Text(driver.name, style = MaterialTheme.typography.titleLarge)
+                Text(driverName, style = MaterialTheme.typography.titleLarge)
                 Text(driver.code, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Spacer(Modifier.height(8.dp))
                 StatusIndicator(driver.status, color = SafeGreen)
             }
-            OutlinedButton(onClick = {}, enabled = false) { Text("Cá nhân") }
+            if (onLogout != null) {
+                OutlinedButton(onClick = onLogout) { Text("Đăng xuất") }
+            } else {
+                OutlinedButton(onClick = {}, enabled = false) { Text("Cá nhân") }
+            }
         }
     }
 }
@@ -187,41 +193,35 @@ private fun SystemStatusCard(modifier: Modifier = Modifier) {
 
 @Composable
 private fun QuickStatsCard(modifier: Modifier = Modifier) {
-    DashboardCard("Thống kê nhanh", modifier = modifier) {
-        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            MetricCard("Chuyến trong tháng", "12", modifier = Modifier.weight(1f), valueColor = SafeGreen)
-            MetricCard("Cảnh báo", "5", modifier = Modifier.weight(1f), valueColor = WarningYellow)
-        }
-        Spacer(Modifier.height(12.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            MetricCard("Thời gian lái", "8g 35p", modifier = Modifier.weight(1f), valueColor = AccentBlue)
-            MetricCard("Giờ nguy cơ", "01:00-03:00", modifier = Modifier.weight(1f), valueColor = WarningYellow)
+    DashboardCard("Chỉ số an toàn", modifier = modifier) {
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            MetricCard(label = "Điểm an toàn", value = "98", modifier = Modifier.weight(1f), valueColor = SafeGreen)
+            MetricCard(label = "Cảnh báo tuần", value = "1", modifier = Modifier.weight(1f), valueColor = AccentBlue)
+            MetricCard(label = "Giờ lái xe", value = "24h", modifier = Modifier.weight(1f), valueColor = MaterialTheme.colorScheme.primary)
         }
     }
 }
 
 @Composable
-private fun SystemRow(name: String, value: String, color: androidx.compose.ui.graphics.Color) {
+private fun SystemRow(label: String, status: String, color: androidx.compose.ui.graphics.Color) {
     Row(
-        modifier = Modifier.fillMaxWidth().padding(vertical = 7.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.SpaceBetween
+        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
     ) {
+        Text(label, color = MaterialTheme.colorScheme.onSurfaceVariant)
         Row(verticalAlignment = Alignment.CenterVertically) {
-            val icon = if (name == "Camera") Icons.Default.Videocam else if (name.contains("máy chủ")) Icons.Default.CloudDone else Icons.Default.CheckCircle
-            Icon(icon, contentDescription = null, tint = color)
-            Text("  $name", style = MaterialTheme.typography.bodyLarge)
+            Icon(Icons.Default.CheckCircle, contentDescription = null, tint = color, modifier = Modifier.size(16.dp))
+            Spacer(Modifier.width(6.dp))
+            Text(status, color = color)
         }
-        Text(value, color = color, style = MaterialTheme.typography.labelLarge)
     }
 }
 
-@Preview(widthDp = 1280, heightDp = 720, showBackground = true)
+@Preview(showBackground = true, widthDp = 1000)
 @Composable
 private fun HomeScreenPreview() {
     DriverGuardianTheme {
-        Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).padding(20.dp)) {
-            HomeScreen({}, {}, {}, {}, {})
-        }
+        HomeScreen({}, {}, {}, {}, {})
     }
 }

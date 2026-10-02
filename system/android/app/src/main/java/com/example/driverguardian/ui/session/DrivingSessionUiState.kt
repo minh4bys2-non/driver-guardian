@@ -1,6 +1,7 @@
 package com.example.driverguardian.ui.session
 
 import com.example.driverguardian.domain.model.Driver
+import com.example.driverguardian.domain.model.DriverSummary
 import com.example.driverguardian.domain.model.DrowsinessEvent
 import com.example.driverguardian.domain.model.DrivingSession
 import com.example.driverguardian.domain.model.ModelVersion
@@ -51,6 +52,7 @@ data class DrivingSessionUiState(
     val drivers: List<Driver> = emptyList(),
     val vehicles: List<Vehicle> = emptyList(),
     val activeModel: ModelVersion? = null,
+    val authenticatedDriver: DriverSummary? = null,
     val selectedDriverId: Int? = null,
     val selectedVehicleId: Int? = null,
     val activeSession: DrivingSession? = null,
@@ -62,9 +64,34 @@ data class DrivingSessionUiState(
     val completionState: CompletionState = CompletionState.Idle,
     val acknowledgementState: AcknowledgementState = AcknowledgementState.Idle
 ) {
-    val selectedDriver: Driver? get() = drivers.firstOrNull { it.id == selectedDriverId }
+    val selectedDriver: Driver?
+        get() = drivers.firstOrNull { it.id == selectedDriverId }
+            ?: authenticatedDriver?.let {
+                Driver(
+                    id = it.driverId,
+                    code = it.driverCode,
+                    fullName = it.fullName,
+                    phoneNumber = null,
+                    licenseNumber = null,
+                    status = "ACTIVE",
+                    createdAt = ""
+                )
+            }
     val selectedVehicle: Vehicle? get() = vehicles.firstOrNull { it.id == selectedVehicleId }
-    val activeDriver: Driver? get() = activeSession?.let { session -> drivers.firstOrNull { it.id == session.driverId } }
+    val activeDriver: Driver? get() = activeSession?.let { session ->
+        drivers.firstOrNull { it.id == session.driverId }
+            ?: authenticatedDriver?.takeIf { it.driverId == session.driverId }?.let {
+                Driver(
+                    id = it.driverId,
+                    code = it.driverCode,
+                    fullName = it.fullName,
+                    phoneNumber = null,
+                    licenseNumber = null,
+                    status = "ACTIVE",
+                    createdAt = ""
+                )
+            }
+    }
     val activeVehicle: Vehicle? get() = activeSession?.let { session -> vehicles.firstOrNull { it.id == session.vehicleId } }
     val canContinue: Boolean
         get() = loadState == LoadState.Success && selectedDriver != null && selectedVehicle != null && activeModel != null

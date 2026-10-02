@@ -8,6 +8,13 @@ val driverGuardianApiBaseUrlLiteral = "\"" + driverGuardianApiBaseUrl
     .replace("\\", "\\\\")
     .replace("\"", "\\\"") + "\""
 
+val googleServerClientId = providers.gradleProperty("GOOGLE_SERVER_CLIENT_ID")
+    .orElse("")
+    .get()
+val googleServerClientIdLiteral = "\"" + googleServerClientId
+    .replace("\\", "\\\\")
+    .replace("\"", "\\\"") + "\""
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -25,6 +32,7 @@ android {
         versionCode = 1
         versionName = "1.0.0"
         buildConfigField("String", "API_BASE_URL", driverGuardianApiBaseUrlLiteral)
+        buildConfigField("String", "GOOGLE_SERVER_CLIENT_ID", googleServerClientIdLiteral)
     }
 
     buildFeatures {
@@ -66,6 +74,14 @@ dependencies {
     implementation("com.microsoft.onnxruntime:onnxruntime-android:1.30.0")
     implementation("com.squareup.retrofit2:retrofit:2.11.0")
     implementation("com.squareup.retrofit2:converter-gson:2.11.0")
+
+    // Google Authentication & Credential Manager
+    implementation("androidx.credentials:credentials:1.3.0")
+    implementation("androidx.credentials:credentials-play-services-auth:1.3.0")
+    implementation("com.google.android.libraries.identity.googleid:googleid:1.1.1")
+
+    // Secure Storage (Android Keystore backed)
+    implementation("androidx.security:security-crypto:1.1.0-alpha06")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
     testImplementation("junit:junit:4.13.2")

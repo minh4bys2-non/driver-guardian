@@ -1,10 +1,13 @@
 package com.example.driverguardian.data.remote.dto
 
+import com.example.driverguardian.domain.model.AuthTokens
 import com.example.driverguardian.domain.model.Driver
+import com.example.driverguardian.domain.model.DriverSummary
 import com.example.driverguardian.domain.model.DrowsinessEvent
 import com.example.driverguardian.domain.model.DrivingSession
 import com.example.driverguardian.domain.model.ModelVersion
 import com.example.driverguardian.domain.model.TripSession
+import com.example.driverguardian.domain.model.UserProfile
 import com.example.driverguardian.domain.model.Vehicle
 import com.google.gson.annotations.SerializedName
 
@@ -100,6 +103,41 @@ data class DrowsinessEventResponseDto(
     @SerializedName("sync_status") val syncStatus: String
 )
 
+data class GoogleAuthRequestDto(
+    @SerializedName("id_token") val idToken: String
+)
+
+data class RefreshTokenRequestDto(
+    @SerializedName("refresh_token") val refreshToken: String
+)
+
+data class LogoutRequestDto(
+    @SerializedName("refresh_token") val refreshToken: String? = null
+)
+
+data class DriverSummaryDto(
+    @SerializedName("driver_id") val driverId: Int,
+    @SerializedName("driver_code") val driverCode: String,
+    @SerializedName("full_name") val fullName: String
+)
+
+data class UserProfileResponseDto(
+    @SerializedName("user_id") val userId: Int,
+    @SerializedName("email") val email: String,
+    @SerializedName("display_name") val displayName: String?,
+    @SerializedName("avatar_url") val avatarUrl: String?,
+    @SerializedName("role") val role: String,
+    @SerializedName("driver") val driver: DriverSummaryDto?
+)
+
+data class AuthTokensResponseDto(
+    @SerializedName("access_token") val accessToken: String,
+    @SerializedName("refresh_token") val refreshToken: String,
+    @SerializedName("token_type") val tokenType: String = "bearer",
+    @SerializedName("expires_in") val expiresIn: Int = 1800,
+    @SerializedName("user") val user: UserProfileResponseDto
+)
+
 fun DriverResponseDto.toDomain() = Driver(driverId, driverCode, fullName, phoneNumber, licenseNumber, status, createdAt)
 fun VehicleResponseDto.toDomain() = Vehicle(vehicleId, plateNumber, vehicleName, vehicleType, deviceCode, status, createdAt)
 fun ModelVersionResponseDto.toDomain() = ModelVersion(modelVersionId, versionName, modelType, fileName, description, isActive, deployedAt)
@@ -136,3 +174,7 @@ fun DrowsinessEventResponseDto.toDomain() = DrowsinessEvent(
     marValue = marValue,
     headPose = headPose
 )
+
+fun DriverSummaryDto.toDomain() = DriverSummary(driverId, driverCode, fullName)
+fun UserProfileResponseDto.toDomain() = UserProfile(userId, email, displayName, avatarUrl, role, driver?.toDomain())
+fun AuthTokensResponseDto.toTokensDomain() = AuthTokens(accessToken, refreshToken, tokenType, expiresIn)

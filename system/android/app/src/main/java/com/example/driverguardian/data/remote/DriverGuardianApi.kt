@@ -1,12 +1,17 @@
 package com.example.driverguardian.data.remote
 
+import com.example.driverguardian.data.remote.dto.AuthTokensResponseDto
 import com.example.driverguardian.data.remote.dto.DriverResponseDto
 import com.example.driverguardian.data.remote.dto.DrowsinessEventCreateDto
 import com.example.driverguardian.data.remote.dto.DrowsinessEventResponseDto
 import com.example.driverguardian.data.remote.dto.DrivingSessionCreateDto
 import com.example.driverguardian.data.remote.dto.DrivingSessionResponseDto
+import com.example.driverguardian.data.remote.dto.GoogleAuthRequestDto
+import com.example.driverguardian.data.remote.dto.LogoutRequestDto
 import com.example.driverguardian.data.remote.dto.ModelVersionResponseDto
+import com.example.driverguardian.data.remote.dto.RefreshTokenRequestDto
 import com.example.driverguardian.data.remote.dto.TripSessionResponseDto
+import com.example.driverguardian.data.remote.dto.UserProfileResponseDto
 import com.example.driverguardian.data.remote.dto.VehicleResponseDto
 import retrofit2.http.Body
 import retrofit2.http.GET
@@ -15,6 +20,11 @@ import retrofit2.http.Path
 import retrofit2.http.Query
 
 interface DriverGuardianApi {
+    @POST("auth/google") suspend fun authenticateGoogle(@Body request: GoogleAuthRequestDto): AuthTokensResponseDto
+    @POST("auth/refresh") suspend fun refreshToken(@Body request: RefreshTokenRequestDto): AuthTokensResponseDto
+    @POST("auth/logout") suspend fun logout(@Body request: LogoutRequestDto): Map<String, Any>
+    @GET("auth/me") suspend fun getMe(): UserProfileResponseDto
+
     @GET("drivers") suspend fun getDrivers(): List<DriverResponseDto>
     @GET("vehicles") suspend fun getVehicles(): List<VehicleResponseDto>
     @GET("model-versions/active") suspend fun getActiveModelVersion(): ModelVersionResponseDto

@@ -27,6 +27,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import com.example.driverguardian.domain.model.Driver
+import com.example.driverguardian.domain.model.DriverSummary
 import com.example.driverguardian.domain.model.Vehicle
 import com.example.driverguardian.ui.components.DashboardCard
 import com.example.driverguardian.ui.session.DrivingSessionUiState
@@ -74,10 +75,16 @@ private fun SelectionLists(
     modifier: Modifier = Modifier
 ) {
     Row(modifier = modifier, horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-        DashboardCard("Chọn tài xế", modifier = Modifier.weight(1f)) {
-            LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                items(state.drivers, key = { it.id }) { driver ->
-                    DriverCard(driver, driver.id == state.selectedDriverId) { onSelectDriver(driver.id) }
+        if (state.authenticatedDriver != null) {
+            DashboardCard("Tài xế đã đăng nhập", modifier = Modifier.weight(1f)) {
+                AuthenticatedDriverCard(state.authenticatedDriver)
+            }
+        } else {
+            DashboardCard("Chọn tài xế", modifier = Modifier.weight(1f)) {
+                LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    items(state.drivers, key = { it.id }) { driver ->
+                        DriverCard(driver, driver.id == state.selectedDriverId) { onSelectDriver(driver.id) }
+                    }
                 }
             }
         }
@@ -96,6 +103,26 @@ private fun StatusPanel(message: String, onRetry: () -> Unit, modifier: Modifier
     DashboardCard("Không thể chuẩn bị chuyến đi", modifier = modifier) {
         Text(message, color = MaterialTheme.colorScheme.onSurfaceVariant)
         Button(onClick = onRetry) { Text("Thử lại") }
+    }
+}
+
+@Composable
+private fun AuthenticatedDriverCard(driver: DriverSummary) {
+    Card(
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+        border = BorderStroke(2.dp, SafeGreen)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().height(88.dp).padding(horizontal = 16.dp),
+            horizontalArrangement = Arrangement.spacedBy(14.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(Icons.Default.Person, contentDescription = null, tint = SafeGreen)
+            Column(modifier = Modifier.weight(1f)) {
+                Text(driver.fullName, style = MaterialTheme.typography.titleMedium)
+                Text("${driver.driverCode} • Đã xác thực Google", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
     }
 }
 

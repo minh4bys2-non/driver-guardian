@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from app.auth.dependencies import get_current_user
 from app.database import get_db
 from app.schemas.driver import DriverResponse
 
@@ -23,6 +24,11 @@ DatabaseSession = Annotated[
     Depends(get_db),
 ]
 
+CurrentUser = Annotated[
+    dict,
+    Depends(get_current_user),
+]
+
 
 @router.get(
     "",
@@ -30,6 +36,7 @@ DatabaseSession = Annotated[
 )
 def get_drivers(
     database: DatabaseSession,
+    current_user: CurrentUser,
 ):
     query = text(
         """
@@ -47,15 +54,8 @@ def get_drivers(
     )
 
     try:
-        rows = database.execute(
-            query
-        ).mappings().all()
-
-        return [
-            dict(row)
-            for row in rows
-        ]
-
+        rows = database.execute(query).mappings().all()
+        return [dict(row) for row in rows]
     except Exception as error:
         logger.error(
             "Driver query failed (%s)",

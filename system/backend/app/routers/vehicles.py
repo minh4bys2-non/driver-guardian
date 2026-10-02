@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from app.auth.dependencies import get_current_user
 from app.database import get_db
 from app.schemas.vehicle import VehicleResponse
 
@@ -23,12 +24,20 @@ DatabaseSession = Annotated[
     Depends(get_db),
 ]
 
+CurrentUser = Annotated[
+    dict,
+    Depends(get_current_user),
+]
+
 
 @router.get(
     "",
     response_model=list[VehicleResponse],
 )
-def get_vehicles(database: DatabaseSession):
+def get_vehicles(
+    database: DatabaseSession,
+    current_user: CurrentUser,
+):
     query = text(
         """
         SELECT
@@ -46,12 +55,7 @@ def get_vehicles(database: DatabaseSession):
 
     try:
         rows = database.execute(query).mappings().all()
-
-        return [
-            dict(row)
-            for row in rows
-        ]
-
+        return [dict(row) for row in rows]
     except Exception as error:
         logger.error(
             "Vehicle query failed (%s)",

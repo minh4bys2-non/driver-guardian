@@ -2,9 +2,9 @@
 
 ## Purpose
 
-This service exposes the current Driver Guardian system APIs and persists
-driver, vehicle, model-version, driving-session, and drowsiness-event data in
-Oracle Database.
+This service exposes the Driver Guardian system APIs and persists
+driver, vehicle, model-version, user authentication, driving-session,
+and drowsiness-event data in Oracle Database.
 
 The backend is intentionally independent from Android and AI code. It exposes
 the persisted driving-session lifecycle without inventing AI-derived scores.
@@ -14,105 +14,55 @@ the persisted driving-session lifecycle without inventing AI-derived scores.
 - `app/main.py`: FastAPI application, router registration, and health routes.
 - `app/database.py`: environment loading, SQLAlchemy Oracle engine, session
   factory, and database connectivity check.
-- `app/routers/`: HTTP routes and SQL operations.
+- `app/auth/`: Google ID token verification, JWT issuance, passwordless session
+  handling, and authentication dependencies (`get_current_user`, `get_current_driver`).
+- `app/routers/`: HTTP routes (Auth, Drivers, Vehicles, Model Versions, Sessions, Events).
 - `app/schemas/`: Pydantic request and response models.
-- `tests/`: Oracle-independent smoke and error-handling regression tests.
+- `tests/`: Oracle-independent unit tests (Trip lifecycle, Auth, Error handling, Smoke).
 
-The implementation uses SQLAlchemy with the `oracle+oracledb` driver. A real
-Oracle connection is opened only by database-backed requests.
+## Authentication & Security
 
-## Requirements
-
-- Python 3.12. The recovered environment used Python 3.12.10; repository
-  verification was performed with Python 3.12.14.
-- Oracle Database with the schema documented in `../database/` for
-  database-backed endpoints.
-
-## Setup
-
-From `system/backend`:
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-```
-
-On macOS/Linux, activate with `source .venv/bin/activate` instead.
-
-## Environment configuration
-
-Copy `.env.example` to `.env` and supply values for:
-
-```dotenv
-DB_USER=
-DB_PASSWORD=
-DB_HOST=
-DB_PORT=
-DB_SERVICE=
-```
-
-The names match `app/database.py`. `.env` is ignored by Git; never commit real
-credentials.
-
-## Run
-
-```powershell
-python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
-```
-
-- API root: `http://127.0.0.1:8000/`
-- Swagger UI: `http://127.0.0.1:8000/docs`
-- OpenAPI JSON: `http://127.0.0.1:8000/openapi.json`
+- **Google ID Token Verification**: Validates issuer, audience, signature, and expiration
+  using official Google cryptography tools (`google-auth`).
+- **Driver Guardian Tokens**:
+  - Access Token: Short-lived JWT (default 30 mins) with minimal claims (`sub`, `role`, `exp`).
+  - Refresh Token: Long-lived cryptographically secure random token (default 30 days).
+  - Storage: Only the SHA-256 hash (`TOKEN_HASH`) is stored in `AUTH_REFRESH_TOKENS`.
+- **USER ≠ DRIVER Boundary**:
+  - Authenticated accounts exist in `USERS`.
+  - Business profiles exist in `DRIVERS`.
+  - For `ROLE=DRIVER`, sessions are strictly bound to `USERS.DRIVER_ID`.
+  - Users without a linked `DRIVER_ID` cannot create driving sessions.
+  - Cross-driver session/event access returns `403 Forbidden`.
 
 ## Current API
 
-| Method | Path | Description |
-|---|---|---|
-| GET | `/` | Service identity |
-| GET | `/health` | Process-level health |
-| GET | `/health/database` | Oracle connectivity and context |
-| GET | `/drivers` | List drivers |
-| GET | `/vehicles` | List vehicles |
-| GET | `/model-versions/active` | Get the active model version |
-| POST | `/sessions` | Create an active driving session |
-| POST | `/sessions/{session_id}/complete` | Complete an active session using one database timestamp |
-| GET | `/sessions` | List joined session history with optional driver/status filters |
-| GET | `/sessions/{session_id}` | Get joined session detail |
-| GET | `/sessions/{session_id}/events` | List persisted session events in chronological order |
-| POST | `/events` | Create a drowsiness event and increment session alerts |
-| POST | `/events/{event_id}/acknowledge` | Idempotently record driver confirmation |
-
-Database failures return generic client messages. Logs record only the
-exception type, not the exception text, to avoid exposing connection details or
-credentials.
+| Method | Path | Description | Protected |
+|---|---|---|---|
+| GET | `/` | Service identity | No |
+| GET | `/health` | Process-level health | No |
+| GET | `/health/database` | Oracle connectivity and context | No |
+| POST | `/auth/google` | Exchange verified Google ID token for Driver Guardian tokens | No |
+| POST | `/auth/refresh` | Rotate access and refresh tokens | No |
+| POST | `/auth/logout` | Revoke refresh token and invalidate session | Yes |
+| GET | `/auth/me` | Return current authenticated user profile and linked driver | Yes |
+| GET | `/drivers` | List drivers | Yes |
+| GET | `/vehicles` | List vehicles | Yes |
+| GET | `/model-versions/active` | Get the active model version | Yes |
+| POST | `/sessions` | Create an active driving session (enforces driver ownership) | Yes |
+| POST | `/sessions/{session_id}/complete` | Complete an active session | Yes |
+| GET | `/sessions` | List session history filtered by authenticated driver | Yes |
+| GET | `/sessions/{session_id}` | Get session detail (enforces driver ownership) | Yes |
+| GET | `/sessions/{session_id}/events` | List session events in chronological order | Yes |
+| POST | `/events` | Create a drowsiness event and increment session alerts | Yes |
+| POST | `/events/{event_id}/acknowledge` | Idempotently record driver confirmation | Yes |
 
 ## Tests
 
-The unit smoke tests do not need Oracle. They set non-secret placeholder
-environment variables and replace only the database access boundary needed by
-each error-path test.
+Run the test suite:
 
 ```powershell
 python -m unittest discover -s tests -v
 ```
 
-The suite verifies application import, `/`, `/health`, OpenAPI generation,
-preservation of the eight current routes, and redaction of raw database errors.
-
-## Oracle schema
-
-See [`../database/README.md`](../database/README.md). Apply the recovered schema
-only to an appropriate Oracle user. No `CREATE USER` artifact was recovered,
-and the reference-only tablespace script must not be used as a default setup
-script.
-
-## Known limitations
-
-- Oracle was not reachable during repository verification. Unit smoke tests
-  remain valid without it; database integration is not verified.
-- No portable Oracle container or user-provisioning script is included.
-- Safety-score calculation and analytics remain undefined. Existing nullable
-  database values are returned unchanged rather than derived by the API.
-- Android Retrofit integration is outside this phase.
+All 27 backend tests run without needing live Google servers or a live Oracle database.

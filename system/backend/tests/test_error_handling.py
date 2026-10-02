@@ -12,6 +12,7 @@ os.environ.setdefault("DB_HOST", "127.0.0.1")
 os.environ.setdefault("DB_PORT", "1521")
 os.environ.setdefault("DB_SERVICE", "FREEPDB1")
 
+from app.auth.dependencies import get_current_user
 from app.database import get_db
 from app.main import app
 
@@ -39,6 +40,16 @@ class DatabaseErrorHandlingTest(unittest.IsolatedAsyncioTestCase):
             transport=ASGITransport(app=app),
             base_url="http://testserver",
         )
+        app.dependency_overrides[get_current_user] = lambda: {
+            "user_id": 1,
+            "google_sub": "sub-1",
+            "email": "driver@driverguardian.com",
+            "display_name": "Lan",
+            "avatar_url": None,
+            "role": "DRIVER",
+            "driver_id": 1,
+            "is_active": "Y",
+        }
 
     async def asyncTearDown(self):
         app.dependency_overrides.clear()

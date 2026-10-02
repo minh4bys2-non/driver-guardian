@@ -3,6 +3,7 @@ import logging
 from fastapi import FastAPI, HTTPException
 
 from app.database import check_database_connection
+from app.routers.auth import router as auth_router
 from app.routers.drivers import router as drivers_router
 from app.routers.vehicles import router as vehicles_router
 from app.routers.model_versions import router as model_versions_router
@@ -23,11 +24,13 @@ app = FastAPI(
 )
 
 
+app.include_router(auth_router)
 app.include_router(drivers_router)
 app.include_router(vehicles_router)
 app.include_router(model_versions_router)
 app.include_router(sessions_router)
 app.include_router(events_router)
+
 
 
 @app.get("/")

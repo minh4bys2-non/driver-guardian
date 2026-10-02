@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from app.auth.dependencies import get_current_user
 from app.database import get_db
 from app.schemas.model_version import ModelVersionResponse
 
@@ -23,6 +24,11 @@ DatabaseSession = Annotated[
     Depends(get_db),
 ]
 
+CurrentUser = Annotated[
+    dict,
+    Depends(get_current_user),
+]
+
 
 @router.get(
     "/active",
@@ -30,6 +36,7 @@ DatabaseSession = Annotated[
 )
 def get_active_model_version(
     database: DatabaseSession,
+    current_user: CurrentUser,
 ):
     query = text(
         """

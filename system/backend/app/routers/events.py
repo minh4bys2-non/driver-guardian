@@ -16,6 +16,7 @@ from sqlalchemy import (
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from app.auth.dependencies import get_current_user
 from app.database import get_db
 from app.schemas.drowsiness_event import (
     DrowsinessEventCreate,
@@ -35,6 +36,11 @@ router = APIRouter(
 DatabaseSession = Annotated[
     Session,
     Depends(get_db),
+]
+
+CurrentUser = Annotated[
+    dict,
+    Depends(get_current_user),
 ]
 
 
@@ -68,11 +74,13 @@ drowsiness_events_table = Table(
 def create_drowsiness_event(
     payload: DrowsinessEventCreate,
     database: DatabaseSession,
+    current_user: CurrentUser,
 ):
     active_session_query = text(
         """
         SELECT
             SESSION_ID AS "session_id",
+            DRIVER_ID AS "driver_id",
             STATUS AS "status"
         FROM DRIVING_SESSIONS
         WHERE SESSION_ID = :session_id
@@ -92,6 +100,13 @@ def create_drowsiness_event(
                 detail="Active driving session not found",
             )
 
+        session_driver_id = session.get("driver_id")
+        if current_user.get("role") == "DRIVER" and session_driver_id is not None and session_driver_id != current_user.get("driver_id"):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied to this driving session",
+            )
+
         insert_statement = (
             insert(drowsiness_events_table)
             .values(
@@ -105,34 +120,20 @@ def create_drowsiness_event(
                 drowsiness_events_table.c.EVENT_ID.label("event_id"),
                 drowsiness_events_table.c.SESSION_ID.label("session_id"),
                 drowsiness_events_table.c.EVENT_TIME.label("event_time"),
-                drowsiness_events_table.c.DRIVER_STATE.label(
-                    "driver_state"
-                ),
-                drowsiness_events_table.c.ALERT_LEVEL.label(
-                    "alert_level"
-                ),
+                drowsiness_events_table.c.DRIVER_STATE.label("driver_state"),
+                drowsiness_events_table.c.ALERT_LEVEL.label("alert_level"),
                 drowsiness_events_table.c.CONFIDENCE.label("confidence"),
-                drowsiness_events_table.c.DROWSINESS_SCORE.label(
-                    "drowsiness_score"
-                ),
+                drowsiness_events_table.c.DROWSINESS_SCORE.label("drowsiness_score"),
                 drowsiness_events_table.c.EAR_VALUE.label("ear_value"),
                 drowsiness_events_table.c.MAR_VALUE.label("mar_value"),
                 drowsiness_events_table.c.HEAD_POSE.label("head_pose"),
-                drowsiness_events_table.c.DURATION_MS.label(
-                    "duration_ms"
-                ),
-                drowsiness_events_table.c.ACKNOWLEDGED.label(
-                    "acknowledged"
-                ),
-                drowsiness_events_table.c.SYNC_STATUS.label(
-                    "sync_status"
-                ),
+                drowsiness_events_table.c.DURATION_MS.label("duration_ms"),
+                drowsiness_events_table.c.ACKNOWLEDGED.label("acknowledged"),
+                drowsiness_events_table.c.SYNC_STATUS.label("sync_status"),
             )
         )
 
-        event = database.execute(
-            insert_statement
-        ).mappings().one()
+        event = database.execute(insert_statement).mappings().one()
 
         database.execute(
             text(
@@ -146,28 +147,23 @@ def create_drowsiness_event(
         )
 
         database.commit()
-
         return dict(event)
 
     except HTTPException:
         database.rollback()
         raise
-
     except IntegrityError as error:
         database.rollback()
-
         raise HTTPException(
             status_code=409,
             detail="Event violates database constraints",
         ) from error
-
     except SQLAlchemyError as error:
         database.rollback()
         logger.error(
             "Drowsiness event creation failed (%s)",
             type(error).__name__,
         )
-
         raise HTTPException(
             status_code=500,
             detail="Failed to create event",
@@ -181,14 +177,18 @@ def create_drowsiness_event(
 def acknowledge_drowsiness_event(
     event_id: int,
     database: DatabaseSession,
+    current_user: CurrentUser,
 ):
     lock_query = text(
         """
         SELECT
-            EVENT_ID AS "event_id",
-            ACKNOWLEDGED AS "acknowledged"
-        FROM DROWSINESS_EVENTS
-        WHERE EVENT_ID = :event_id
+            E.EVENT_ID AS "event_id",
+            E.SESSION_ID AS "session_id",
+            E.ACKNOWLEDGED AS "acknowledged",
+            S.DRIVER_ID AS "driver_id"
+        FROM DROWSINESS_EVENTS E
+        JOIN DRIVING_SESSIONS S ON S.SESSION_ID = E.SESSION_ID
+        WHERE E.EVENT_ID = :event_id
         FOR UPDATE
         """
     )
@@ -248,6 +248,13 @@ def acknowledge_drowsiness_event(
             raise HTTPException(
                 status_code=404,
                 detail="Drowsiness event not found",
+            )
+
+        event_driver_id = event.get("driver_id")
+        if current_user.get("role") == "DRIVER" and event_driver_id is not None and event_driver_id != current_user.get("driver_id"):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied to this drowsiness event",
             )
 
         confirmation_count = database.execute(

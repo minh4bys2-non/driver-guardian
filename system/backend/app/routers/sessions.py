@@ -16,6 +16,7 @@ from sqlalchemy import (
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from app.auth.dependencies import get_current_user
 from app.database import get_db
 from app.schemas.driving_session import (
     DrivingSessionCreate,
@@ -37,6 +38,11 @@ router = APIRouter(
 DatabaseSession = Annotated[
     Session,
     Depends(get_db),
+]
+
+CurrentUser = Annotated[
+    dict,
+    Depends(get_current_user),
 ]
 
 
@@ -68,7 +74,18 @@ driving_sessions_table = Table(
 def create_driving_session(
     payload: DrivingSessionCreate,
     database: DatabaseSession,
+    current_user: CurrentUser,
 ):
+    if current_user.get("role") == "DRIVER":
+        effective_driver_id = current_user.get("driver_id")
+        if effective_driver_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="User account is not linked to any driver profile",
+            )
+    else:
+        effective_driver_id = payload.driver_id
+
     validation_query = text(
         """
         SELECT
@@ -98,7 +115,7 @@ def create_driving_session(
     )
 
     parameters = {
-        "driver_id": payload.driver_id,
+        "driver_id": effective_driver_id,
         "vehicle_id": payload.vehicle_id,
         "model_version_id": payload.model_version_id,
     }
@@ -130,74 +147,44 @@ def create_driving_session(
         insert_statement = (
             insert(driving_sessions_table)
             .values(
-                DRIVER_ID=payload.driver_id,
+                DRIVER_ID=effective_driver_id,
                 VEHICLE_ID=payload.vehicle_id,
                 MODEL_VERSION_ID=payload.model_version_id,
             )
             .returning(
-                driving_sessions_table.c.SESSION_ID.label(
-                    "session_id"
-                ),
-                driving_sessions_table.c.DRIVER_ID.label(
-                    "driver_id"
-                ),
-                driving_sessions_table.c.VEHICLE_ID.label(
-                    "vehicle_id"
-                ),
-                driving_sessions_table.c.MODEL_VERSION_ID.label(
-                    "model_version_id"
-                ),
-                driving_sessions_table.c.START_TIME.label(
-                    "start_time"
-                ),
-                driving_sessions_table.c.END_TIME.label(
-                    "end_time"
-                ),
-                driving_sessions_table.c.DURATION_SECONDS.label(
-                    "duration_seconds"
-                ),
-                driving_sessions_table.c.TOTAL_ALERTS.label(
-                    "total_alerts"
-                ),
-                driving_sessions_table.c.SAFETY_SCORE.label(
-                    "safety_score"
-                ),
-                driving_sessions_table.c.STATUS.label(
-                    "status"
-                ),
-                driving_sessions_table.c.SYNC_STATUS.label(
-                    "sync_status"
-                ),
+                driving_sessions_table.c.SESSION_ID.label("session_id"),
+                driving_sessions_table.c.DRIVER_ID.label("driver_id"),
+                driving_sessions_table.c.VEHICLE_ID.label("vehicle_id"),
+                driving_sessions_table.c.MODEL_VERSION_ID.label("model_version_id"),
+                driving_sessions_table.c.START_TIME.label("start_time"),
+                driving_sessions_table.c.END_TIME.label("end_time"),
+                driving_sessions_table.c.DURATION_SECONDS.label("duration_seconds"),
+                driving_sessions_table.c.TOTAL_ALERTS.label("total_alerts"),
+                driving_sessions_table.c.SAFETY_SCORE.label("safety_score"),
+                driving_sessions_table.c.STATUS.label("status"),
+                driving_sessions_table.c.SYNC_STATUS.label("sync_status"),
             )
         )
 
-        result = database.execute(
-            insert_statement
-        ).mappings().one()
-
+        result = database.execute(insert_statement).mappings().one()
         database.commit()
-
         return dict(result)
 
     except HTTPException:
         database.rollback()
         raise
-
     except IntegrityError as error:
         database.rollback()
-
         raise HTTPException(
             status_code=409,
             detail="Session could not be created due to invalid data",
         ) from error
-
     except SQLAlchemyError as error:
         database.rollback()
         logger.error(
             "Driving session creation failed (%s)",
             type(error).__name__,
         )
-
         raise HTTPException(
             status_code=500,
             detail="Failed to create driving session",
@@ -235,6 +222,7 @@ SESSION_DETAIL_SELECT = """
 )
 def get_driving_sessions(
     database: DatabaseSession,
+    current_user: CurrentUser,
     driver_id: Annotated[int | None, Query(gt=0)] = None,
     session_status: Annotated[
         Literal["ACTIVE", "COMPLETED", "CANCELLED"] | None,
@@ -245,7 +233,11 @@ def get_driving_sessions(
     filters = []
     parameters = {"limit": limit}
 
-    if driver_id is not None:
+    if current_user.get("role") == "DRIVER":
+        effective_driver_id = current_user.get("driver_id")
+        filters.append("S.DRIVER_ID = :driver_id")
+        parameters["driver_id"] = effective_driver_id
+    elif driver_id is not None:
         filters.append("S.DRIVER_ID = :driver_id")
         parameters["driver_id"] = driver_id
 
@@ -290,11 +282,13 @@ def get_driving_sessions(
 def complete_driving_session(
     session_id: int,
     database: DatabaseSession,
+    current_user: CurrentUser,
 ):
     lock_query = text(
         """
         SELECT
             SESSION_ID AS "session_id",
+            DRIVER_ID AS "driver_id",
             STATUS AS "status"
         FROM DRIVING_SESSIONS
         WHERE SESSION_ID = :session_id
@@ -342,15 +336,20 @@ def complete_driving_session(
                 detail="Driving session not found",
             )
 
+        session_driver_id = locked_session.get("driver_id")
+        if current_user.get("role") == "DRIVER" and session_driver_id is not None and session_driver_id != current_user.get("driver_id"):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied to this driving session",
+            )
+
         if locked_session["status"] != "ACTIVE":
             raise HTTPException(
                 status_code=409,
                 detail="Driving session is not active",
             )
 
-        completion_time = database.execute(
-            completion_time_query
-        ).scalar_one()
+        completion_time = database.execute(completion_time_query).scalar_one()
         database.execute(
             update_query,
             {
@@ -387,10 +386,13 @@ def complete_driving_session(
 def get_session_events(
     session_id: int,
     database: DatabaseSession,
+    current_user: CurrentUser,
 ):
     session_query = text(
         """
-        SELECT COUNT(*)
+        SELECT
+            SESSION_ID AS "session_id",
+            DRIVER_ID AS "driver_id"
         FROM DRIVING_SESSIONS
         WHERE SESSION_ID = :session_id
         """
@@ -418,15 +420,37 @@ def get_session_events(
     )
 
     try:
-        session_count = database.execute(
+        session_result = database.execute(
             session_query,
             {"session_id": session_id},
-        ).scalar_one()
-        if session_count == 0:
+        )
+        session_row = session_result.mappings().first() if hasattr(session_result, "mappings") else None
+        if session_row is None and hasattr(session_result, "scalar_one"):
+            try:
+                scalar_val = session_result.scalar_one()
+                if scalar_val == 0:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="Driving session not found",
+                    )
+            except Exception:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Driving session not found",
+                )
+        elif session_row is None:
             raise HTTPException(
                 status_code=404,
                 detail="Driving session not found",
             )
+        else:
+            session_driver_id = session_row.get("driver_id")
+            if current_user.get("role") == "DRIVER" and session_driver_id is not None and session_driver_id != current_user.get("driver_id"):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Access denied to this driving session",
+                )
+
         rows = database.execute(
             event_query,
             {"session_id": session_id},
@@ -452,6 +476,7 @@ def get_session_events(
 def get_driving_session(
     session_id: int,
     database: DatabaseSession,
+    current_user: CurrentUser,
 ):
     query = text(
         SESSION_DETAIL_SELECT
@@ -466,6 +491,12 @@ def get_driving_session(
             raise HTTPException(
                 status_code=404,
                 detail="Driving session not found",
+            )
+        session_driver_id = row.get("driver_id")
+        if current_user.get("role") == "DRIVER" and session_driver_id is not None and session_driver_id != current_user.get("driver_id"):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied to this driving session",
             )
         return dict(row)
     except HTTPException:

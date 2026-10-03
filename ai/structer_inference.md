@@ -224,7 +224,7 @@ Giả sử đầu vào có kích thước mẻ $bz = 2$ và chiều dài chuỗi
 | **3.2** | `adaptive_avg_pool2d` trên $P_4^{\text{out}}$ | $[120, 128, 40, 40]$ | $[120, 128, 1, 1]$ | — | Nén thông tin không gian vùng miệng về vector 128 chiều |
 | **3.3** | `adaptive_avg_pool2d` trên $P_5^{\text{out}}$ | $[120, 256, 20, 20]$ | $[120, 256, 1, 1]$ | — | Nén thông tin không gian toàn đầu về vector 256 chiều |
 | **3.4** | **Time-Unfolding (Reshape lại chuỗi)** | $[bz \cdot T, C, 1, 1]$ | $\begin{matrix} v_3 \in [bz, T, 64] \\ v_4 \in [bz, T, 128] \\ v_5 \in [bz, T, 256] \end{matrix}$ | — | Khôi phục thứ tự thời gian cho từng khung hình |
-| **4.1** | `SpatialFeatureAdapter` (Concat Mode) | $v_3, v_4, v_5$ | $[bz, T, 448]$ | — | Ghép nối toàn bộ 448 kênh đa tỷ lệ |
+| **4.1** | `CNNAdapter` (Concat Mode) | $v_3, v_4, v_5$ | $[bz, T, 448]$ | — | Ghép nối toàn bộ 448 kênh đa tỷ lệ |
 | **4.2** | `Linear + LayerNorm + ReLU + Dropout` | $[bz, T, 448]$ | $[bz, T, 256]$ | — | Chiếu về không gian biểu diễn ẩn chung $d = 256$ |
 | **4.3** | `Deep LSTM` (3 lớp xếp chồng) | $[bz, T, 256]$ | $[bz, T, 256]$ | — | Mô hình hóa quy luật diễn biến theo thời gian |
 | **4.4** | `fc_out` (Sequence Mode) | $[bz, T, 256]$ | $[bz, T, 2]$ | — | **Dự đoán nhãn theo từng khung hình liên tục** |
@@ -276,7 +276,7 @@ $$\mathbf{v}_3 \in \mathbb{R}^{bz \times T \times 64}, \quad \mathbf{v}_4 \in \m
 
 ---
 
-### 5.4. Khối Dung Hợp Đặc Trưng Không Gian (`SpatialFeatureAdapter`)
+### 5.4. Khối Dung Hợp Đặc Trưng Không Gian (`CNNAdapter`)
 Mã nguồn định nghĩa trong `LSTM/model.py`:
 Nhận 3 tensor $(\mathbf{v}_3, \mathbf{v}_4, \mathbf{v}_5)$ với tổng số kênh $64 + 128 + 256 = 448$ và chiếu về chiều ẩn $d_{\text{model}} = 256$.
 
@@ -343,7 +343,7 @@ self.fc_out = nn.Sequential(
 | **CNN Backbone** | Stem, Stage 1, Stage 2, Stage 3, Stage 4 | $[3, 640, 640] \to (P_3, P_4, P_5)$ | **1,038,784** (~1.04M) | ~31.1% |
 | **CNN Neck** | PAFPN (Top-down FPN + Bottom-up PAN) | $(P_3, P_4, P_5) \to (P_3', P_4', P_5')$ | **602,752** (~0.60M) | ~18.1% |
 | **Spatial Pooling** | `F.adaptive_avg_pool2d(1, 1)` | 2D Maps $\to$ 1D Vectors | **0** (Non-parametric) | 0.0% |
-| **Feature Adapter** | `SpatialFeatureAdapter` (Chế độ `concat`) | $448 \to 256$ + LayerNorm(256) | **115,456** (~0.12M) | ~3.5% |
+| **Feature Adapter** | `CNNAdapter` (Chế độ `concat`) | $448 \to 256$ + LayerNorm(256) | **115,456** (~0.12M) | ~3.5% |
 | **Temporal LSTM** | Stacked 3-Layer LSTM (Hidden=256) | $256 \to 256$ (3 Layers) | **1,579,008** (~1.58M) | ~47.3% |
 | **Classifier Head** | FC Layer + Dropout(0.2) | $256 \to 2$ | **514** (< 1K) | < 0.1% |
 | **TỔNG TOÀN BỘ MÔ HÌNH** | **End-to-End Driver Guardian Inference Model** | **$[bz, T, 3, 640, 640] \to [bz, T, 2]$** | **~3,336,514 (~3.34M)** | **100.0%** |
@@ -366,7 +366,7 @@ Trong chế độ này, mô hình được đóng gói thành một lớp `nn.Mo
    * Mỗi khung hình mới đến chỉ cần chạy qua `Backbone + Neck + AdaptiveAvgPool2d` một lần duy nhất, thu được vector $v_t \in \mathbb{R}^{448}$.
    * Tần số chạy trích xuất không gian: $2\text{ FPS}$ (mỗi $0.5\text{s}$ một khung hình).
 2. **Cập nhật trạng thái ẩn LSTM (Stateful Streaming Inference):**
-   * Đưa vector $v_t$ qua `SpatialFeatureAdapter` thu được $x_t \in \mathbb{R}^{256}$.
+   * Đưa vector $v_t$ qua `CNNAdapter` thu được $x_t \in \mathbb{R}^{256}$.
    * Cập nhật bước thời gian của LSTM với trạng thái ẩn được duy trì liên tục:
      $$(\mathbf{h}_t, \mathbf{c}_t) = \text{LSTMCell}(x_t, (\mathbf{h}_{t-1}, \mathbf{c}_{t-1}))$$
    * Dự đoán ngay lập tức qua `fc_out` với độ trễ tính toán cực tiểu: **$< 1\text{ms}$**.

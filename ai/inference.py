@@ -61,7 +61,7 @@ from ai.ObjectDetection_2p6M.src.backbone_neck import Backbone, PAFPN
 from ai.ObjectDetection_2p6M.src.config import TrainConfig as DetectionTrainConfig
 
 # Nạp các khối từ LSTM
-from ai.LSTM.model import SpatialFeatureAdapter, DeepLSTMClassifier
+from ai.LSTM.model import CNNAdapter, DeepLSTMClassifier
 
 try:
     import onnx

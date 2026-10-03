@@ -31,6 +31,7 @@ class DefaultGoogleIdTokenVerifier:
                 id_token_string,
                 request,
                 audience=self.client_id,
+                clock_skew_in_seconds=10,
             )
         except Exception as error:
             raise ValueError(f"Invalid Google ID token: {error}") from error

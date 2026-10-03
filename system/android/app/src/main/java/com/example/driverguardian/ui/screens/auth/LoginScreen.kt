@@ -236,6 +236,14 @@ fun LoginScreen(
                             ) {
                                 Text("Thử lại")
                             }
+
+                            Spacer(modifier = Modifier.height(16.dp))
+
+                            // Persistent Google Sign-In button available even after an error
+                            GoogleSignInButton(
+                                onClick = onLoginWithGoogle,
+                                modifier = Modifier.fillMaxWidth()
+                            )
                         }
                     }
                 }
@@ -275,36 +283,10 @@ fun LoginScreen(
 
                             Spacer(modifier = Modifier.height(20.dp))
 
-                            Button(
+                            GoogleSignInButton(
                                 onClick = onLoginWithGoogle,
-                                colors = ButtonDefaults.buttonColors(
-                                    containerColor = Color.White,
-                                    contentColor = Color.Black
-                                ),
-                                shape = RoundedCornerShape(12.dp),
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .height(52.dp)
-                            ) {
-                                Row(
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.Center
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Default.AccountCircle,
-                                        contentDescription = "Google Icon",
-                                        tint = AccentBlue,
-                                        modifier = Modifier.size(24.dp)
-                                    )
-                                    Spacer(modifier = Modifier.width(12.dp))
-                                    Text(
-                                        text = "Tiếp tục với Google",
-                                        fontWeight = FontWeight.SemiBold,
-                                        fontSize = 15.sp,
-                                        color = Color(0xFF1F1F1F)
-                                    )
-                                }
-                            }
+                                modifier = Modifier.fillMaxWidth()
+                            )
                         }
                     }
                 }
@@ -320,3 +302,39 @@ fun LoginScreen(
         }
     }
 }
+
+@Composable
+fun GoogleSignInButton(
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Button(
+        onClick = onClick,
+        colors = ButtonDefaults.buttonColors(
+            containerColor = Color.White,
+            contentColor = Color.Black
+        ),
+        shape = RoundedCornerShape(12.dp),
+        modifier = modifier.height(52.dp)
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.Center
+        ) {
+            Icon(
+                imageVector = Icons.Default.AccountCircle,
+                contentDescription = "Google Icon",
+                tint = AccentBlue,
+                modifier = Modifier.size(24.dp)
+            )
+            Spacer(modifier = Modifier.width(12.dp))
+            Text(
+                text = "Tiếp tục với Google",
+                fontWeight = FontWeight.SemiBold,
+                fontSize = 15.sp,
+                color = Color(0xFF1F1F1F)
+            )
+        }
+    }
+}
+

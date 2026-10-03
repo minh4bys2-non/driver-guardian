@@ -1,3 +1,4 @@
+import os
 from typing import Annotated
 
 from fastapi import Depends, HTTPException, status
@@ -14,7 +15,7 @@ security_scheme = HTTPBearer(auto_error=False)
 
 
 def get_google_verifier() -> GoogleTokenVerifier:
-    return DefaultGoogleIdTokenVerifier()
+    return DefaultGoogleIdTokenVerifier(client_id=os.getenv("GOOGLE_CLIENT_ID"))
 
 
 def get_current_user(

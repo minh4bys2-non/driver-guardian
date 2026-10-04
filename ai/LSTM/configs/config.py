@@ -116,6 +116,12 @@ class TrainConfig:
     enable_resume: bool = False  # Cờ bật/tắt nạp lại: True = Cho phép resume | False = Luôn train mới từ Epoch 1
     resume_epoch: Optional[int] = None  # Số epoch cụ thể cần nạp lại
     resume: str = ""  # Đường dẫn file checkpoint, số epoch hoặc bí danh ('last', 'best') để huấn luyện tiếp
+
+    # Cấu hình Giám sát Phân giải cao theo từng Step (Per-Step Metrics trên TensorBoard)
+    enable_step_logging: bool = True  # Bật/tắt tính toán và ghi nhận per-step metrics lên TensorBoard
+    log_step_interval: int = 5  # Số batch steps giữa các lần ghi TensorBoard (mặc định = 5)
+    flush_step_interval: int = 50  # Số batch steps giữa các lần flush đĩa SummaryWriter (mặc định = 50)
+    ema_beta: float = 0.95  # Hệ số làm mượt hàm mất mát Exponential Moving Average (EMA)
     
     # Cơ chế Dừng sớm (Early Stopping)
     early_stopping: bool = True  # Bật/tắt Early Stopping
@@ -206,6 +212,11 @@ class TrainConfig:
         assert self.hidden_dim > 0, "hidden_dim phải > 0"
         assert self.num_layers > 0, "num_layers phải > 0"
         assert self.num_classes > 0, "num_classes phải > 0"
+
+        # 7. Ràng buộc tham số ghi nhận log cấp độ Step
+        assert self.log_step_interval >= 1, "log_step_interval phải >= 1"
+        assert self.flush_step_interval >= 1, "flush_step_interval phải >= 1"
+        assert 0.0 < self.ema_beta < 1.0, "ema_beta phải nằm trong khoảng (0, 1)"
 
     def to_dict(self) -> Dict[str, Any]:
         """Chuyển đổi Config sang dạng Dictionary."""

@@ -93,6 +93,12 @@ logging:
   resume_epoch: 1
   resume: ""
 
+  # Cấu hình Giám sát Phân giải cao theo từng Step (Per-Step Metrics)
+  enable_step_logging: true
+  log_step_interval: 5
+  flush_step_interval: 50
+  ema_beta: 0.95
+
   # Early Stopping
   early_stopping: true
   patience: 10

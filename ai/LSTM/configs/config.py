@@ -99,6 +99,8 @@ class TrainConfig:
     betas: Tuple[float, float] = (0.9, 0.999)  # Tham số betas cho Adam/AdamW
     momentum: float = 0.9  # Động lượng Momentum khi optimizer="sgd"
     grad_clip_norm: float = 1.0  # Ngưỡng cắt gradient (Gradient Clipping) tránh bùng nổ gradient
+    gradient_accumulation_steps: int = 1  # Số bước tích lũy gradient trước khi cập nhật trọng số (giảm đỉnh VRAM)
+    empty_cache_interval: int = 0  # Số step giữa các lần giải phóng cache GPU (0: chỉ dọn mốc epoch; >0: dọn định kỳ)
     use_scheduler: bool = True  # Bật/Tắt bộ điều chỉnh Learning Rate Scheduler
     scheduler_type: str = "cosine"  # Loại Scheduler: "cosine" | "step" | "plateau"
 
@@ -164,6 +166,8 @@ class TrainConfig:
         assert self.val_num_workers >= 0, "val_num_workers không được âm"
         assert self.epochs > 0, "epochs phải > 0"
         assert self.lr0 > 0.0, "lr0 phải > 0"
+        assert self.gradient_accumulation_steps >= 1, "gradient_accumulation_steps phải là số nguyên >= 1"
+        assert self.empty_cache_interval >= 0, "empty_cache_interval không được âm"
         assert self.patience > 0, "patience phải > 0"
         if self.resume_epoch is not None:
             assert self.resume_epoch >= 1, "resume_epoch phải là số nguyên dương >= 1"

@@ -313,11 +313,16 @@ class PyTorchBackboneNeckExtractor:
         p3_full = torch.cat(p3_chunks, dim=0)
         p4_full = torch.cat(p4_chunks, dim=0)
         p5_full = torch.cat(p5_chunks, dim=0)
+        del p3_chunks, p4_chunks, p5_chunks
+        if device.type == "cuda" and T > 64:
+            torch.cuda.empty_cache()
         return p3_full, p4_full, p5_full
 
     def close(self) -> None:
         """Giải phóng tài nguyên mô hình và bộ nhớ GPU."""
         self.model = None
+        import gc
+        gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 

@@ -3,10 +3,16 @@ package com.example.driverguardian.ui.screens.onnxdemo
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.driverguardian.ai.contract.demo.EndToEndDemoModelContract
 import com.example.driverguardian.ai.contract.drowsiness.*
+import com.example.driverguardian.ai.demo.BoundedSequenceBuffer
+import com.example.driverguardian.ai.demo.DemoOnnxOutput
+import com.example.driverguardian.ai.demo.EndToEndDemoInferenceRunner
+import com.example.driverguardian.ai.demo.EndToEndDemoPreprocessor
 import com.example.driverguardian.ai.parity.*
 import com.example.driverguardian.ai.runtime.*
 import com.example.driverguardian.ai.tensor.DummyTensorFactory
+import com.example.driverguardian.ai.tensor.FloatTensor
 import com.example.driverguardian.ai.tensor.TensorShape
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -23,31 +29,37 @@ data class OnnxDemoUiState(
     val metadata: ModelMetadata? = null,
     val contract: ContractValidationResult? = null,
     val lastInference: RuntimeInferenceResult? = null,
+    val demoOutput: DemoOnnxOutput? = null,
     val dummyAvailable: Boolean = false,
     val dummyMessage: String = "Load a model to evaluate dummy input support.",
     val goldenAvailable: Boolean = false,
     val goldenTolerance: String = "Not configured",
     val goldenResults: List<Pair<String, ParityResult>> = emptyList(),
     val goldenMessage: String = "Golden vectors: NOT AVAILABLE\nExpected path: assets/onnx_test_vectors/manifest.json",
+    val activeModelAsset: String = OnnxDemoViewModel.DEMO_MODEL_ASSET,
 )
 
 class OnnxDemoViewModel(application: Application) : AndroidViewModel(application) {
     private val engine = OnnxRuntimeEngine()
-    private val contract = DrowsinessModelContract(DrowsinessInputMapping.Unresolved)
+    private val demoContract = EndToEndDemoModelContract()
+    private val legacyContract = DrowsinessModelContract(DrowsinessInputMapping.Unresolved)
+    private val demoInferenceRunner = EndToEndDemoInferenceRunner(engine)
     private var goldenSuite: LoadedGoldenSuite? = null
     private val mutableState = MutableStateFlow(OnnxDemoUiState(diagnostics = engine.diagnostics))
     val uiState: StateFlow<OnnxDemoUiState> = mutableState.asStateFlow()
 
-    init { inspectGoldenVectors() }
+    init {
+        inspectGoldenVectors()
+    }
 
-    fun loadModel() {
+    fun loadModel(assetPath: String = mutableState.value.activeModelAsset) {
         if (mutableState.value.runtimeState is RuntimeState.Loading || mutableState.value.runtimeState is RuntimeState.Running) return
-        mutableState.update { it.copy(runtimeState = RuntimeState.Loading, lastInference = null) }
+        mutableState.update { it.copy(runtimeState = RuntimeState.Loading, lastInference = null, activeModelAsset = assetPath) }
         viewModelScope.launch {
             val bytes = try {
-                withContext(Dispatchers.IO) { getApplication<Application>().assets.open(MODEL_ASSET).use { it.readBytes() } }
+                withContext(Dispatchers.IO) { getApplication<Application>().assets.open(assetPath).use { it.readBytes() } }
             } catch (_: FileNotFoundException) {
-                val error = RuntimeError.ModelNotFound(MODEL_ASSET)
+                val error = RuntimeError.ModelNotFound(assetPath)
                 engine.recordFailure(error)
                 mutableState.update { it.copy(runtimeState = engine.state, diagnostics = engine.diagnostics, metadata = null, contract = null) }
                 return@launch
@@ -57,14 +69,18 @@ class OnnxDemoViewModel(application: Application) : AndroidViewModel(application
                 mutableState.update { it.copy(runtimeState = engine.state, diagnostics = engine.diagnostics) }
                 return@launch
             }
-            when (val result = withContext(Dispatchers.Default) { engine.loadModel(MODEL_ASSET, bytes) }) {
+            when (val result = withContext(Dispatchers.Default) { engine.loadModel(assetPath, bytes) }) {
                 is RuntimeResult.Success -> mutableState.update {
-                    val dummy = dummyEligibility(result.value)
+                    val meta = result.value
+                    // Try demo contract first, fallback to legacy contract
+                    val demoValidation = demoContract.validate(meta)
+                    val validation = if (demoValidation.isRunnable) demoValidation else legacyContract.validate(meta)
+                    val dummy = dummyEligibility(meta)
                     it.copy(
                         runtimeState = engine.state,
                         diagnostics = engine.diagnostics,
-                        metadata = result.value,
-                        contract = contract.validate(result.value),
+                        metadata = meta,
+                        contract = validation,
                         dummyAvailable = dummy.first,
                         dummyMessage = dummy.second,
                     )
@@ -74,9 +90,55 @@ class OnnxDemoViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
+    /**
+     * Executes inference on the loaded end-to-end demo ONNX model using deterministic synthetic video inputs.
+     *
+     * @param sequenceLength T frames (default 1, supports dynamic T such as 2 or 10)
+     * @param constantPixelValue float pixel value, e.g. 0.5f (normalized) or 0.0f
+     */
+    fun runDemoInference(sequenceLength: Int = 1, constantPixelValue: Float = 0.5f) {
+        val metadata = mutableState.value.metadata ?: return
+        if (mutableState.value.runtimeState !is RuntimeState.Ready) return
+
+        viewModelScope.launch {
+            mutableState.update { it.copy(runtimeState = RuntimeState.Running(metadata)) }
+
+            // Build deterministic [1, T, 3, 640, 640] FloatTensor
+            val frameElements = EndToEndDemoPreprocessor.FRAME_ELEMENT_COUNT
+            val totalElements = sequenceLength * frameElements
+            val buffer = FloatArray(totalElements) { constantPixelValue }
+            val shape = listOf(1L, sequenceLength.toLong(), 3L, 640L, 640L)
+            val tensor = FloatTensor(shape, buffer)
+
+            val inferenceResult = demoInferenceRunner.runInference(tensor)
+
+            mutableState.update {
+                when (inferenceResult) {
+                    is RuntimeResult.Success -> it.copy(
+                        runtimeState = engine.state,
+                        diagnostics = engine.diagnostics,
+                        demoOutput = inferenceResult.value,
+                    )
+                    is RuntimeResult.Failure -> it.copy(
+                        runtimeState = RuntimeState.Failed(inferenceResult.error, metadata),
+                        diagnostics = engine.diagnostics,
+                    )
+                }
+            }
+        }
+    }
+
     fun runDummyInference() {
         val metadata = mutableState.value.metadata ?: return
         if (mutableState.value.runtimeState !is RuntimeState.Ready || !mutableState.value.dummyAvailable) return
+
+        // If this is the demo end-to-end model, run demo inference with T=1
+        val demoValidation = demoContract.validate(metadata)
+        if (demoValidation.isRunnable) {
+            runDemoInference(sequenceLength = 1)
+            return
+        }
+
         viewModelScope.launch {
             mutableState.update { it.copy(runtimeState = RuntimeState.Running(metadata)) }
             val result = withContext(Dispatchers.Default) {
@@ -139,6 +201,11 @@ class OnnxDemoViewModel(application: Application) : AndroidViewModel(application
     }
 
     private fun dummyEligibility(metadata: ModelMetadata): Pair<Boolean, String> {
+        val demoValidation = demoContract.validate(metadata)
+        if (demoValidation.isRunnable) {
+            return true to "Demo end-to-end model validated. Ready for synthetic video input [1, T, 3, 640, 640]."
+        }
+
         var total = 0L
         for (input in metadata.inputs) {
             if (input.type != RuntimeTensorType.FLOAT) return false to "Input '${input.name}' is ${input.type}; FLOAT is required."
@@ -154,5 +221,9 @@ class OnnxDemoViewModel(application: Application) : AndroidViewModel(application
 
     override fun onCleared() { engine.close(); super.onCleared() }
 
-    companion object { const val MODEL_ASSET = "models/drowsiness_model.onnx" }
+    companion object {
+        const val DEMO_MODEL_ASSET = "models/driver_guardian_end2end_demo.onnx"
+        const val LEGACY_MODEL_ASSET = "models/drowsiness_model.onnx"
+        const val MODEL_ASSET = DEMO_MODEL_ASSET
+    }
 }

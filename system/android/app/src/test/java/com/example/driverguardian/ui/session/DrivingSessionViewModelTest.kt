@@ -353,6 +353,10 @@ private class FakeRepository(
         ackGate?.await()
         return ackResult
     }
+    override suspend fun createVehicle(plateNumber: String, vehicleName: String, vehicleType: String, deviceCode: String?): RepositoryResult<Vehicle> =
+        RepositoryResult.Success(Vehicle(id = 999, plateNumber = plateNumber, name = vehicleName, type = vehicleType, deviceCode = deviceCode, status = "ACTIVE", createdAt = ""))
+    override suspend fun updateVehicle(vehicleId: Int, plateNumber: String?, vehicleName: String?, vehicleType: String?, deviceCode: String?): RepositoryResult<Vehicle> =
+        RepositoryResult.Success(Vehicle(id = vehicleId, plateNumber = plateNumber ?: "", name = vehicleName, type = vehicleType, deviceCode = deviceCode, status = "ACTIVE", createdAt = ""))
     override suspend fun createEvent(sessionId: Int, driverState: String, alertLevel: Int, confidence: Double?, durationMs: Int?): RepositoryResult<DrowsinessEvent> {
         eventCalls += 1
         lastDriverState = driverState

@@ -71,5 +71,7 @@ private class HistoryFake(
     override suspend fun createSession(driverId: Int, vehicleId: Int, modelVersionId: Int) = RepositoryResult.Error("unused")
     override suspend fun completeSession(sessionId: Int) = RepositoryResult.Error("unused")
     override suspend fun acknowledgeEvent(eventId: Int) = RepositoryResult.Error("unused")
+    override suspend fun createVehicle(plateNumber: String, vehicleName: String, vehicleType: String, deviceCode: String?) = RepositoryResult.Error("unused")
+    override suspend fun updateVehicle(vehicleId: Int, plateNumber: String?, vehicleName: String?, vehicleType: String?, deviceCode: String?) = RepositoryResult.Error("unused")
     override suspend fun createEvent(sessionId: Int, driverState: String, alertLevel: Int, confidence: Double?, durationMs: Int?) = RepositoryResult.Error("unused")
 }

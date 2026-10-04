@@ -40,6 +40,9 @@ import com.example.driverguardian.ui.navigation.Screen
 import com.example.driverguardian.ui.theme.DangerRed
 import com.example.driverguardian.ui.theme.SafeGreen
 
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+
 data class SidebarItem(
     val label: String,
     val route: String,
@@ -53,7 +56,8 @@ private val sidebarItems = listOf(
     SidebarItem("Phân tích", Screen.Analytics.route, Icons.Default.Analytics),
     SidebarItem("Cảnh báo", Screen.AlertHistory.route, Icons.Default.Notifications),
     SidebarItem("Cài đặt", Screen.Settings.route, Icons.Default.Settings),
-    SidebarItem("Hệ thống", Screen.SystemInfo.route, Icons.Default.Info)
+    SidebarItem("Hệ thống", Screen.SystemInfo.route, Icons.Default.Info),
+    SidebarItem("ONNX Demo", Screen.OnnxDemo.route, Icons.Default.Analytics),
 )
 
 @Composable
@@ -64,13 +68,15 @@ fun AppSidebar(
     onLogout: (() -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
+    val scrollState = rememberScrollState()
     Column(
         modifier = modifier
             .fillMaxHeight()
             .width(200.dp)
             .background(MaterialTheme.colorScheme.surface)
-            .padding(vertical = 20.dp, horizontal = 12.dp),
-        verticalArrangement = Arrangement.spacedBy(6.dp)
+            .verticalScroll(scrollState)
+            .padding(vertical = 12.dp, horizontal = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp)
     ) {
         Row(
             modifier = Modifier
@@ -132,7 +138,7 @@ fun AppSidebar(
             )
         }
 
-        Spacer(modifier = Modifier.weight(1f))
+        Spacer(modifier = Modifier.height(12.dp))
 
         if (onLogout != null) {
             OutlinedButton(

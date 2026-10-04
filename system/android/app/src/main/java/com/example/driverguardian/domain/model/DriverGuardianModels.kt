@@ -17,7 +17,8 @@ data class Vehicle(
     val type: String?,
     val deviceCode: String?,
     val status: String,
-    val createdAt: String
+    val createdAt: String,
+    val driverId: Int? = null
 )
 
 data class ModelVersion(

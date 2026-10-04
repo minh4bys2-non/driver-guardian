@@ -28,7 +28,8 @@ data class VehicleResponseDto(
     @SerializedName("vehicle_type") val vehicleType: String?,
     @SerializedName("device_code") val deviceCode: String?,
     @SerializedName("status") val status: String,
-    @SerializedName("created_at") val createdAt: String
+    @SerializedName("created_at") val createdAt: String,
+    @SerializedName("driver_id") val driverId: Int? = null
 )
 
 data class ModelVersionResponseDto(
@@ -138,8 +139,34 @@ data class AuthTokensResponseDto(
     @SerializedName("user") val user: UserProfileResponseDto
 )
 
+data class DriverProfileCreateDto(
+    @SerializedName("full_name") val fullName: String,
+    @SerializedName("phone_number") val phoneNumber: String?,
+    @SerializedName("license_number") val licenseNumber: String
+)
+
+data class DriverProfileUpdateDto(
+    @SerializedName("full_name") val fullName: String? = null,
+    @SerializedName("phone_number") val phoneNumber: String? = null,
+    @SerializedName("license_number") val licenseNumber: String? = null
+)
+
+data class VehicleCreateDto(
+    @SerializedName("plate_number") val plateNumber: String,
+    @SerializedName("vehicle_name") val vehicleName: String,
+    @SerializedName("vehicle_type") val vehicleType: String,
+    @SerializedName("device_code") val deviceCode: String? = null
+)
+
+data class VehicleUpdateDto(
+    @SerializedName("plate_number") val plateNumber: String? = null,
+    @SerializedName("vehicle_name") val vehicleName: String? = null,
+    @SerializedName("vehicle_type") val vehicleType: String? = null,
+    @SerializedName("device_code") val deviceCode: String? = null
+)
+
 fun DriverResponseDto.toDomain() = Driver(driverId, driverCode, fullName, phoneNumber, licenseNumber, status, createdAt)
-fun VehicleResponseDto.toDomain() = Vehicle(vehicleId, plateNumber, vehicleName, vehicleType, deviceCode, status, createdAt)
+fun VehicleResponseDto.toDomain() = Vehicle(vehicleId, plateNumber, vehicleName, vehicleType, deviceCode, status, createdAt, driverId)
 fun ModelVersionResponseDto.toDomain() = ModelVersion(modelVersionId, versionName, modelType, fileName, description, isActive, deployedAt)
 fun DrivingSessionResponseDto.toDomain() = DrivingSession(
     id = sessionId,

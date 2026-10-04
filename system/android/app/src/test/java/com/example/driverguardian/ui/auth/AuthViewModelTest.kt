@@ -45,6 +45,12 @@ class AuthViewModelTest {
 
         override suspend fun restoreSession(): RepositoryResult<UserProfile?> = restoreResult
 
+        override suspend fun createDriverProfile(
+            fullName: String,
+            phoneNumber: String?,
+            licenseNumber: String
+        ): RepositoryResult<UserProfile> = loginResult
+
         override suspend fun logout(): RepositoryResult<Unit> {
             logoutCallCount++
             return RepositoryResult.Success(Unit)

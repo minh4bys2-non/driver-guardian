@@ -50,7 +50,10 @@ fun HomeScreen(
     onAnalytics: () -> Unit,
     onPreTrip: () -> Unit,
     onSettings: () -> Unit,
-    driverName: String = MockData.currentDriver.name,
+    driverName: String = "Tài xế",
+    driverCode: String? = null,
+    vehicleName: String? = null,
+    vehiclePlate: String? = null,
     onLogout: (() -> Unit)? = null
 ) {
     BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
@@ -89,13 +92,13 @@ fun HomeScreen(
 
             if (compact) {
                 Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
-                    DriverCard(driverName, onLogout, Modifier.fillMaxWidth())
-                    VehicleCard(onStartTrip, Modifier.fillMaxWidth())
+                    DriverCard(driverName, driverCode, onLogout, Modifier.fillMaxWidth())
+                    VehicleCard(vehicleName, vehiclePlate, onStartTrip, Modifier.fillMaxWidth())
                 }
             } else {
                 Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-                    DriverCard(driverName, onLogout, Modifier.weight(1f))
-                    VehicleCard(onStartTrip, Modifier.weight(1f))
+                    DriverCard(driverName, driverCode, onLogout, Modifier.weight(1f))
+                    VehicleCard(vehicleName, vehiclePlate, onStartTrip, Modifier.weight(1f))
                 }
             }
 
@@ -139,9 +142,12 @@ private fun HeaderText(driverName: String, modifier: Modifier = Modifier) {
 }
 
 @Composable
-private fun DriverCard(driverName: String, onLogout: (() -> Unit)?, modifier: Modifier = Modifier) {
-    val driver = MockData.currentDriver
-
+private fun DriverCard(
+    driverName: String,
+    driverCode: String?,
+    onLogout: (() -> Unit)?,
+    modifier: Modifier = Modifier
+) {
     DashboardCard("Hồ sơ tài xế", modifier = modifier) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Box(
@@ -155,9 +161,12 @@ private fun DriverCard(driverName: String, onLogout: (() -> Unit)?, modifier: Mo
             }
             Column(modifier = Modifier.padding(start = 16.dp).weight(1f)) {
                 Text(driverName, style = MaterialTheme.typography.titleLarge)
-                Text(driver.code, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(
+                    if (driverCode != null) "Mã TX: $driverCode" else "Chưa gán mã tài xế",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
                 Spacer(Modifier.height(8.dp))
-                StatusIndicator(driver.status, color = SafeGreen)
+                StatusIndicator("Đang hoạt động", color = SafeGreen)
             }
             if (onLogout != null) {
                 OutlinedButton(onClick = onLogout) { Text("Đăng xuất") }
@@ -169,15 +178,24 @@ private fun DriverCard(driverName: String, onLogout: (() -> Unit)?, modifier: Mo
 }
 
 @Composable
-private fun VehicleCard(onStartTrip: () -> Unit, modifier: Modifier = Modifier) {
-    val vehicle = MockData.vehicles.first()
-
+private fun VehicleCard(
+    vehicleName: String?,
+    vehiclePlate: String?,
+    onStartTrip: () -> Unit,
+    modifier: Modifier = Modifier
+) {
     DashboardCard("Phương tiện", modifier = modifier) {
-        Text(vehicle.name, style = MaterialTheme.typography.titleLarge)
-        Text("Biển số: ${vehicle.plate}", color = MaterialTheme.colorScheme.onSurfaceVariant)
-        Text("Mã thiết bị: ${vehicle.deviceCode}", color = MaterialTheme.colorScheme.onSurfaceVariant)
-        Spacer(Modifier.height(10.dp))
-        OutlinedButton(onClick = onStartTrip) { Text("Đổi xe") }
+        if (vehiclePlate != null) {
+            Text(vehicleName ?: vehiclePlate, style = MaterialTheme.typography.titleLarge)
+            Text("Biển số: $vehiclePlate", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Spacer(Modifier.height(10.dp))
+            OutlinedButton(onClick = onStartTrip) { Text("Đổi xe") }
+        } else {
+            Text("Chưa chọn phương tiện", style = MaterialTheme.typography.titleMedium)
+            Text("Chọn hoặc thêm phương tiện cho chuyến đi", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Spacer(Modifier.height(10.dp))
+            OutlinedButton(onClick = onStartTrip) { Text("Chọn phương tiện") }
+        }
     }
 }
 

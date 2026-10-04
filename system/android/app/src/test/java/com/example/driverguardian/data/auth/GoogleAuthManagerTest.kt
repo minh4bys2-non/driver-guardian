@@ -135,6 +135,12 @@ class GoogleAuthManagerTest {
             return loginResult
         }
 
+        override suspend fun createDriverProfile(
+            fullName: String,
+            phoneNumber: String?,
+            licenseNumber: String
+        ): RepositoryResult<UserProfile> = loginResult
+
         override suspend fun restoreSession(): RepositoryResult<UserProfile?> = RepositoryResult.Success(null)
         override suspend fun logout(): RepositoryResult<Unit> = RepositoryResult.Success(Unit)
         override fun getCurrentUser(): UserProfile? = null

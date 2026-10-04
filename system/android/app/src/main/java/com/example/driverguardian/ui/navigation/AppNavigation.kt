@@ -42,6 +42,7 @@ import com.example.driverguardian.data.auth.EncryptedTokenStore
 import com.example.driverguardian.data.auth.GoogleAuthManager
 import com.example.driverguardian.data.auth.SessionManager
 import com.example.driverguardian.data.remote.ApiClient
+import com.example.driverguardian.data.repository.AuthRepository
 import com.example.driverguardian.data.repository.NetworkAuthRepository
 import com.example.driverguardian.data.repository.NetworkDriverGuardianRepository
 import com.example.driverguardian.domain.model.UserProfile
@@ -55,6 +56,9 @@ import com.example.driverguardian.ui.monitoring.MonitoringViewModel
 import com.example.driverguardian.ui.monitoring.MonitoringViewModelFactory
 import com.example.driverguardian.ui.screens.alerts.AlertHistoryScreen
 import com.example.driverguardian.ui.screens.analytics.AnalyticsScreen
+import com.example.driverguardian.ui.screens.auth.DriverProfileSetupScreen
+import com.example.driverguardian.ui.screens.auth.DriverProfileSetupViewModel
+import com.example.driverguardian.ui.screens.auth.DriverProfileSetupViewModelFactory
 import com.example.driverguardian.ui.screens.auth.LoginScreen
 import com.example.driverguardian.ui.screens.driving.ActiveDrivingScreen
 import com.example.driverguardian.ui.screens.driving.DangerAlertScreen
@@ -104,16 +108,19 @@ fun DriverGuardianApp() {
     val backStackEntry by navController.currentBackStackEntryAsState()
     val currentRoute = backStackEntry?.destination?.route
 
-    val isAuthFlow = currentRoute == Screen.Login.route
+    val isAuthFlow = currentRoute == Screen.Login.route || currentRoute == Screen.DriverProfileSetup.route
     val showSidebar = currentRoute != Screen.DangerAlert.route && !isAuthFlow
 
     val currentUserProfile: UserProfile? = when (val state = authUiState) {
         is AuthUiState.Authenticated -> state.user
         is AuthUiState.UnlinkedDriver -> state.user
-        else -> null
+        else -> sessionManager.getCurrentUser()
     }
 
     LaunchedEffect(Unit) {
+        sessionManager.getCurrentUser()?.driver?.let { driver ->
+            sessionViewModel.setAuthenticatedDriver(driver)
+        }
         authViewModel.restoreSession()
     }
 
@@ -121,9 +128,9 @@ fun DriverGuardianApp() {
         when (val state = authUiState) {
             is AuthUiState.Authenticated -> {
                 sessionViewModel.setAuthenticatedDriver(state.user.driver)
-                if (currentRoute == Screen.Login.route) {
+                if (currentRoute == Screen.Login.route || currentRoute == Screen.DriverProfileSetup.route) {
                     navController.navigate(Screen.Home.route) {
-                        popUpTo(Screen.Login.route) { inclusive = true }
+                        popUpTo(0) { inclusive = true }
                     }
                 }
             }
@@ -137,8 +144,8 @@ fun DriverGuardianApp() {
             }
             is AuthUiState.UnlinkedDriver -> {
                 sessionViewModel.setAuthenticatedDriver(null)
-                if (currentRoute != null && currentRoute != Screen.Login.route) {
-                    navController.navigate(Screen.Login.route) {
+                if (currentRoute != Screen.DriverProfileSetup.route) {
+                    navController.navigate(Screen.DriverProfileSetup.route) {
                         popUpTo(0) { inclusive = true }
                     }
                 }
@@ -175,8 +182,13 @@ fun DriverGuardianApp() {
                         monitoringViewModel = monitoringViewModel,
                         authUiState = authUiState,
                         authViewModel = authViewModel,
+                        authRepository = authRepository,
                         currentUserProfile = currentUserProfile,
-                        startDestination = if (sessionManager.isAuthenticated()) Screen.Home.route else Screen.Login.route,
+                        startDestination = when {
+                            !sessionManager.isAuthenticated() -> Screen.Login.route
+                            sessionManager.getCurrentUser()?.driver == null -> Screen.DriverProfileSetup.route
+                            else -> Screen.Home.route
+                        },
                         modifier = Modifier
                             .weight(1f)
                             .fillMaxSize()
@@ -247,6 +259,7 @@ private fun AppNavHost(
     monitoringViewModel: MonitoringViewModel,
     authUiState: AuthUiState,
     authViewModel: AuthViewModel,
+    authRepository: AuthRepository,
     currentUserProfile: UserProfile?,
     startDestination: String,
     modifier: Modifier = Modifier
@@ -294,10 +307,33 @@ private fun AppNavHost(
                 onRetry = { authViewModel.clearError() }
             )
         }
+        composable(Screen.DriverProfileSetup.route) {
+            val setupViewModel: DriverProfileSetupViewModel = viewModel(
+                factory = remember { DriverProfileSetupViewModelFactory(authRepository) }
+            )
+            val setupUiState by setupViewModel.uiState.collectAsStateWithLifecycle()
+
+            DriverProfileSetupScreen(
+                state = setupUiState,
+                onFullNameChange = setupViewModel::onFullNameChange,
+                onPhoneNumberChange = setupViewModel::onPhoneNumberChange,
+                onLicenseNumberChange = setupViewModel::onLicenseNumberChange,
+                onSave = {
+                    setupViewModel.saveProfile {
+                        // Success updates sessionManager which triggers AuthState.Authenticated
+                    }
+                },
+                onLogout = {
+                    setupViewModel.logout()
+                }
+            )
+        }
         composable(Screen.Home.route) {
             val driverDisplayName = currentUserProfile?.driver?.fullName
                 ?: currentUserProfile?.displayName
                 ?: "Tài xế"
+            val selectedVehicle = sessionUiState.vehicles.firstOrNull { it.id == sessionUiState.selectedVehicleId }
+                ?: sessionUiState.vehicles.firstOrNull()
             HomeScreen(
                 onStartTrip = { navController.safeNavigate(Screen.Selection.route) },
                 onHistory = { navController.safeNavigate(Screen.TripHistory.route) },
@@ -305,6 +341,9 @@ private fun AppNavHost(
                 onPreTrip = { navController.safeNavigate(Screen.PreTripCheck.route) },
                 onSettings = { navController.safeNavigate(Screen.Settings.route) },
                 driverName = driverDisplayName,
+                driverCode = currentUserProfile?.driver?.driverCode,
+                vehicleName = selectedVehicle?.name,
+                vehiclePlate = selectedVehicle?.plateNumber,
                 onLogout = { authViewModel.logout() }
             )
         }
@@ -313,6 +352,8 @@ private fun AppNavHost(
                 state = sessionUiState,
                 onSelectDriver = sessionViewModel::selectDriver,
                 onSelectVehicle = sessionViewModel::selectVehicle,
+                onAddVehicle = sessionViewModel::addVehicle,
+                onEditVehicle = sessionViewModel::updateVehicle,
                 onRetry = sessionViewModel::refresh,
                 onCancel = { navController.safeNavigate(Screen.Home.route) },
                 onContinue = { navController.safeNavigate(Screen.PreTripCheck.route) }

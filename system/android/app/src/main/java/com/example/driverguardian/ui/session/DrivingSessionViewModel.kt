@@ -24,6 +24,7 @@ class DrivingSessionViewModel(
     }
 
     fun setAuthenticatedDriver(driver: DriverSummary?) {
+        val previousDriver = currentAuthDriver
         currentAuthDriver = driver
         mutableUiState.update { state ->
             val updatedDriverId = driver?.driverId ?: state.selectedDriverId
@@ -31,6 +32,9 @@ class DrivingSessionViewModel(
                 authenticatedDriver = driver,
                 selectedDriverId = updatedDriverId
             )
+        }
+        if (driver != null && (previousDriver?.driverId != driver.driverId || mutableUiState.value.loadState is LoadState.Error)) {
+            refresh()
         }
     }
 
@@ -58,10 +62,16 @@ class DrivingSessionViewModel(
             val vehicles = (vehiclesResult as RepositoryResult.Success).value
             val model = (modelResult as RepositoryResult.Success).value
             val hasDriver = authDriver != null || drivers.isNotEmpty()
-            val loadState = if (!hasDriver || vehicles.isEmpty()) {
-                LoadState.Empty("Chưa có đủ tài xế hoặc phương tiện để bắt đầu chuyến đi.")
+            val loadState = if (!hasDriver) {
+                LoadState.Empty("Chưa có hồ sơ tài xế để bắt đầu chuyến đi.")
             } else {
                 LoadState.Success
+            }
+            val currentSelectedVehicleId = mutableUiState.value.selectedVehicleId
+            val preselectedVehicleId = when {
+                vehicles.size == 1 -> vehicles.first().id
+                currentSelectedVehicleId != null && vehicles.any { it.id == currentSelectedVehicleId } -> currentSelectedVehicleId
+                else -> null
             }
             mutableUiState.value = DrivingSessionUiState(
                 loadState = loadState,
@@ -69,8 +79,63 @@ class DrivingSessionViewModel(
                 vehicles = vehicles,
                 activeModel = model,
                 authenticatedDriver = authDriver,
-                selectedDriverId = preselectedDriverId
+                selectedDriverId = preselectedDriverId,
+                selectedVehicleId = preselectedVehicleId
             )
+        }
+    }
+
+    fun addVehicle(
+        plateNumber: String,
+        vehicleName: String,
+        vehicleType: String,
+        deviceCode: String?,
+        onResult: (Boolean, String?) -> Unit
+    ) {
+        viewModelScope.launch {
+            when (val result = repository.createVehicle(plateNumber, vehicleName, vehicleType, deviceCode)) {
+                is RepositoryResult.Success -> {
+                    val newVehicle = result.value
+                    mutableUiState.update { current ->
+                        val updatedList = current.vehicles.filter { it.id != newVehicle.id } + newVehicle
+                        current.copy(
+                            vehicles = updatedList,
+                            selectedVehicleId = newVehicle.id
+                        )
+                    }
+                    onResult(true, null)
+                }
+                is RepositoryResult.Error -> {
+                    onResult(false, result.message)
+                }
+            }
+        }
+    }
+
+    fun updateVehicle(
+        vehicleId: Int,
+        plateNumber: String?,
+        vehicleName: String?,
+        vehicleType: String?,
+        deviceCode: String?,
+        onResult: (Boolean, String?) -> Unit
+    ) {
+        viewModelScope.launch {
+            when (val result = repository.updateVehicle(vehicleId, plateNumber, vehicleName, vehicleType, deviceCode)) {
+                is RepositoryResult.Success -> {
+                    val updatedVehicle = result.value
+                    mutableUiState.update { current ->
+                        val updatedList = current.vehicles.map {
+                            if (it.id == vehicleId) updatedVehicle else it
+                        }
+                        current.copy(vehicles = updatedList)
+                    }
+                    onResult(true, null)
+                }
+                is RepositoryResult.Error -> {
+                    onResult(false, result.message)
+                }
+            }
         }
     }
 

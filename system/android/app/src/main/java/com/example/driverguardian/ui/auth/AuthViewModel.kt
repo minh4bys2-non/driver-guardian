@@ -47,8 +47,15 @@ class AuthViewModel(
             _uiState.value = AuthUiState.Loading
             when (val result = authRepository.restoreSession()) {
                 is RepositoryResult.Success -> {
-                    if (result.value == null) {
+                    val user = result.value
+                    if (user == null) {
                         _uiState.value = AuthUiState.Unauthenticated
+                    } else {
+                        _uiState.value = if (user.role == "DRIVER" && user.driver == null) {
+                            AuthUiState.UnlinkedDriver(user)
+                        } else {
+                            AuthUiState.Authenticated(user)
+                        }
                     }
                 }
                 is RepositoryResult.Error -> {

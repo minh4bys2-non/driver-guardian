@@ -105,6 +105,14 @@ def create_driving_session(
 
             (
                 SELECT COUNT(*)
+                FROM VEHICLES
+                WHERE VEHICLE_ID = :vehicle_id
+                  AND DRIVER_ID = :driver_id
+                  AND STATUS = 'ACTIVE'
+            ) AS "driver_vehicle_count",
+
+            (
+                SELECT COUNT(*)
                 FROM MODEL_VERSIONS
                 WHERE MODEL_VERSION_ID = :model_version_id
                   AND IS_ACTIVE = 'Y'
@@ -136,6 +144,16 @@ def create_driving_session(
             raise HTTPException(
                 status_code=404,
                 detail="Active vehicle not found",
+            )
+
+        if (
+            current_user.get("role") == "DRIVER"
+            and validation_result.get("driver_vehicle_count") is not None
+            and validation_result.get("driver_vehicle_count") == 0
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Vehicle does not belong to the authenticated driver",
             )
 
         if validation_result["model_count"] == 0:

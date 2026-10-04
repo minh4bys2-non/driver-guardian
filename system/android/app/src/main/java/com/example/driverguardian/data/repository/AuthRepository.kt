@@ -3,6 +3,7 @@ package com.example.driverguardian.data.repository
 import com.example.driverguardian.data.auth.AuthState
 import com.example.driverguardian.data.auth.SessionManager
 import com.example.driverguardian.data.remote.DriverGuardianApi
+import com.example.driverguardian.data.remote.dto.DriverProfileCreateDto
 import com.example.driverguardian.data.remote.dto.GoogleAuthRequestDto
 import com.example.driverguardian.data.remote.dto.LogoutRequestDto
 import com.example.driverguardian.data.remote.dto.toDomain
@@ -15,6 +16,7 @@ import java.io.IOException
 interface AuthRepository {
     val authState: StateFlow<AuthState>
     suspend fun loginWithGoogle(idToken: String): RepositoryResult<UserProfile>
+    suspend fun createDriverProfile(fullName: String, phoneNumber: String?, licenseNumber: String): RepositoryResult<UserProfile>
     suspend fun restoreSession(): RepositoryResult<UserProfile?>
     suspend fun logout(): RepositoryResult<Unit>
     fun getCurrentUser(): UserProfile?
@@ -51,6 +53,36 @@ class NetworkAuthRepository(
             val message = "Lỗi xác thực: ${e.localizedMessage ?: "Không xác định"}"
             sessionManager.setError(message)
             RepositoryResult.Error(message, cause = e)
+        }
+    }
+
+    override suspend fun createDriverProfile(
+        fullName: String,
+        phoneNumber: String?,
+        licenseNumber: String
+    ): RepositoryResult<UserProfile> {
+        return try {
+            val response = api.createDriverProfile(
+                DriverProfileCreateDto(
+                    fullName = fullName,
+                    phoneNumber = phoneNumber,
+                    licenseNumber = licenseNumber
+                )
+            )
+            val updatedUser = response.toDomain()
+            sessionManager.updateUser(updatedUser)
+            RepositoryResult.Success(updatedUser)
+        } catch (e: HttpException) {
+            val message = when (e.code()) {
+                400 -> "Tài khoản đã được liên kết với hồ sơ tài xế."
+                409 -> "Số GPLX đã tồn tại trong hệ thống."
+                else -> "Tạo hồ sơ tài xế thất bại (${e.code()})."
+            }
+            RepositoryResult.Error(message, e.code(), e)
+        } catch (e: IOException) {
+            RepositoryResult.Error("Không thể kết nối đến máy chủ Driver Guardian.", cause = e)
+        } catch (e: Exception) {
+            RepositoryResult.Error("Lỗi: ${e.localizedMessage ?: "Không xác định"}", cause = e)
         }
     }
 

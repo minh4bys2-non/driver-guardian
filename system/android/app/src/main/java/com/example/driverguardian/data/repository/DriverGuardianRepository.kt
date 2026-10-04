@@ -37,6 +37,19 @@ interface DriverGuardianRepository {
     suspend fun getSession(sessionId: Int): RepositoryResult<TripSession>
     suspend fun getSessionEvents(sessionId: Int): RepositoryResult<List<DrowsinessEvent>>
     suspend fun acknowledgeEvent(eventId: Int): RepositoryResult<DrowsinessEvent>
+    suspend fun createVehicle(
+        plateNumber: String,
+        vehicleName: String,
+        vehicleType: String,
+        deviceCode: String? = null
+    ): RepositoryResult<Vehicle>
+    suspend fun updateVehicle(
+        vehicleId: Int,
+        plateNumber: String? = null,
+        vehicleName: String? = null,
+        vehicleType: String? = null,
+        deviceCode: String? = null
+    ): RepositoryResult<Vehicle>
     suspend fun createEvent(
         sessionId: Int,
         driverState: String,
@@ -79,6 +92,40 @@ class NetworkDriverGuardianRepository(
     override suspend fun acknowledgeEvent(eventId: Int) = request(
         notFoundMessage = "Không tìm thấy cảnh báo."
     ) { api.acknowledgeEvent(eventId).toDomain() }
+
+    override suspend fun createVehicle(
+        plateNumber: String,
+        vehicleName: String,
+        vehicleType: String,
+        deviceCode: String?
+    ) = request {
+        api.createVehicle(
+            com.example.driverguardian.data.remote.dto.VehicleCreateDto(
+                plateNumber = plateNumber,
+                vehicleName = vehicleName,
+                vehicleType = vehicleType,
+                deviceCode = deviceCode
+            )
+        ).toDomain()
+    }
+
+    override suspend fun updateVehicle(
+        vehicleId: Int,
+        plateNumber: String?,
+        vehicleName: String?,
+        vehicleType: String?,
+        deviceCode: String?
+    ) = request {
+        api.updateVehicle(
+            vehicleId,
+            com.example.driverguardian.data.remote.dto.VehicleUpdateDto(
+                plateNumber = plateNumber,
+                vehicleName = vehicleName,
+                vehicleType = vehicleType,
+                deviceCode = deviceCode
+            )
+        ).toDomain()
+    }
 
     override suspend fun createEvent(
         sessionId: Int,

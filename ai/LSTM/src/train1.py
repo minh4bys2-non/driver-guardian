@@ -1,23 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 r"""
-Tệp: src/train1.py
+Tệp: src/train.py
 Mục đích:
     Pipeline hoàn chỉnh huấn luyện mô hình Deep GRU (Drowsiness Detection),
     đánh giá kết quả mô hình (Model Evaluation) và chẩn đoán quá trình huấn luyện
     (Training Process Diagnostics) sử dụng tập dữ liệu video thô trích xuất trực tiếp
-    bản đồ đặc trưng qua mô hình PyTorch native BackboneNeck.
+    bản đồ đặc trưng qua mô hình PyTorch native BackboneNeck (src/dataset2.py)
+    và hỗ trợ tăng cường dữ liệu thời gian (src/augment.py).
 
 Luồng dữ liệu:
     - Tập Huấn luyện (Train): RawVideoBackboneNeckDataset từ src/dataset2.py (nạp từ video thô qua OpenCV & BackboneNeck)
     - Tập Kiểm định (Val): RawVideoBackboneNeckDataset từ src/dataset2.py (nạp từ video thô qua OpenCV & BackboneNeck)
+    - Tăng cường dữ liệu: DetectionAugmenter từ src/augment.py (Temporal Consistency qua shared seed)
     - Mô hình: DeepGRUClassifier từ src/models.py (CNNAdapter + Deep GRU + TemporalAttentionPooling + FC)
     - Hàm mất mát: DrowsinessLoss từ src/loss.py (CrossEntropyLoss hỗ trợ pos_weight)
 
 Cơ chế cấu hình:
-    - 100% CẤU HÌNH TẬP TRUNG QUA configs/config.py (TrainConfig)
+    - 100% CẤU HÌNH TẬP TRUNG QUA configs/config.py (TrainConfig) & configs/config.yaml
     - KHÔNG DÙNG GIAO DIỆN DÒNG LỆNH (No CLI / No Argparse)
-    - Thực thi trực tiếp: python src/train1.py hoặc python train1.py
+    - Thực thi trực tiếp: python train.py hoặc python src/train.py
 """
 
 import os
@@ -31,6 +33,7 @@ import re
 import shutil
 import tempfile
 import logging
+import gc
 from pathlib import Path
 from typing import Tuple, List, Dict, Any, Optional, Union, Sequence
 
@@ -39,6 +42,13 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
+
+# Tắt triệt để các thông báo rác từ FFmpeg/swscaler ra màn hình console
+os.environ["OPENCV_FFMPEG_LOGLEVEL"] = "-8"
+
+# Tối ưu hóa bộ cấp phát CUDA Caching Allocator: Chống phân mảnh bộ nhớ khi chuỗi video có độ dài biến thiên
+if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 # Thêm thư mục gốc dự án vào sys.path
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -141,6 +151,73 @@ def setup_logger(log_dir: Union[str, Path], experiment_name: str) -> logging.Log
     logger.addHandler(console_handler)
 
     return logger
+
+
+def get_vram_info(device: Optional[torch.device] = None) -> Dict[str, float]:
+    """
+    Truy vấn thông số chi tiết về tình trạng bộ nhớ VRAM của GPU NVIDIA.
+
+    Args:
+        device: Thiết bị PyTorch (nếu None sẽ tự phát hiện cuda:0).
+
+    Returns:
+        Dict chứa:
+            allocated_gb: VRAM hiện tại đang dùng bởi tensors (GB).
+            reserved_gb: VRAM được PyTorch Caching Allocator bảo lưu (GB).
+            peak_gb: Đỉnh VRAM cao nhất đã đạt được kể từ lần reset gần nhất (GB).
+            total_gb: Tổng dung lượng VRAM vật lý của GPU (GB).
+            percent_used: Tỷ lệ phần trăm VRAM bảo lưu trên tổng VRAM (%).
+    """
+    if not torch.cuda.is_available():
+        return {
+            "allocated_gb": 0.0,
+            "reserved_gb": 0.0,
+            "peak_gb": 0.0,
+            "total_gb": 0.0,
+            "percent_used": 0.0
+        }
+    dev = device if device is not None and device.type == "cuda" else torch.device("cuda:0")
+    try:
+        dev_idx = dev.index if dev.index is not None else 0
+        total_bytes = torch.cuda.get_device_properties(dev_idx).total_memory
+        allocated_bytes = torch.cuda.memory_allocated(dev_idx)
+        reserved_bytes = torch.cuda.memory_reserved(dev_idx)
+        peak_bytes = torch.cuda.max_memory_allocated(dev_idx)
+
+        total_gb = total_bytes / (1024 ** 3)
+        allocated_gb = allocated_bytes / (1024 ** 3)
+        reserved_gb = reserved_bytes / (1024 ** 3)
+        peak_gb = peak_bytes / (1024 ** 3)
+        percent_used = (reserved_gb / total_gb * 100.0) if total_gb > 0 else 0.0
+
+        return {
+            "allocated_gb": round(allocated_gb, 2),
+            "reserved_gb": round(reserved_gb, 2),
+            "peak_gb": round(peak_gb, 2),
+            "total_gb": round(total_gb, 2),
+            "percent_used": round(percent_used, 1)
+        }
+    except Exception:
+        return {
+            "allocated_gb": 0.0,
+            "reserved_gb": 0.0,
+            "peak_gb": 0.0,
+            "total_gb": 0.0,
+            "percent_used": 0.0
+        }
+
+
+def cleanup_cuda_memory(force_gc: bool = True) -> None:
+    """
+    Thu hồi rác Python và giải phóng bộ nhớ đệm (caching allocator) của CUDA.
+
+    Args:
+        force_gc: Cờ bật thu gom rác Python gc.collect() trước khi xả cache GPU.
+    """
+    if force_gc:
+        gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 # ==============================================================================
@@ -911,6 +988,11 @@ class DrowsinessTrainer1:
         if config.device == "cuda" and torch.cuda.is_available():
             self.device = torch.device("cuda")
             self.logger.info(f"[+] Thiết bị tính toán: GPU NVIDIA ({torch.cuda.get_device_name(0)})")
+            v_info = get_vram_info(self.device)
+            self.logger.info(
+                f"    -> Tổng VRAM: {v_info['total_gb']:.1f} GB | Đang cấp phát: {v_info['allocated_gb']:.2f} GB | "
+                f"Gradient Accumulation: {config.gradient_accumulation_steps}"
+            )
         else:
             self.device = torch.device("cpu")
             self.logger.info("[+] Thiết bị tính toán: CPU")
@@ -1000,7 +1082,18 @@ class DrowsinessTrainer1:
         seq_len = getattr(self.config, "seq_len", None)
         chunk_size = int(getattr(self.config, "chunk_size", 16))
         min_frames = int(getattr(self.config, "min_frames", 1))
-        train_ratio = float(getattr(self.config, "train_ratio", 0.8))
+        use_aug = bool(getattr(self.config, "use_augmentation", True))
+        effective_augmenter = None
+        if use_aug:
+            try:
+                from src.augment import get_video_augmenter
+                effective_augmenter = get_video_augmenter()
+                self.logger.info("[+] Đã kích hoạt bộ tăng cường dữ liệu: DetectionAugmenter (src/augment.py)")
+            except Exception as e:
+                self.logger.warning(f"[!] Không thể nạp DetectionAugmenter: {e}. Tiếp tục không augment.")
+                effective_augmenter = None
+        else:
+            self.logger.info("[-] Tăng cường dữ liệu: ĐÃ TẮT (use_augmentation=False)")
 
         self.logger.info(f"[*] Khởi tạo tập huấn luyện video thô từ: {raw_train_dir.resolve()}")
         train_dataset = RawVideoBackboneNeckDataset(
@@ -1012,6 +1105,7 @@ class DrowsinessTrainer1:
             checkpoint_path=ckpt_path,
             chunk_size=chunk_size,
             device="auto",
+            augmenter=effective_augmenter,
             window_sampling="random",
             min_frames=min_frames
         )
@@ -1124,9 +1218,45 @@ class DrowsinessTrainer1:
             return torch.amp.autocast("cuda", enabled=self.amp)
         return torch.cuda.amp.autocast(enabled=self.amp)
 
+    def _handle_cuda_oom(self, epoch: int, batch_idx: int, total_batches: int, phase: str = "Train") -> None:
+        """
+        Xử lý sự cố quá tải bộ nhớ VRAM (CUDA Out Of Memory):
+        - Xả sạch bộ đệm gradient: zero_grad(set_to_none=True).
+        - Thu gom rác Python gc.collect() và dọn dẹp cache GPU torch.cuda.empty_cache().
+        - Ghi log cảnh báo mức ERROR kèm chi tiết tài nguyên VRAM.
+        - Bỏ qua batch lỗi để duy trì tiến trình huấn luyện mà không bị sập (crash).
+        """
+        v_info = get_vram_info(self.device)
+        self.logger.error("!" * 80)
+        self.logger.error(
+            f"[!] PHÁT HIỆN SỰ CỐ CUDA OUT OF MEMORY (OOM) TRONG PHA {phase.upper()}!\n"
+            f"    - Mốc thời gian: Epoch {epoch:02d}/{self.config.epochs:02d} | Batch {batch_idx:03d}/{total_batches:03d}\n"
+            f"    - Trạng thái VRAM: Đã cấp phát {v_info['allocated_gb']:.2f}GB / {v_info['total_gb']:.1f}GB "
+            f"(Bảo lưu: {v_info['reserved_gb']:.2f}GB, Đỉnh: {v_info['peak_gb']:.2f}GB)\n"
+            f"    - Hành động: Đang xả sạch gradients, giải phóng caching allocator và bỏ qua batch lỗi an toàn..."
+        )
+        self.logger.error("!" * 80)
+
+        # 1. Xả sạch optimizer gradients
+        try:
+            self.optimizer.zero_grad(set_to_none=True)
+        except Exception:
+            pass
+
+        # 2. Xả scaler nếu có
+        if hasattr(self, "scaler") and self.scaler is not None:
+            try:
+                self.scaler.update()
+            except Exception:
+                pass
+
+        # 3. Thu dọn bộ nhớ VRAM
+        cleanup_cuda_memory(force_gc=True)
+
     def train_one_epoch(self, epoch: int) -> Tuple[Dict[str, float], float]:
         """
-        Thực hiện một epoch huấn luyện với giám sát trực quan qua tqdm.
+        Thực hiện một epoch huấn luyện với giám sát trực quan qua tqdm,
+        hỗ trợ Gradient Accumulation và cơ chế tự phục hồi khi gặp CUDA OOM.
         Returns:
             (train_metrics, avg_grad_norm)
         """
@@ -1137,6 +1267,12 @@ class DrowsinessTrainer1:
         total_batches = len(self.train_loader)
         current_lr = self.optimizer.param_groups[0]["lr"]
         use_tqdm = getattr(self.config, "use_tqdm", True)
+
+        accum_steps = max(1, getattr(self.config, "gradient_accumulation_steps", 1))
+        empty_cache_interval = getattr(self.config, "empty_cache_interval", 0)
+
+        # Đảm bảo gradients sạch trước khi bắt đầu epoch
+        self.optimizer.zero_grad(set_to_none=True)
 
         pbar = tqdm(
             self.train_loader,
@@ -1149,55 +1285,95 @@ class DrowsinessTrainer1:
         )
 
         for batch_idx, (features, targets, seq_lens, metas) in enumerate(pbar, start=1):
-            p3, p4, p5 = features
-            p3 = p3.to(self.device, non_blocking=True)
-            p4 = p4.to(self.device, non_blocking=True)
-            p5 = p5.to(self.device, non_blocking=True)
-            targets = targets.to(self.device, non_blocking=True)
-            seq_lens = seq_lens.to(self.device, non_blocking=True)
+            try:
+                p3, p4, p5 = features
+                p3 = p3.to(self.device, non_blocking=True)
+                p4 = p4.to(self.device, non_blocking=True)
+                p5 = p5.to(self.device, non_blocking=True)
+                targets = targets.to(self.device, non_blocking=True)
+                seq_lens = seq_lens.to(self.device, non_blocking=True)
 
-            self.optimizer.zero_grad(set_to_none=True)
+                # Chạy forward pass với Automatic Mixed Precision (AMP)
+                with self._autocast_context():
+                    logits = self.model((p3, p4, p5), seq_lens=seq_lens)
+                    loss = self.criterion(logits, targets)
+                    loss_scaled = loss / accum_steps
 
-            # Chạy forward pass với Automatic Mixed Precision (AMP)
-            with self._autocast_context():
-                logits = self.model((p3, p4, p5), seq_lens=seq_lens)
-                loss = self.criterion(logits, targets)
+                # Backward pass có điều chỉnh tỷ lệ qua GradScaler
+                self.scaler.scale(loss_scaled).backward()
 
-            # Backward pass có điều chỉnh tỷ lệ qua GradScaler
-            self.scaler.scale(loss).backward()
+                # Cập nhật trọng số theo chu kỳ tích lũy gradient
+                is_accum_step = (batch_idx % accum_steps == 0) or (batch_idx == total_batches)
+                if is_accum_step:
+                    # Unscale trước khi cắt gradient
+                    self.scaler.unscale_(self.optimizer)
+                    gnorm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip_norm)
+                    grad_norms.append(float(gnorm.item()))
 
-            # Unscale trước khi cắt gradient
-            self.scaler.unscale_(self.optimizer)
-            gnorm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip_norm)
-            grad_norms.append(float(gnorm.item()))
+                    # Cập nhật trọng số
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                    self.optimizer.zero_grad(set_to_none=True)
 
-            # Cập nhật trọng số
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
+                cur_gnorm = grad_norms[-1] if grad_norms else 0.0
 
-            # Tính toán xác suất và cập nhật metrics
-            with torch.no_grad():
-                probs = F.softmax(logits, dim=-1)
-                preds = torch.argmax(probs, dim=-1)
-                self.metrics_tracker.update(preds, targets, probs, float(loss.item()), p3.size(0))
+                # Tính toán xác suất và cập nhật metrics (dùng loss gốc không scale)
+                with torch.no_grad():
+                    probs = F.softmax(logits, dim=-1)
+                    preds = torch.argmax(probs, dim=-1)
+                    self.metrics_tracker.update(preds, targets, probs, float(loss.item()), p3.size(0))
 
-            temp_acc = (preds == targets).float().mean().item()
+                temp_acc = (preds == targets).float().mean().item()
 
-            if use_tqdm:
-                pbar.set_postfix(
-                    loss=f"{loss.item():.4f}",
-                    acc=f"{self.metrics_tracker.running_acc:.1f}%",
-                    gnorm=f"{gnorm.item():.3f}",
-                    lr=f"{current_lr:.2e}"
-                )
-            else:
-                if batch_idx % self.config.log_interval == 0 or batch_idx == total_batches:
-                    self.logger.info(
-                        f"  [Train] Epoch {epoch:02d}/{self.config.epochs:02d} | "
-                        f"Batch {batch_idx:03d}/{total_batches:03d} | "
-                        f"Loss: {loss.item():.4f} | Acc: {temp_acc * 100:.1f}% | "
-                        f"GradNorm: {gnorm.item():.3f} | LR: {current_lr:.6f}"
-                    )
+                # Truy vấn thông tin VRAM real-time
+                vram_postfix = ""
+                if self.device.type == "cuda":
+                    v_info = get_vram_info(self.device)
+                    vram_postfix = f"{v_info['allocated_gb']:.1f}/{v_info['total_gb']:.0f}G"
+
+                if use_tqdm:
+                    pbar_kwargs = {
+                        "loss": f"{loss.item():.4f}",
+                        "acc": f"{self.metrics_tracker.running_acc:.1f}%",
+                        "gnorm": f"{cur_gnorm:.3f}",
+                        "lr": f"{current_lr:.2e}"
+                    }
+                    if vram_postfix:
+                        pbar_kwargs["vram"] = vram_postfix
+                    pbar.set_postfix(**pbar_kwargs)
+                else:
+                    if batch_idx % self.config.log_interval == 0 or batch_idx == total_batches:
+                        vram_str = f" | VRAM: {vram_postfix}" if vram_postfix else ""
+                        self.logger.info(
+                            f"  [Train] Epoch {epoch:02d}/{self.config.epochs:02d} | "
+                            f"Batch {batch_idx:03d}/{total_batches:03d} | "
+                            f"Loss: {loss.item():.4f} | Acc: {temp_acc * 100:.1f}% | "
+                            f"GradNorm: {cur_gnorm:.3f} | LR: {current_lr:.6f}{vram_str}"
+                        )
+
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as oom_err:
+                if isinstance(oom_err, torch.cuda.OutOfMemoryError) or "out of memory" in str(oom_err).lower():
+                    self._handle_cuda_oom(epoch, batch_idx, total_batches, phase="Train")
+                    continue
+                raise oom_err
+
+            finally:
+                # Chủ động thu hồi biến tensor khỏi scope vòng lặp Python
+                if "p3" in locals(): del p3
+                if "p4" in locals(): del p4
+                if "p5" in locals(): del p5
+                if "targets" in locals(): del targets
+                if "seq_lens" in locals(): del seq_lens
+                if "features" in locals(): del features
+                if "logits" in locals(): del logits
+                if "loss" in locals(): del loss
+                if "loss_scaled" in locals(): del loss_scaled
+                if "probs" in locals(): del probs
+                if "preds" in locals(): del preds
+
+                # Dọn cache định kỳ nếu bật cấu hình empty_cache_interval > 0
+                if empty_cache_interval > 0 and (batch_idx % empty_cache_interval == 0):
+                    cleanup_cuda_memory(force_gc=False)
 
         pbar.close()
         train_metrics = self.metrics_tracker.compute()
@@ -1206,16 +1382,16 @@ class DrowsinessTrainer1:
 
     def validate(self, epoch: int) -> Tuple[Dict[str, float], np.ndarray, List[int], List[float], float]:
         """
-        Thực hiện đánh giá trên tập kiểm định video thô với giám sát qua tqdm.
+        Thực hiện đánh giá trên tập kiểm định video thô với giám sát qua tqdm,
+        tự động dọn dẹp cache GPU và bọc cơ chế xử lý ngoại lệ OOM an toàn.
         Returns:
             (val_metrics, confusion_matrix, targets, probs_drowsy, avg_latency_ms)
         """
         self.model.eval()
         self.metrics_tracker.reset()
 
-        # Giải phóng cache GPU
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        # Giải phóng triệt để cache GPU trước khi validate
+        cleanup_cuda_memory(force_gc=True)
 
         total_batches = len(self.val_loader)
         batch_latencies: List[float] = []
@@ -1233,44 +1409,65 @@ class DrowsinessTrainer1:
 
         with torch.no_grad():
             for batch_idx, (features, targets, seq_lens, metas) in enumerate(val_pbar, start=1):
-                start_t = time.perf_counter()
+                try:
+                    start_t = time.perf_counter()
 
-                p3, p4, p5 = features
-                p3 = p3.to(self.device, non_blocking=True)
-                p4 = p4.to(self.device, non_blocking=True)
-                p5 = p5.to(self.device, non_blocking=True)
-                targets = targets.to(self.device, non_blocking=True)
-                seq_lens = seq_lens.to(self.device, non_blocking=True)
+                    p3, p4, p5 = features
+                    p3 = p3.to(self.device, non_blocking=True)
+                    p4 = p4.to(self.device, non_blocking=True)
+                    p5 = p5.to(self.device, non_blocking=True)
+                    targets = targets.to(self.device, non_blocking=True)
+                    seq_lens = seq_lens.to(self.device, non_blocking=True)
 
-                with self._autocast_context():
-                    logits = self.model((p3, p4, p5), seq_lens=seq_lens)
-                    loss = self.criterion(logits, targets)
+                    with self._autocast_context():
+                        logits = self.model((p3, p4, p5), seq_lens=seq_lens)
+                        loss = self.criterion(logits, targets)
 
-                probs = F.softmax(logits, dim=-1)
-                preds = torch.argmax(probs, dim=-1)
+                    probs = F.softmax(logits, dim=-1)
+                    preds = torch.argmax(probs, dim=-1)
 
-                end_t = time.perf_counter()
-                latency_ms = (end_t - start_t) * 1000.0 / max(1, p3.size(0))
-                batch_latencies.append(latency_ms)
+                    end_t = time.perf_counter()
+                    latency_ms = (end_t - start_t) * 1000.0 / max(1, p3.size(0))
+                    batch_latencies.append(latency_ms)
 
-                self.metrics_tracker.update(preds, targets, probs, float(loss.item()), p3.size(0))
+                    self.metrics_tracker.update(preds, targets, probs, float(loss.item()), p3.size(0))
 
-                if use_tqdm:
-                    val_pbar.set_postfix(
-                        val_loss=f"{self.metrics_tracker.running_loss:.4f}",
-                        val_acc=f"{self.metrics_tracker.running_acc:.1f}%",
-                        ms=f"{latency_ms:.1f}"
-                    )
-                else:
-                    if batch_idx % self.config.log_interval == 0 or batch_idx == total_batches:
-                        self.logger.info(
-                            f"  [Val] Epoch {epoch:02d}/{self.config.epochs:02d} | "
-                            f"Batch {batch_idx:03d}/{total_batches:03d} | "
-                            f"Loss: {loss.item():.4f} | Acc: {self.metrics_tracker.running_acc:.1f}% | "
-                            f"Latency: {latency_ms:.2f}ms/clip"
+                    if use_tqdm:
+                        val_pbar.set_postfix(
+                            val_loss=f"{self.metrics_tracker.running_loss:.4f}",
+                            val_acc=f"{self.metrics_tracker.running_acc:.1f}%",
+                            ms=f"{latency_ms:.1f}"
                         )
+                    else:
+                        if batch_idx % self.config.log_interval == 0 or batch_idx == total_batches:
+                            self.logger.info(
+                                f"  [Val] Epoch {epoch:02d}/{self.config.epochs:02d} | "
+                                f"Batch {batch_idx:03d}/{total_batches:03d} | "
+                                f"Loss: {loss.item():.4f} | Acc: {self.metrics_tracker.running_acc:.1f}% | "
+                                f"Latency: {latency_ms:.2f}ms/clip"
+                            )
+                except (torch.cuda.OutOfMemoryError, RuntimeError) as oom_err:
+                    if isinstance(oom_err, torch.cuda.OutOfMemoryError) or "out of memory" in str(oom_err).lower():
+                        self._handle_cuda_oom(epoch, batch_idx, total_batches, phase="Val")
+                        continue
+                    raise oom_err
+                finally:
+                    if "p3" in locals(): del p3
+                    if "p4" in locals(): del p4
+                    if "p5" in locals(): del p5
+                    if "targets" in locals(): del targets
+                    if "seq_lens" in locals(): del seq_lens
+                    if "features" in locals(): del features
+                    if "logits" in locals(): del logits
+                    if "loss" in locals(): del loss
+                    if "probs" in locals(): del probs
+                    if "preds" in locals(): del preds
 
         val_pbar.close()
+
+        # Giải phóng cache GPU sau khi hoàn tất kiểm định
+        cleanup_cuda_memory(force_gc=True)
+
         val_metrics = self.metrics_tracker.compute()
         cm = self.metrics_tracker.get_confusion_matrix()
         avg_latency = float(np.mean(batch_latencies)) if batch_latencies else 0.0
@@ -1295,14 +1492,27 @@ class DrowsinessTrainer1:
             epoch_start = time.time()
             current_lr = self.optimizer.param_groups[0]["lr"]
 
+            # Reset thống kê đỉnh VRAM đầu mỗi epoch nếu dùng GPU CUDA
+            if self.device.type == "cuda":
+                try:
+                    torch.cuda.reset_peak_memory_stats(self.device)
+                except Exception:
+                    pass
+
             # 1. Chạy Pha Huấn Luyện (Train Pass)
             train_metrics, grad_norm = self.train_one_epoch(epoch)
+
+            # Dọn dẹp cache sau train pass trước khi sang validation
+            cleanup_cuda_memory(force_gc=True)
 
             # 2. Chạy Pha Kiểm Định (Validation Pass) nếu đến chu kỳ
             val_metrics = None
             avg_latency = 0.0
             if epoch % self.config.val_interval_epochs == 0 or epoch == self.config.epochs:
                 val_metrics, cm, targets, probs, avg_latency = self.validate(epoch)
+
+            # Dọn dẹp cache sau val pass trước khi cập nhật scheduler và lưu checkpoint
+            cleanup_cuda_memory(force_gc=True)
 
             # 3. Cập nhật Scheduler
             if self.scheduler is not None:
@@ -1325,7 +1535,7 @@ class DrowsinessTrainer1:
                 epoch_time_s=epoch_time
             )
 
-            # 5. In Bảng Tổng Kết Epoch & Chẩn đoán Overfitting
+            # 5. In Bảng Tổng Kết Epoch & Chẩn đoán Overfitting / VRAM
             self.logger.info("-" * 80)
             log_str = (
                 f"[EPOCH {epoch:02d}/{self.config.epochs:02d}] "
@@ -1338,6 +1548,16 @@ class DrowsinessTrainer1:
                     f"Gap: {log_entry['gap_loss']:+.4f} | Latency: {avg_latency:.1f}ms/clip"
                 )
             log_str += f" | Time: {epoch_time:.1f}s"
+
+            if self.device.type == "cuda":
+                v_info = get_vram_info(self.device)
+                log_str += f" | Peak VRAM: {v_info['peak_gb']:.2f}/{v_info['total_gb']:.1f}GB ({v_info['percent_used']:.1f}%)"
+                if v_info["percent_used"] > 90.0:
+                    self.logger.warning(
+                        f"  [!] CẢNH BÁO VRAM: Mức chiếm dụng VRAM ({v_info['percent_used']:.1f}%) vượt ngưỡng 90%! "
+                        f"Khuyến nghị giảm batch_size hoặc tăng gradient_accumulation_steps."
+                    )
+
             self.logger.info(log_str)
 
             # Chẩn đoán Overfitting nếu Gap Loss tăng quá cao
@@ -1461,7 +1681,8 @@ class DrowsinessTrainer1:
         return summary_payload
 
     def close(self) -> None:
-        """Đóng an toàn các tài nguyên mở (Datasets, Visualizer, Logger handlers)."""
+        """Đóng an toàn các tài nguyên mở (Datasets, Visualizer, Logger handlers, giải phóng VRAM)."""
+        cleanup_cuda_memory(force_gc=True)
         if hasattr(self, "train_loader") and hasattr(self.train_loader, "dataset"):
             if hasattr(self.train_loader.dataset, "close"):
                 try:
@@ -1486,6 +1707,7 @@ class DrowsinessTrainer1:
                     self.logger.removeHandler(h)
                 except Exception:
                     pass
+        cleanup_cuda_memory(force_gc=True)
 
 
 # Alias hỗ trợ gọi tương đương DrowsinessTrainer
@@ -1559,6 +1781,7 @@ def run_dry_run_test() -> None:
             sample_interval=0.1,
             num_workers=0,
             val_num_workers=0,
+            gradient_accumulation_steps=2,
             device="cuda" if torch.cuda.is_available() else "cpu",
             amp=False,
             use_tqdm=False,
@@ -1647,8 +1870,25 @@ def run_dry_run_test() -> None:
             assert "Các checkpoint epoch sẵn có" in str(fnf_err), "Ngoại lệ thiếu danh sách các epoch sẵn có!"
             print(f"    [✓] Báo lỗi ngoại lệ thân thiện thành công:\n        {fnf_err.args[0].splitlines()[0]}")
 
+        # 7. Kiểm tra đo đạc thông số VRAM & dọn dẹp bộ nhớ
+        print("\n[*] [Bước 9] Kiểm tra chức năng giám sát VRAM (get_vram_info) & cleanup_cuda_memory:")
+        v_test = get_vram_info()
+        assert isinstance(v_test, dict) and "allocated_gb" in v_test and "total_gb" in v_test, "LỖI cấu trúc get_vram_info!"
+        cleanup_cuda_memory(force_gc=True)
+        print(f"    [✓] get_vram_info hoạt động chuẩn xác: {v_test}")
+
+        # 8. Kiểm tra cơ chế tự phục hồi OOM (_handle_cuda_oom)
+        print("\n[*] [Bước 10] Kiểm tra cơ chế tự phục hồi CUDA OOM (_handle_cuda_oom):")
+        cfg_oom_test = replace(cfg, enable_resume=False)
+        mock_trainer = DrowsinessTrainer1(config=cfg_oom_test)
+        try:
+            mock_trainer._handle_cuda_oom(epoch=1, batch_idx=1, total_batches=2, phase="Mock_OOM_Test")
+            print("    [✓] _handle_cuda_oom xả gradients, dọn dẹp cache VRAM và xử lý an toàn không gây sập!")
+        finally:
+            mock_trainer.close()
+
         print("\n" + "=" * 80)
-        print("   >>> [THÀNH CÔNG 100%] KIỂM THỬ DRY-RUN TOÀN BỘ CƠ CHẾ TRAIN1 ĐẠT CHUẨN! <<<")
+        print("   >>> [THÀNH CÔNG 100%] KIỂM THỬ DRY-RUN TOÀN BỘ CƠ CHẾ TRAIN ĐẠT CHUẨN! <<<")
         print("=" * 80)
 
     finally:

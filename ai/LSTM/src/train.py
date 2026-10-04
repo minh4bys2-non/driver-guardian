@@ -5,18 +5,21 @@ Tệp: src/train.py
 Mục đích:
     Pipeline hoàn chỉnh huấn luyện mô hình Deep GRU (Drowsiness Detection),
     đánh giá kết quả mô hình (Model Evaluation) và chẩn đoán quá trình huấn luyện
-    (Training Process Diagnostics).
+    (Training Process Diagnostics) sử dụng tập dữ liệu video thô trích xuất trực tiếp
+    bản đồ đặc trưng qua mô hình PyTorch native BackboneNeck (src/dataset2.py)
+    và hỗ trợ tăng cường dữ liệu thời gian (src/augment.py).
 
 Luồng dữ liệu:
-    - Tập Huấn luyện (Train): HDF5FeatureDataset từ src/dataset.py (nạp từ file HDF5 .h5)
-    - Tập Kiểm định (Val): HDF5FeatureDataset từ src/dataset.py (nạp từ file HDF5 .h5)
+    - Tập Huấn luyện (Train): RawVideoBackboneNeckDataset từ src/dataset2.py (nạp từ video thô qua OpenCV & BackboneNeck)
+    - Tập Kiểm định (Val): RawVideoBackboneNeckDataset từ src/dataset2.py (nạp từ video thô qua OpenCV & BackboneNeck)
+    - Tăng cường dữ liệu: DetectionAugmenter từ src/augment.py (Temporal Consistency qua shared seed)
     - Mô hình: DeepGRUClassifier từ src/models.py (CNNAdapter + Deep GRU + TemporalAttentionPooling + FC)
     - Hàm mất mát: DrowsinessLoss từ src/loss.py (CrossEntropyLoss hỗ trợ pos_weight)
 
 Cơ chế cấu hình:
-    - 100% CẤU HÌNH TẬP TRUNG QUA configs/config.py (TrainConfig)
+    - 100% CẤU HÌNH TẬP TRUNG QUA configs/config.py (TrainConfig) & configs/config.yaml
     - KHÔNG DÙNG GIAO DIỆN DÒNG LỆNH (No CLI / No Argparse)
-    - Thực thi trực tiếp: python train.py
+    - Thực thi trực tiếp: python train.py hoặc python src/train.py
 """
 
 import os
@@ -30,14 +33,22 @@ import re
 import shutil
 import tempfile
 import logging
+import gc
 from pathlib import Path
-from typing import Tuple, List, Dict, Any, Optional, Union
+from typing import Tuple, List, Dict, Any, Optional, Union, Sequence
 
 # Đảm bảo console Windows hỗ trợ in tiếng Việt UTF-8 không lỗi charmap
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
+
+# Tắt triệt để các thông báo rác từ FFmpeg/swscaler ra màn hình console
+os.environ["OPENCV_FFMPEG_LOGLEVEL"] = "-8"
+
+# Tối ưu hóa bộ cấp phát CUDA Caching Allocator: Chống phân mảnh bộ nhớ khi chuỗi video có độ dài biến thiên
+if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 # Thêm thư mục gốc dự án vào sys.path
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -48,6 +59,7 @@ if str(ROOT_DIR) not in sys.path:
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ["ORT_LOG_LEVEL"] = "3"
 
+import cv2
 import numpy as np
 from tqdm.auto import tqdm
 import torch
@@ -84,7 +96,11 @@ except ImportError:
 
 # Import các module nội bộ của dự án
 from configs.config import TrainConfig, load_config
-from src.dataset import HDF5FeatureDataset, collate_h5_features, seed_worker, create_mock_h5_dataset
+from src.dataset2 import (
+    RawVideoBackboneNeckDataset,
+    collate_raw_video_features,
+    DEFAULT_CHECKPOINT_PATH
+)
 from src.models import DeepGRUClassifier
 from src.loss import DrowsinessLoss, build_loss
 
@@ -104,13 +120,20 @@ def seed_everything(seed: int = 42) -> None:
     torch.backends.cudnn.benchmark = False
 
 
+def _seed_worker(worker_id: int) -> None:
+    """Hàm worker_init_fn đảm bảo tính tái lập cho PyTorch DataLoader."""
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
 def setup_logger(log_dir: Union[str, Path], experiment_name: str) -> logging.Logger:
     """Khởi tạo logger ghi log đồng thời ra console và tệp tin .log."""
     log_dir_path = Path(log_dir)
     log_dir_path.mkdir(parents=True, exist_ok=True)
     log_file = log_dir_path / f"{experiment_name}.log"
 
-    logger = logging.getLogger(f"Trainer_{experiment_name}")
+    logger = logging.getLogger(f"Trainer1_{experiment_name}")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
 
@@ -128,6 +151,73 @@ def setup_logger(log_dir: Union[str, Path], experiment_name: str) -> logging.Log
     logger.addHandler(console_handler)
 
     return logger
+
+
+def get_vram_info(device: Optional[torch.device] = None) -> Dict[str, float]:
+    """
+    Truy vấn thông số chi tiết về tình trạng bộ nhớ VRAM của GPU NVIDIA.
+
+    Args:
+        device: Thiết bị PyTorch (nếu None sẽ tự phát hiện cuda:0).
+
+    Returns:
+        Dict chứa:
+            allocated_gb: VRAM hiện tại đang dùng bởi tensors (GB).
+            reserved_gb: VRAM được PyTorch Caching Allocator bảo lưu (GB).
+            peak_gb: Đỉnh VRAM cao nhất đã đạt được kể từ lần reset gần nhất (GB).
+            total_gb: Tổng dung lượng VRAM vật lý của GPU (GB).
+            percent_used: Tỷ lệ phần trăm VRAM bảo lưu trên tổng VRAM (%).
+    """
+    if not torch.cuda.is_available():
+        return {
+            "allocated_gb": 0.0,
+            "reserved_gb": 0.0,
+            "peak_gb": 0.0,
+            "total_gb": 0.0,
+            "percent_used": 0.0
+        }
+    dev = device if device is not None and device.type == "cuda" else torch.device("cuda:0")
+    try:
+        dev_idx = dev.index if dev.index is not None else 0
+        total_bytes = torch.cuda.get_device_properties(dev_idx).total_memory
+        allocated_bytes = torch.cuda.memory_allocated(dev_idx)
+        reserved_bytes = torch.cuda.memory_reserved(dev_idx)
+        peak_bytes = torch.cuda.max_memory_allocated(dev_idx)
+
+        total_gb = total_bytes / (1024 ** 3)
+        allocated_gb = allocated_bytes / (1024 ** 3)
+        reserved_gb = reserved_bytes / (1024 ** 3)
+        peak_gb = peak_bytes / (1024 ** 3)
+        percent_used = (reserved_gb / total_gb * 100.0) if total_gb > 0 else 0.0
+
+        return {
+            "allocated_gb": round(allocated_gb, 2),
+            "reserved_gb": round(reserved_gb, 2),
+            "peak_gb": round(peak_gb, 2),
+            "total_gb": round(total_gb, 2),
+            "percent_used": round(percent_used, 1)
+        }
+    except Exception:
+        return {
+            "allocated_gb": 0.0,
+            "reserved_gb": 0.0,
+            "peak_gb": 0.0,
+            "total_gb": 0.0,
+            "percent_used": 0.0
+        }
+
+
+def cleanup_cuda_memory(force_gc: bool = True) -> None:
+    """
+    Thu hồi rác Python và giải phóng bộ nhớ đệm (caching allocator) của CUDA.
+
+    Args:
+        force_gc: Cờ bật thu gom rác Python gc.collect() trước khi xả cache GPU.
+    """
+    if force_gc:
+        gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 # ==============================================================================
@@ -195,7 +285,7 @@ class MetricsTracker:
         y_pred = np.array(self.preds)
         y_prob = np.array(self.probs_drowsy)
 
-        # Tính toán Accuracy
+        # Tính toán Accuracy & F1
         if HAS_SKLEARN:
             acc = float(accuracy_score(y_true, y_pred))
             f1_drowsy = float(f1_score(y_true, y_pred, pos_label=1, zero_division=0))
@@ -299,51 +389,61 @@ class TrainingVisualizer:
         grad_norm: float,
         epoch_time_s: float
     ) -> Dict[str, Any]:
-        """
-        Ghi nhận tiến trình của 1 epoch vào bộ nhớ lịch sử và TensorBoard.
-        Tính toán khoảng cách tổng quát hóa (Generalization Gap) để chẩn đoán Overfitting.
-        """
-        val_m = val_metrics if val_metrics is not None else {}
-        gap_loss = (val_m.get("loss", 0.0) - train_metrics.get("loss", 0.0)) if val_metrics else 0.0
-        gap_f1 = (train_metrics.get("f1", 0.0) - val_m.get("f1", 0.0)) if val_metrics else 0.0
-
-        entry = {
+        """Ghi nhận thông số của một Epoch vào lịch sử và TensorBoard."""
+        entry: Dict[str, Any] = {
             "epoch": epoch,
             "train_loss": train_metrics.get("loss", 0.0),
             "train_acc": train_metrics.get("accuracy", 0.0),
             "train_f1": train_metrics.get("f1", 0.0),
-            "val_loss": val_m.get("loss", 0.0),
-            "val_acc": val_m.get("accuracy", 0.0),
-            "val_f1": val_m.get("f1", 0.0),
-            "val_recall": val_m.get("recall", 0.0),
-            "val_precision": val_m.get("precision", 0.0),
-            "val_specificity": val_m.get("specificity", 0.0),
-            "val_auc_roc": val_m.get("auc_roc", 0.0),
-            "val_auc_pr": val_m.get("auc_pr", 0.0),
             "lr": lr,
             "grad_norm": grad_norm,
-            "gap_loss": gap_loss,
-            "gap_f1": gap_f1,
-            "epoch_time_s": round(epoch_time_s, 2)
+            "epoch_time_s": epoch_time_s,
         }
+
+        if val_metrics is not None:
+            entry.update({
+                "val_loss": val_metrics.get("loss", 0.0),
+                "val_acc": val_metrics.get("accuracy", 0.0),
+                "val_f1": val_metrics.get("f1", 0.0),
+                "val_precision": val_metrics.get("precision", 0.0),
+                "val_recall": val_metrics.get("recall", 0.0),
+                "val_specificity": val_metrics.get("specificity", 0.0),
+                "val_auc_roc": val_metrics.get("auc_roc", 0.0),
+                "val_auc_pr": val_metrics.get("auc_pr", 0.0),
+                "gap_loss": val_metrics.get("loss", 0.0) - train_metrics.get("loss", 0.0),
+                "gap_f1": train_metrics.get("f1", 0.0) - val_metrics.get("f1", 0.0),
+            })
+        else:
+            entry.update({
+                "val_loss": float("nan"),
+                "val_acc": float("nan"),
+                "val_f1": float("nan"),
+                "gap_loss": 0.0,
+                "gap_f1": 0.0,
+            })
+
         self.history.append(entry)
 
-        # Ghi vào TensorBoard
+        # Ghi sang TensorBoard
         if self.tb_writer is not None:
-            self.tb_writer.add_scalar("Loss/train", train_metrics.get("loss", 0.0), epoch)
-            self.tb_writer.add_scalar("Accuracy/train", train_metrics.get("accuracy", 0.0), epoch)
-            self.tb_writer.add_scalar("F1/train", train_metrics.get("f1", 0.0), epoch)
-            self.tb_writer.add_scalar("Optimizer/lr", lr, epoch)
-            self.tb_writer.add_scalar("Optimizer/grad_norm", grad_norm, epoch)
+            self.tb_writer.add_scalar("Loss/Train", entry["train_loss"], epoch)
+            self.tb_writer.add_scalar("Accuracy/Train", entry["train_acc"], epoch)
+            self.tb_writer.add_scalar("F1_Drowsy/Train", entry["train_f1"], epoch)
+            self.tb_writer.add_scalar("LearningRate", lr, epoch)
+            self.tb_writer.add_scalar("GradNorm", grad_norm, epoch)
 
             if val_metrics is not None:
-                self.tb_writer.add_scalar("Loss/val", val_m.get("loss", 0.0), epoch)
-                self.tb_writer.add_scalar("Accuracy/val", val_m.get("accuracy", 0.0), epoch)
-                self.tb_writer.add_scalar("F1/val", val_m.get("f1", 0.0), epoch)
-                self.tb_writer.add_scalar("Recall/val_drowsy", val_m.get("recall", 0.0), epoch)
-                self.tb_writer.add_scalar("Precision/val_drowsy", val_m.get("precision", 0.0), epoch)
-                self.tb_writer.add_scalar("AUC/val_roc", val_m.get("auc_roc", 0.0), epoch)
-                self.tb_writer.add_scalar("Diagnostics/gap_loss", gap_loss, epoch)
+                self.tb_writer.add_scalar("Loss/Val", entry["val_loss"], epoch)
+                self.tb_writer.add_scalar("Accuracy/Val", entry["val_acc"], epoch)
+                self.tb_writer.add_scalar("F1_Drowsy/Val", entry["val_f1"], epoch)
+                self.tb_writer.add_scalar("Precision_Drowsy/Val", entry["val_precision"], epoch)
+                self.tb_writer.add_scalar("Recall_Drowsy/Val", entry["val_recall"], epoch)
+                self.tb_writer.add_scalar("Specificity_Alert/Val", entry["val_specificity"], epoch)
+                self.tb_writer.add_scalar("AUC_ROC/Val", entry["val_auc_roc"], epoch)
+                self.tb_writer.add_scalar("AUC_PR/Val", entry["val_auc_pr"], epoch)
+                self.tb_writer.add_scalar("Diagnostics/Generalization_Gap_Loss", entry["gap_loss"], epoch)
+
+            self.tb_writer.flush()
 
         return entry
 
@@ -551,13 +651,14 @@ class TrainingVisualizer:
         if self.tb_writer is not None:
             self.tb_writer.flush()
             self.tb_writer.close()
+            self.tb_writer = None
 
 
 # ==============================================================================
-# 4. BỘ QUẢN LÝ CHECKPOINTS & EARLY STOPPING: CheckpointManager
+# 4. BỘ QUẢN LÝ CHECKPOINTS & RESUME: CheckpointManager
 # ==============================================================================
 class CheckpointManager:
-    """Quản lý lưu trữ checkpoint mô hình và cơ chế dừng sớm (Early Stopping)."""
+    """Quản lý lưu trữ checkpoint, khôi phục trạng thái huấn luyện và Early Stopping."""
 
     def __init__(self, config: TrainConfig, logger: logging.Logger) -> None:
         self.config = config
@@ -567,45 +668,34 @@ class CheckpointManager:
 
         self.monitor = config.monitor_metric.lower()
         self.mode = config.monitor_mode.lower()
-        self.patience = config.patience
         self.min_delta = config.min_delta
+        self.patience = config.patience
         self.early_stopping_enabled = config.early_stopping
 
         self.patience_counter = 0
         self.best_epoch = 0
-        self.best_score = -float("inf") if self.mode == "max" else float("inf")
         self.periodic_ckpts: List[Path] = []
 
-    def _is_better(self, score: float) -> bool:
-        """So sánh điểm số hiện tại với kỷ lục tốt nhất."""
-        if self.mode == "max":
-            return score > (self.best_score + self.min_delta)
+        if self.mode == "min":
+            self.best_score = float("inf")
         else:
-            return score < (self.best_score - self.min_delta)
+            self.best_score = float("-inf")
 
-    def _extract_metric_score(self, metrics: Optional[Dict[str, float]]) -> Optional[float]:
-        """Trích xuất giá trị chỉ số từ dictionary metrics dựa trên monitor_metric linh hoạt."""
-        if not metrics:
-            return None
-        # 1. Thử khóa trực tiếp (vd: 'val_f1' hoặc 'f1')
-        if self.monitor in metrics:
-            return float(metrics[self.monitor])
-        # 2. Thử bỏ tiền tố 'val_' hoặc 'train_'
-        clean_key = self.monitor
-        if clean_key.startswith("val_"):
-            clean_key = clean_key[4:]
-        elif clean_key.startswith("train_"):
-            clean_key = clean_key[6:]
-
-        if clean_key in metrics:
-            return float(metrics[clean_key])
-
-        # 3. Thử các alias phổ biến (acc -> accuracy, loss)
-        alias_map = {"acc": "accuracy", "accuracy": "acc"}
-        if clean_key in alias_map and alias_map[clean_key] in metrics:
-            return float(metrics[alias_map[clean_key]])
-
+    def _extract_metric_score(self, metrics: Dict[str, float]) -> Optional[float]:
+        """Trích xuất giá trị chỉ số giám sát từ từ điển metrics."""
+        for k, v in metrics.items():
+            if k.lower() == self.monitor or f"val_{k.lower()}" == self.monitor:
+                return float(v)
         return None
+
+    def _find_available_epoch_checkpoints(self) -> Dict[int, Path]:
+        """Quét và lập danh mục tất cả các file checkpoint epoch sẵn có trong thư mục."""
+        found: Dict[int, Path] = {}
+        for p in self.checkpoint_dir.glob("*.pt"):
+            m = re.search(r"epoch_(\d+)", p.name, re.IGNORECASE)
+            if m:
+                found[int(m.group(1))] = p
+        return dict(sorted(found.items()))
 
     def resolve_checkpoint_path(
         self,
@@ -613,41 +703,25 @@ class CheckpointManager:
         checkpoint_target: Optional[Union[str, Path, int]] = None
     ) -> Path:
         """
-        Tự động tìm kiếm và phân giải đường dẫn checkpoint theo số epoch hoặc bí danh.
-        Hỗ trợ:
-            - resume_epoch=10 (tìm {exp}_epoch_010.pt hoặc *epoch_10*.pt)
-            - checkpoint_target='10' hoặc 10
-            - checkpoint_target='best' (tìm {exp}_best.pt)
-            - checkpoint_target='last' hoặc '' (tìm {exp}_last.pt hoặc epoch lớn nhất)
-            - checkpoint_target='epoch_10'
-            - checkpoint_target='path/to/checkpoint.pt'
+        Phân giải đường dẫn tệp checkpoint từ tham số resume_epoch hoặc chuỗi cấu hình.
+        Hỗ trợ số epoch cụ thể (vd: 10), bí danh ('last', 'best') hoặc tên file trực tiếp.
         """
-        target_epoch: Optional[int] = None
-        target_str: str = ""
+        target_str = ""
+        target_epoch: Optional[int] = resume_epoch
 
-        if resume_epoch is not None:
-            try:
-                target_epoch = int(resume_epoch)
-            except (ValueError, TypeError):
-                target_str = str(resume_epoch).strip()
-        elif checkpoint_target is not None:
+        if checkpoint_target is not None:
             if isinstance(checkpoint_target, int):
                 target_epoch = checkpoint_target
             elif isinstance(checkpoint_target, Path):
-                if checkpoint_target.exists():
-                    return checkpoint_target
                 target_str = str(checkpoint_target)
             else:
                 target_str = str(checkpoint_target).strip()
-
-        # Nếu target_str đại diện cho số nguyên: vd "10" hoặc "epoch_10"
-        if target_epoch is None and target_str:
-            if target_str.isdigit():
-                target_epoch = int(target_str)
-            elif target_str.lower().startswith("epoch_"):
-                suffix = target_str[6:]
-                if suffix.isdigit():
-                    target_epoch = int(suffix)
+                if target_str.isdigit():
+                    target_epoch = int(target_str)
+                elif target_str.lower().startswith("epoch_"):
+                    suffix = target_str.lower().replace("epoch_", "").replace(".pt", "")
+                    if suffix.isdigit():
+                        target_epoch = int(suffix)
 
         # 1. Trường hợp tìm theo target_epoch cụ thể
         if target_epoch is not None:
@@ -748,59 +822,65 @@ class CheckpointManager:
             should_stop (bool): True nếu kích hoạt Early Stopping, ngược lại False.
         """
         eval_metrics = val_metrics if val_metrics is not None else current_metrics
-        is_best = False
-        old_best = self.best_score
+        score = self._extract_metric_score(eval_metrics) if eval_metrics else None
 
-        # 1. Đánh giá kỷ lục tốt nhất và cập nhật patience_counter
-        score = self._extract_metric_score(eval_metrics)
-        if score is not None:
-            is_best = self._is_better(score)
-            if is_best:
-                self.best_score = score
-                self.best_epoch = epoch
-                self.patience_counter = 0
-            else:
-                self.patience_counter += 1
-
-        # 2. Đóng gói checkpoint_data hoàn chỉnh (sau khi đã cập nhật best_score và best_epoch)
-        checkpoint_data = {
+        # 1. Đóng gói checkpoint data
+        checkpoint_data: Dict[str, Any] = {
             "epoch": epoch,
             "best_epoch": self.best_epoch,
             "best_score": self.best_score,
             "patience_counter": self.patience_counter,
-            "model_state_dict": model.state_dict() if model is not None else {},
-            "optimizer_state_dict": optimizer.state_dict() if optimizer is not None else {},
-            "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
-            "scaler_state_dict": scaler.state_dict() if scaler else None,
-            "train_metrics": train_metrics if train_metrics is not None else {},
-            "val_metrics": val_metrics if val_metrics is not None else {},
-            "metrics": eval_metrics if eval_metrics is not None else (train_metrics or {}),
-            "config": self.config.to_dict(),
-            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+            "monitor_metric": self.monitor,
+            "monitor_mode": self.mode,
+            "train_metrics": train_metrics,
+            "val_metrics": eval_metrics,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "config": self.config.to_dict()
         }
 
-        # 3. Luôn lưu checkpoint gần nhất (last_model.pt) để chống mất mát
+        if model is not None:
+            checkpoint_data["model_state_dict"] = model.state_dict()
+        if optimizer is not None:
+            checkpoint_data["optimizer_state_dict"] = optimizer.state_dict()
+        if scheduler is not None:
+            checkpoint_data["scheduler_state_dict"] = scheduler.state_dict()
+        if scaler is not None:
+            checkpoint_data["scaler_state_dict"] = scaler.state_dict()
+
+        # 2. Luôn lưu checkpoint mới nhất (last.pt)
         last_ckpt_path = self.checkpoint_dir / f"{self.config.experiment_name}_last.pt"
         torch.save(checkpoint_data, str(last_ckpt_path))
 
-        # 4. Lưu kỷ lục tốt nhất (best_model.pt) nếu có cải thiện
-        if is_best:
-            best_ckpt_path = self.checkpoint_dir / f"{self.config.experiment_name}_best.pt"
-            torch.save(checkpoint_data, str(best_ckpt_path))
-            self.logger.info(
-                f"[★ BEST CHECKPOINT] Epoch {epoch}: Chỉ số '{self.monitor}' cải thiện từ "
-                f"{old_best:.4f} -> {self.best_score:.4f}. Đã lưu: {best_ckpt_path.name}"
-            )
-        elif score is not None:
-            self.logger.info(
-                f"[i] Epoch {epoch}: Chỉ số '{self.monitor}'={score:.4f} không cải thiện "
-                f"(Best: {self.best_score:.4f} tại epoch {self.best_epoch}). Patience: {self.patience_counter}/{self.patience}"
-            )
+        # 3. Đánh giá xem có phải Checkpoint Tốt nhất (best.pt) hay không
+        is_best = False
+        if score is not None:
+            if self.mode == "min":
+                improved = score < (self.best_score - self.min_delta)
+            else:
+                improved = score > (self.best_score + self.min_delta)
 
-        # 5. Lưu checkpoint theo Epoch:
+            if improved:
+                self.best_score = score
+                self.best_epoch = epoch
+                self.patience_counter = 0
+                is_best = True
+
+                # Cập nhật best_epoch trong payload trước khi lưu best.pt
+                checkpoint_data["best_epoch"] = self.best_epoch
+                checkpoint_data["best_score"] = self.best_score
+                best_ckpt_path = self.checkpoint_dir / f"{self.config.experiment_name}_best.pt"
+                torch.save(checkpoint_data, str(best_ckpt_path))
+                self.logger.info(
+                    f"    [*] [KỶ LỤC MỚI] Chỉ số '{self.monitor}' đạt mức tối ưu: {score:.4f} "
+                    f"-> Đã lưu Checkpoint tốt nhất: {best_ckpt_path.name}"
+                )
+            else:
+                self.patience_counter += 1
+
+        # 4. Lưu checkpoint theo Epoch:
         save_all = getattr(self.config, "save_all_epochs", True)
         if save_all:
-            # Lưu TẤT CẢ các epoch riêng biệt, KHÔNG xóa bất kỳ epoch nào
+            # Lưu TẤT CẢ các epoch riêng biệt
             epoch_ckpt_path = self.checkpoint_dir / f"{self.config.experiment_name}_epoch_{epoch:03d}.pt"
             torch.save(checkpoint_data, str(epoch_ckpt_path))
             self.logger.info(f"    [+] Đã lưu checkpoint Epoch {epoch:02d}: {epoch_ckpt_path.name}")
@@ -814,7 +894,7 @@ class CheckpointManager:
                 if old_ckpt.exists():
                     old_ckpt.unlink()
 
-        # 6. Kiểm tra điều kiện Dừng sớm (Early Stopping)
+        # 5. Kiểm tra điều kiện Dừng sớm (Early Stopping)
         if score is not None and self.early_stopping_enabled and (self.patience_counter >= self.patience):
             self.logger.warning(
                 f"\n[!] EARLY STOPPING ĐƯỢC KÍCH HOẠT: Chỉ số '{self.monitor}' không cải thiện "
@@ -887,10 +967,10 @@ class CheckpointManager:
 
 
 # ==============================================================================
-# 5. ĐỘNG CƠ HUẤN LUYỆN LÕI: DrowsinessTrainer
+# 5. ĐỘNG CƠ HUẤN LUYỆN LÕI: DrowsinessTrainer1 (Raw Video PyTorch BackboneNeck)
 # ==============================================================================
-class DrowsinessTrainer:
-    """Động cơ điều phối toàn diện pipeline huấn luyện, kiểm định và chẩn đoán."""
+class DrowsinessTrainer1:
+    """Động cơ điều phối toàn diện pipeline huấn luyện, kiểm định và chẩn đoán với video thô."""
 
     def __init__(self, config: TrainConfig) -> None:
         self.config = config
@@ -901,13 +981,18 @@ class DrowsinessTrainer:
         # 2. Khởi tạo Logger và Visualizer
         self.logger = setup_logger(config.log_dir, config.experiment_name)
         self.logger.info("=" * 80)
-        self.logger.info(f"   KHỞI TẠO PIPELINE HUẤN LUYỆN: {config.experiment_name.upper()}")
+        self.logger.info(f"   KHỞI TẠO PIPELINE HUẤN LUYỆN VIDEO THÔ: {config.experiment_name.upper()}")
         self.logger.info("=" * 80)
 
         # 3. Xác định Thiết bị Tính toán (CUDA vs CPU)
         if config.device == "cuda" and torch.cuda.is_available():
             self.device = torch.device("cuda")
             self.logger.info(f"[+] Thiết bị tính toán: GPU NVIDIA ({torch.cuda.get_device_name(0)})")
+            v_info = get_vram_info(self.device)
+            self.logger.info(
+                f"    -> Tổng VRAM: {v_info['total_gb']:.1f} GB | Đang cấp phát: {v_info['allocated_gb']:.2f} GB | "
+                f"Gradient Accumulation: {config.gradient_accumulation_steps}"
+            )
         else:
             self.device = torch.device("cpu")
             self.logger.info("[+] Thiết bị tính toán: CPU")
@@ -918,7 +1003,7 @@ class DrowsinessTrainer:
         else:
             self.scaler = torch.cuda.amp.GradScaler(enabled=self.amp)
 
-        # 4. Khởi tạo DataLoaders (Train HDF5 + Val Raw Video ONNX)
+        # 4. Khởi tạo DataLoaders (Train & Val từ video thô qua src.dataset2)
         self.train_loader, self.val_loader = self._build_dataloaders()
 
         # 5. Khởi tạo Kiến trúc Mô hình (DeepGRUClassifier)
@@ -972,68 +1057,124 @@ class DrowsinessTrainer:
                 self.logger.info("[*] Chế độ huấn luyện mới từ đầu (Epoch 1).")
 
     def _build_dataloaders(self) -> Tuple[DataLoader, DataLoader]:
-        """Khởi tạo Train DataLoader và Val DataLoader từ tệp HDF5 (HDF5FeatureDataset)."""
-        self.logger.info(f"[*] Nạp tập huấn luyện HDF5: {self.config.train_h5}")
-        train_h5_path = Path(self.config.train_h5)
-        if not train_h5_path.exists():
-            raise FileNotFoundError(f"Không tìm thấy tệp HDF5 tập train tại: {train_h5_path.resolve()}")
+        """Khởi tạo Train DataLoader và Val DataLoader từ video thô qua src.dataset2."""
+        raw_train_dir = Path(getattr(self.config, "dataset_dir", "dataset"))
+        raw_val_dir_str = getattr(self.config, "val_dataset_dir", None)
+        raw_val_dir = Path(raw_val_dir_str) if raw_val_dir_str else raw_train_dir
 
-        # Khởi tạo Train Dataset (HDF5FeatureDataset)
-        train_dataset = HDF5FeatureDataset(
-            h5_path=train_h5_path,
-            manifest_csv=self.config.train_manifest_csv,
-            split="train",
-            seq_len=self.config.seq_len,
-            include_augmented=self.config.include_augmented_train,
-            window_sampling="random"
+        manifest_file = (
+            getattr(self.config, "manifest_file", None)
+            or getattr(self.config, "train_manifest_csv", None)
         )
-        self.logger.info(f"    -> Đã nạp thành công {len(train_dataset)} mẫu huấn luyện từ tệp HDF5.")
+        val_manifest = (
+            getattr(self.config, "val_manifest", None)
+            or getattr(self.config, "val_manifest_csv", None)
+            or manifest_file
+        )
 
-        g = torch.Generator()
-        g.manual_seed(self.config.seed)
+        ckpt_path = (
+            getattr(self.config, "backbone_neck_checkpoint", None)
+            or getattr(self.config, "checkpoint_path", None)
+            or DEFAULT_CHECKPOINT_PATH
+        )
+
+        sample_interval = float(getattr(self.config, "sample_interval", 0.1))
+        seq_len = getattr(self.config, "seq_len", None)
+        chunk_size = int(getattr(self.config, "chunk_size", 16))
+        min_frames = int(getattr(self.config, "min_frames", 1))
+        use_aug = bool(getattr(self.config, "use_augmentation", True))
+        effective_augmenter = None
+        if use_aug:
+            try:
+                from src.augment import get_video_augmenter
+                effective_augmenter = get_video_augmenter()
+                self.logger.info("[+] Đã kích hoạt bộ tăng cường dữ liệu: DetectionAugmenter (src/augment.py)")
+            except Exception as e:
+                self.logger.warning(f"[!] Không thể nạp DetectionAugmenter: {e}. Tiếp tục không augment.")
+                effective_augmenter = None
+        else:
+            self.logger.info("[-] Tăng cường dữ liệu: ĐÃ TẮT (use_augmentation=False)")
+
+        self.logger.info(f"[*] Khởi tạo tập huấn luyện video thô từ: {raw_train_dir.resolve()}")
+        train_dataset = RawVideoBackboneNeckDataset(
+            dataset_dir=raw_train_dir,
+            manifest_file=manifest_file,
+            split="train",
+            sample_interval=sample_interval,
+            seq_len=seq_len,
+            checkpoint_path=ckpt_path,
+            chunk_size=chunk_size,
+            device="auto",
+            augmenter=effective_augmenter,
+            window_sampling="random",
+            min_frames=min_frames
+        )
+
+        self.logger.info(f"[*] Khởi tạo tập kiểm định video thô từ: {raw_val_dir.resolve()}")
+        val_dataset = RawVideoBackboneNeckDataset(
+            dataset_dir=raw_val_dir,
+            manifest_file=val_manifest,
+            split="val",
+            sample_interval=sample_interval,
+            seq_len=seq_len,
+            checkpoint_path=ckpt_path,
+            chunk_size=chunk_size,
+            device="auto",
+            window_sampling="center",
+            min_frames=min_frames
+        )
+
+        # Nếu tập val rỗng do cấu trúc thư mục phẳng, chia tự động bằng random_split
+        if len(val_dataset) == 0 and len(train_dataset) > 1:
+            self.logger.info(
+                f"[*] Không phát hiện thư mục val tách biệt. Tự động chia dataset theo tỷ lệ train_ratio={train_ratio:.2f}."
+            )
+            all_dataset = RawVideoBackboneNeckDataset(
+                dataset_dir=raw_train_dir,
+                manifest_file=manifest_file,
+                split="all",
+                sample_interval=sample_interval,
+                seq_len=seq_len,
+                checkpoint_path=ckpt_path,
+                chunk_size=chunk_size,
+                device="auto",
+                min_frames=min_frames
+            )
+            total_len = len(all_dataset)
+            tr_len = max(1, int(round(total_len * train_ratio)))
+            va_len = max(1, total_len - tr_len)
+            generator = torch.Generator().manual_seed(self.config.seed)
+            from torch.utils.data import random_split
+            train_dataset, val_dataset = random_split(all_dataset, [tr_len, va_len], generator=generator)
+
+        self.logger.info(f"    -> Đã nạp thành công {len(train_dataset)} mẫu huấn luyện.")
+        self.logger.info(f"    -> Đã nạp thành công {len(val_dataset)} mẫu kiểm định.")
+
+        g = torch.Generator().manual_seed(self.config.seed)
+        val_workers = getattr(self.config, "val_num_workers", self.config.num_workers)
 
         train_loader = DataLoader(
             train_dataset,
             batch_size=self.config.batch_size,
             shuffle=self.config.shuffle,
             num_workers=self.config.num_workers,
-            collate_fn=collate_h5_features,
+            collate_fn=collate_raw_video_features,
             pin_memory=self.config.pin_memory if self.device.type == "cuda" else False,
             persistent_workers=self.config.persistent_workers if self.config.num_workers > 0 else False,
-            worker_init_fn=seed_worker,
+            worker_init_fn=_seed_worker,
             generator=g,
             drop_last=self.config.drop_last
         )
 
-        # Khởi tạo Validation Dataset (HDF5FeatureDataset)
-        val_h5_str = getattr(self.config, "val_h5", None) or self.config.train_h5
-        val_h5_path = Path(val_h5_str)
-        self.logger.info(f"[*] Nạp tập kiểm định HDF5: {val_h5_path.resolve()}")
-        if not val_h5_path.exists():
-            raise FileNotFoundError(f"Không tìm thấy tệp HDF5 tập validation tại: {val_h5_path.resolve()}")
-
-        val_manifest = getattr(self.config, "val_manifest_csv", None) or self.config.train_manifest_csv
-        val_dataset = HDF5FeatureDataset(
-            h5_path=val_h5_path,
-            manifest_csv=val_manifest,
-            split="val",
-            seq_len=self.config.seq_len,
-            stride=1,
-            include_augmented=False,  # Tuyệt đối không dùng augmentation cho validation (chống rò rỉ dữ liệu)
-            window_sampling="center"  # Lấy cửa sổ trung tâm có tính xác định cao
-        )
-        self.logger.info(f"    -> Đã nạp thành công {len(val_dataset)} mẫu kiểm định từ tệp HDF5: {val_h5_path.name}")
-
-        val_workers = getattr(self.config, "val_num_workers", self.config.num_workers)
         val_loader = DataLoader(
             val_dataset,
-            batch_size=self.config.val_batch_size,
+            batch_size=getattr(self.config, "val_batch_size", self.config.batch_size),
             shuffle=False,
             num_workers=val_workers,
-            collate_fn=collate_h5_features,
+            collate_fn=collate_raw_video_features,
             pin_memory=self.config.pin_memory if self.device.type == "cuda" else False,
             persistent_workers=self.config.persistent_workers if val_workers > 0 else False,
-            worker_init_fn=seed_worker,
+            worker_init_fn=_seed_worker,
             drop_last=False
         )
 
@@ -1077,9 +1218,45 @@ class DrowsinessTrainer:
             return torch.amp.autocast("cuda", enabled=self.amp)
         return torch.cuda.amp.autocast(enabled=self.amp)
 
+    def _handle_cuda_oom(self, epoch: int, batch_idx: int, total_batches: int, phase: str = "Train") -> None:
+        """
+        Xử lý sự cố quá tải bộ nhớ VRAM (CUDA Out Of Memory):
+        - Xả sạch bộ đệm gradient: zero_grad(set_to_none=True).
+        - Thu gom rác Python gc.collect() và dọn dẹp cache GPU torch.cuda.empty_cache().
+        - Ghi log cảnh báo mức ERROR kèm chi tiết tài nguyên VRAM.
+        - Bỏ qua batch lỗi để duy trì tiến trình huấn luyện mà không bị sập (crash).
+        """
+        v_info = get_vram_info(self.device)
+        self.logger.error("!" * 80)
+        self.logger.error(
+            f"[!] PHÁT HIỆN SỰ CỐ CUDA OUT OF MEMORY (OOM) TRONG PHA {phase.upper()}!\n"
+            f"    - Mốc thời gian: Epoch {epoch:02d}/{self.config.epochs:02d} | Batch {batch_idx:03d}/{total_batches:03d}\n"
+            f"    - Trạng thái VRAM: Đã cấp phát {v_info['allocated_gb']:.2f}GB / {v_info['total_gb']:.1f}GB "
+            f"(Bảo lưu: {v_info['reserved_gb']:.2f}GB, Đỉnh: {v_info['peak_gb']:.2f}GB)\n"
+            f"    - Hành động: Đang xả sạch gradients, giải phóng caching allocator và bỏ qua batch lỗi an toàn..."
+        )
+        self.logger.error("!" * 80)
+
+        # 1. Xả sạch optimizer gradients
+        try:
+            self.optimizer.zero_grad(set_to_none=True)
+        except Exception:
+            pass
+
+        # 2. Xả scaler nếu có
+        if hasattr(self, "scaler") and self.scaler is not None:
+            try:
+                self.scaler.update()
+            except Exception:
+                pass
+
+        # 3. Thu dọn bộ nhớ VRAM
+        cleanup_cuda_memory(force_gc=True)
+
     def train_one_epoch(self, epoch: int) -> Tuple[Dict[str, float], float]:
         """
-        Thực hiện một epoch huấn luyện với giám sát trực quan qua tqdm.
+        Thực hiện một epoch huấn luyện với giám sát trực quan qua tqdm,
+        hỗ trợ Gradient Accumulation và cơ chế tự phục hồi khi gặp CUDA OOM.
         Returns:
             (train_metrics, avg_grad_norm)
         """
@@ -1090,6 +1267,12 @@ class DrowsinessTrainer:
         total_batches = len(self.train_loader)
         current_lr = self.optimizer.param_groups[0]["lr"]
         use_tqdm = getattr(self.config, "use_tqdm", True)
+
+        accum_steps = max(1, getattr(self.config, "gradient_accumulation_steps", 1))
+        empty_cache_interval = getattr(self.config, "empty_cache_interval", 0)
+
+        # Đảm bảo gradients sạch trước khi bắt đầu epoch
+        self.optimizer.zero_grad(set_to_none=True)
 
         pbar = tqdm(
             self.train_loader,
@@ -1102,55 +1285,95 @@ class DrowsinessTrainer:
         )
 
         for batch_idx, (features, targets, seq_lens, metas) in enumerate(pbar, start=1):
-            p3, p4, p5 = features
-            p3 = p3.to(self.device, non_blocking=True)
-            p4 = p4.to(self.device, non_blocking=True)
-            p5 = p5.to(self.device, non_blocking=True)
-            targets = targets.to(self.device, non_blocking=True)
-            seq_lens = seq_lens.to(self.device, non_blocking=True)
+            try:
+                p3, p4, p5 = features
+                p3 = p3.to(self.device, non_blocking=True)
+                p4 = p4.to(self.device, non_blocking=True)
+                p5 = p5.to(self.device, non_blocking=True)
+                targets = targets.to(self.device, non_blocking=True)
+                seq_lens = seq_lens.to(self.device, non_blocking=True)
 
-            self.optimizer.zero_grad(set_to_none=True)
+                # Chạy forward pass với Automatic Mixed Precision (AMP)
+                with self._autocast_context():
+                    logits = self.model((p3, p4, p5), seq_lens=seq_lens)
+                    loss = self.criterion(logits, targets)
+                    loss_scaled = loss / accum_steps
 
-            # Chạy forward pass với Automatic Mixed Precision (AMP)
-            with self._autocast_context():
-                logits = self.model((p3, p4, p5), seq_lens=seq_lens)
-                loss = self.criterion(logits, targets)
+                # Backward pass có điều chỉnh tỷ lệ qua GradScaler
+                self.scaler.scale(loss_scaled).backward()
 
-            # Backward pass có điều chỉnh tỷ lệ qua GradScaler
-            self.scaler.scale(loss).backward()
+                # Cập nhật trọng số theo chu kỳ tích lũy gradient
+                is_accum_step = (batch_idx % accum_steps == 0) or (batch_idx == total_batches)
+                if is_accum_step:
+                    # Unscale trước khi cắt gradient
+                    self.scaler.unscale_(self.optimizer)
+                    gnorm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip_norm)
+                    grad_norms.append(float(gnorm.item()))
 
-            # Unscale trước khi cắt gradient
-            self.scaler.unscale_(self.optimizer)
-            gnorm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip_norm)
-            grad_norms.append(float(gnorm.item()))
+                    # Cập nhật trọng số
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                    self.optimizer.zero_grad(set_to_none=True)
 
-            # Cập nhật trọng số
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
+                cur_gnorm = grad_norms[-1] if grad_norms else 0.0
 
-            # Tính toán xác suất và cập nhật metrics
-            with torch.no_grad():
-                probs = F.softmax(logits, dim=-1)
-                preds = torch.argmax(probs, dim=-1)
-                self.metrics_tracker.update(preds, targets, probs, float(loss.item()), p3.size(0))
+                # Tính toán xác suất và cập nhật metrics (dùng loss gốc không scale)
+                with torch.no_grad():
+                    probs = F.softmax(logits, dim=-1)
+                    preds = torch.argmax(probs, dim=-1)
+                    self.metrics_tracker.update(preds, targets, probs, float(loss.item()), p3.size(0))
 
-            temp_acc = (preds == targets).float().mean().item()
+                temp_acc = (preds == targets).float().mean().item()
 
-            if use_tqdm:
-                pbar.set_postfix(
-                    loss=f"{loss.item():.4f}",
-                    acc=f"{self.metrics_tracker.running_acc:.1f}%",
-                    gnorm=f"{gnorm.item():.3f}",
-                    lr=f"{current_lr:.2e}"
-                )
-            else:
-                if batch_idx % self.config.log_interval == 0 or batch_idx == total_batches:
-                    self.logger.info(
-                        f"  [Train] Epoch {epoch:02d}/{self.config.epochs:02d} | "
-                        f"Batch {batch_idx:03d}/{total_batches:03d} | "
-                        f"Loss: {loss.item():.4f} | Acc: {temp_acc * 100:.1f}% | "
-                        f"GradNorm: {gnorm.item():.3f} | LR: {current_lr:.6f}"
-                    )
+                # Truy vấn thông tin VRAM real-time
+                vram_postfix = ""
+                if self.device.type == "cuda":
+                    v_info = get_vram_info(self.device)
+                    vram_postfix = f"{v_info['allocated_gb']:.1f}/{v_info['total_gb']:.0f}G"
+
+                if use_tqdm:
+                    pbar_kwargs = {
+                        "loss": f"{loss.item():.4f}",
+                        "acc": f"{self.metrics_tracker.running_acc:.1f}%",
+                        "gnorm": f"{cur_gnorm:.3f}",
+                        "lr": f"{current_lr:.2e}"
+                    }
+                    if vram_postfix:
+                        pbar_kwargs["vram"] = vram_postfix
+                    pbar.set_postfix(**pbar_kwargs)
+                else:
+                    if batch_idx % self.config.log_interval == 0 or batch_idx == total_batches:
+                        vram_str = f" | VRAM: {vram_postfix}" if vram_postfix else ""
+                        self.logger.info(
+                            f"  [Train] Epoch {epoch:02d}/{self.config.epochs:02d} | "
+                            f"Batch {batch_idx:03d}/{total_batches:03d} | "
+                            f"Loss: {loss.item():.4f} | Acc: {temp_acc * 100:.1f}% | "
+                            f"GradNorm: {cur_gnorm:.3f} | LR: {current_lr:.6f}{vram_str}"
+                        )
+
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as oom_err:
+                if isinstance(oom_err, torch.cuda.OutOfMemoryError) or "out of memory" in str(oom_err).lower():
+                    self._handle_cuda_oom(epoch, batch_idx, total_batches, phase="Train")
+                    continue
+                raise oom_err
+
+            finally:
+                # Chủ động thu hồi biến tensor khỏi scope vòng lặp Python
+                if "p3" in locals(): del p3
+                if "p4" in locals(): del p4
+                if "p5" in locals(): del p5
+                if "targets" in locals(): del targets
+                if "seq_lens" in locals(): del seq_lens
+                if "features" in locals(): del features
+                if "logits" in locals(): del logits
+                if "loss" in locals(): del loss
+                if "loss_scaled" in locals(): del loss_scaled
+                if "probs" in locals(): del probs
+                if "preds" in locals(): del preds
+
+                # Dọn cache định kỳ nếu bật cấu hình empty_cache_interval > 0
+                if empty_cache_interval > 0 and (batch_idx % empty_cache_interval == 0):
+                    cleanup_cuda_memory(force_gc=False)
 
         pbar.close()
         train_metrics = self.metrics_tracker.compute()
@@ -1159,16 +1382,16 @@ class DrowsinessTrainer:
 
     def validate(self, epoch: int) -> Tuple[Dict[str, float], np.ndarray, List[int], List[float], float]:
         """
-        Thực hiện đánh giá trên tập kiểm định HDF5 (HDF5FeatureDataset) với giám sát qua tqdm.
+        Thực hiện đánh giá trên tập kiểm định video thô với giám sát qua tqdm,
+        tự động dọn dẹp cache GPU và bọc cơ chế xử lý ngoại lệ OOM an toàn.
         Returns:
             (val_metrics, confusion_matrix, targets, probs_drowsy, avg_latency_ms)
         """
         self.model.eval()
         self.metrics_tracker.reset()
 
-        # Giải phóng cache GPU
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        # Giải phóng triệt để cache GPU trước khi validate
+        cleanup_cuda_memory(force_gc=True)
 
         total_batches = len(self.val_loader)
         batch_latencies: List[float] = []
@@ -1186,44 +1409,65 @@ class DrowsinessTrainer:
 
         with torch.no_grad():
             for batch_idx, (features, targets, seq_lens, metas) in enumerate(val_pbar, start=1):
-                start_t = time.perf_counter()
+                try:
+                    start_t = time.perf_counter()
 
-                p3, p4, p5 = features
-                p3 = p3.to(self.device, non_blocking=True)
-                p4 = p4.to(self.device, non_blocking=True)
-                p5 = p5.to(self.device, non_blocking=True)
-                targets = targets.to(self.device, non_blocking=True)
-                seq_lens = seq_lens.to(self.device, non_blocking=True)
+                    p3, p4, p5 = features
+                    p3 = p3.to(self.device, non_blocking=True)
+                    p4 = p4.to(self.device, non_blocking=True)
+                    p5 = p5.to(self.device, non_blocking=True)
+                    targets = targets.to(self.device, non_blocking=True)
+                    seq_lens = seq_lens.to(self.device, non_blocking=True)
 
-                with self._autocast_context():
-                    logits = self.model((p3, p4, p5), seq_lens=seq_lens)
-                    loss = self.criterion(logits, targets)
+                    with self._autocast_context():
+                        logits = self.model((p3, p4, p5), seq_lens=seq_lens)
+                        loss = self.criterion(logits, targets)
 
-                probs = F.softmax(logits, dim=-1)
-                preds = torch.argmax(probs, dim=-1)
+                    probs = F.softmax(logits, dim=-1)
+                    preds = torch.argmax(probs, dim=-1)
 
-                end_t = time.perf_counter()
-                latency_ms = (end_t - start_t) * 1000.0 / max(1, p3.size(0))
-                batch_latencies.append(latency_ms)
+                    end_t = time.perf_counter()
+                    latency_ms = (end_t - start_t) * 1000.0 / max(1, p3.size(0))
+                    batch_latencies.append(latency_ms)
 
-                self.metrics_tracker.update(preds, targets, probs, float(loss.item()), p3.size(0))
+                    self.metrics_tracker.update(preds, targets, probs, float(loss.item()), p3.size(0))
 
-                if use_tqdm:
-                    val_pbar.set_postfix(
-                        val_loss=f"{self.metrics_tracker.running_loss:.4f}",
-                        val_acc=f"{self.metrics_tracker.running_acc:.1f}%",
-                        ms=f"{latency_ms:.1f}"
-                    )
-                else:
-                    if batch_idx % self.config.log_interval == 0 or batch_idx == total_batches:
-                        self.logger.info(
-                            f"  [Val] Epoch {epoch:02d}/{self.config.epochs:02d} | "
-                            f"Batch {batch_idx:03d}/{total_batches:03d} | "
-                            f"Loss: {loss.item():.4f} | Acc: {self.metrics_tracker.running_acc:.1f}% | "
-                            f"Latency: {latency_ms:.2f}ms/clip"
+                    if use_tqdm:
+                        val_pbar.set_postfix(
+                            val_loss=f"{self.metrics_tracker.running_loss:.4f}",
+                            val_acc=f"{self.metrics_tracker.running_acc:.1f}%",
+                            ms=f"{latency_ms:.1f}"
                         )
+                    else:
+                        if batch_idx % self.config.log_interval == 0 or batch_idx == total_batches:
+                            self.logger.info(
+                                f"  [Val] Epoch {epoch:02d}/{self.config.epochs:02d} | "
+                                f"Batch {batch_idx:03d}/{total_batches:03d} | "
+                                f"Loss: {loss.item():.4f} | Acc: {self.metrics_tracker.running_acc:.1f}% | "
+                                f"Latency: {latency_ms:.2f}ms/clip"
+                            )
+                except (torch.cuda.OutOfMemoryError, RuntimeError) as oom_err:
+                    if isinstance(oom_err, torch.cuda.OutOfMemoryError) or "out of memory" in str(oom_err).lower():
+                        self._handle_cuda_oom(epoch, batch_idx, total_batches, phase="Val")
+                        continue
+                    raise oom_err
+                finally:
+                    if "p3" in locals(): del p3
+                    if "p4" in locals(): del p4
+                    if "p5" in locals(): del p5
+                    if "targets" in locals(): del targets
+                    if "seq_lens" in locals(): del seq_lens
+                    if "features" in locals(): del features
+                    if "logits" in locals(): del logits
+                    if "loss" in locals(): del loss
+                    if "probs" in locals(): del probs
+                    if "preds" in locals(): del preds
 
         val_pbar.close()
+
+        # Giải phóng cache GPU sau khi hoàn tất kiểm định
+        cleanup_cuda_memory(force_gc=True)
+
         val_metrics = self.metrics_tracker.compute()
         cm = self.metrics_tracker.get_confusion_matrix()
         avg_latency = float(np.mean(batch_latencies)) if batch_latencies else 0.0
@@ -1248,14 +1492,27 @@ class DrowsinessTrainer:
             epoch_start = time.time()
             current_lr = self.optimizer.param_groups[0]["lr"]
 
+            # Reset thống kê đỉnh VRAM đầu mỗi epoch nếu dùng GPU CUDA
+            if self.device.type == "cuda":
+                try:
+                    torch.cuda.reset_peak_memory_stats(self.device)
+                except Exception:
+                    pass
+
             # 1. Chạy Pha Huấn Luyện (Train Pass)
             train_metrics, grad_norm = self.train_one_epoch(epoch)
+
+            # Dọn dẹp cache sau train pass trước khi sang validation
+            cleanup_cuda_memory(force_gc=True)
 
             # 2. Chạy Pha Kiểm Định (Validation Pass) nếu đến chu kỳ
             val_metrics = None
             avg_latency = 0.0
             if epoch % self.config.val_interval_epochs == 0 or epoch == self.config.epochs:
                 val_metrics, cm, targets, probs, avg_latency = self.validate(epoch)
+
+            # Dọn dẹp cache sau val pass trước khi cập nhật scheduler và lưu checkpoint
+            cleanup_cuda_memory(force_gc=True)
 
             # 3. Cập nhật Scheduler
             if self.scheduler is not None:
@@ -1278,7 +1535,7 @@ class DrowsinessTrainer:
                 epoch_time_s=epoch_time
             )
 
-            # 5. In Bảng Tổng Kết Epoch & Chẩn đoán Overfitting
+            # 5. In Bảng Tổng Kết Epoch & Chẩn đoán Overfitting / VRAM
             self.logger.info("-" * 80)
             log_str = (
                 f"[EPOCH {epoch:02d}/{self.config.epochs:02d}] "
@@ -1291,6 +1548,16 @@ class DrowsinessTrainer:
                     f"Gap: {log_entry['gap_loss']:+.4f} | Latency: {avg_latency:.1f}ms/clip"
                 )
             log_str += f" | Time: {epoch_time:.1f}s"
+
+            if self.device.type == "cuda":
+                v_info = get_vram_info(self.device)
+                log_str += f" | Peak VRAM: {v_info['peak_gb']:.2f}/{v_info['total_gb']:.1f}GB ({v_info['percent_used']:.1f}%)"
+                if v_info["percent_used"] > 90.0:
+                    self.logger.warning(
+                        f"  [!] CẢNH BÁO VRAM: Mức chiếm dụng VRAM ({v_info['percent_used']:.1f}%) vượt ngưỡng 90%! "
+                        f"Khuyến nghị giảm batch_size hoặc tăng gradient_accumulation_steps."
+                    )
+
             self.logger.info(log_str)
 
             # Chẩn đoán Overfitting nếu Gap Loss tăng quá cao
@@ -1300,7 +1567,7 @@ class DrowsinessTrainer:
                     f"vượt ngưỡng 0.50! Val Loss đang cao hơn đáng kể so với Train Loss."
                 )
 
-            # 6. Kiểm tra và Lưu Checkpoint / Early Stopping (Lưu tại mọi Epoch)
+            # 6. Quản lý Checkpoints & Kiểm tra Dừng sớm (Early Stopping)
             should_stop = self.checkpoint_manager.step(
                 current_metrics=val_metrics,
                 epoch=epoch,
@@ -1322,11 +1589,9 @@ class DrowsinessTrainer:
                 stopping_reason = f"Early Stopping triggered at epoch {epoch} (patience={self.config.patience})"
                 break
 
-            self.logger.info("-" * 80)
-
         total_train_time = time.time() - total_train_start
-        self.logger.info("\n" + "=" * 80)
-        self.logger.info(f"   KẾT THÚC HUẤN LUYỆN! Tổng thời gian: {total_train_time / 60.0:.2f} phút.")
+        self.logger.info("=" * 80)
+        self.logger.info(f"   KẾT THÚC HUẤN LUYỆN — Tổng thời gian: {total_train_time:.1f}s")
         self.logger.info(f"   Lý do kết thúc: {stopping_reason}")
         self.logger.info(f"   Checkpoint tốt nhất tại Epoch {self.checkpoint_manager.best_epoch} "
                          f"(Best {self.config.monitor_metric} = {self.checkpoint_manager.best_score:.4f})")
@@ -1351,7 +1616,7 @@ class DrowsinessTrainer:
 
     def evaluate_final(self, fit_results: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
-        Nạp lại Checkpoint tốt nhất (best_model.pt) và thực hiện đánh giá chuyên sâu
+        Nạp lại Checkpoint tốt nhất (best.pt) và thực hiện đánh giá chuyên sâu
         kết quả mô hình, xuất các biểu đồ chẩn đoán (CM Heatmap, ROC/PR Curves) và JSON summary.
         """
         self.logger.info("\n" + "=" * 80)
@@ -1416,7 +1681,8 @@ class DrowsinessTrainer:
         return summary_payload
 
     def close(self) -> None:
-        """Đóng an toàn các tài nguyên mở (HDF5 datasets, Visualizer, Logger handlers)."""
+        """Đóng an toàn các tài nguyên mở (Datasets, Visualizer, Logger handlers, giải phóng VRAM)."""
+        cleanup_cuda_memory(force_gc=True)
         if hasattr(self, "train_loader") and hasattr(self.train_loader, "dataset"):
             if hasattr(self.train_loader.dataset, "close"):
                 try:
@@ -1441,68 +1707,92 @@ class DrowsinessTrainer:
                     self.logger.removeHandler(h)
                 except Exception:
                     pass
+        cleanup_cuda_memory(force_gc=True)
+
+
+# Alias hỗ trợ gọi tương đương DrowsinessTrainer
+DrowsinessTrainer = DrowsinessTrainer1
 
 
 # ==============================================================================
-# 6. CƠ CHẾ KIỂM THỬ ĐỘC LẬP TỰ ĐỘNG: run_dry_run_test
+# 6. CƠ CHẾ KIỂM THỬ ĐỘC LẬP TỰ ĐỘNG: run_dry_run_test (Video Thô)
 # ==============================================================================
 def run_dry_run_test() -> None:
     """
     Chạy thử nghiệm độc lập toàn diện quy trình huấn luyện và đánh giá
-    trên dữ liệu giả lập (mock data HDF5), xác nhận 100% các thành phần hoạt động trơn tru.
+    trên dữ liệu giả lập (mock raw video files .mp4), xác nhận 100% các thành phần hoạt động trơn tru.
     """
     print("\n" + "=" * 80)
-    print("   [DRY-RUN TEST] BẮT ĐẦU KIỂM THỬ TỰ ĐỘNG TOÀN DIỆN PIPELINE HUẤN LUYỆN")
+    print("   [DRY-RUN TEST] BẮT ĐẦU KIỂM THỬ TỰ ĐỘNG TOÀN DIỆN PIPELINE HUẤN LUYỆN (RAW VIDEO)")
     print("=" * 80)
 
-    temp_dir = tempfile.mkdtemp(prefix="driver_guardian_train_dryrun_")
+    temp_dir = tempfile.mkdtemp(prefix="driver_guardian_train1_dryrun_")
     temp_path = Path(temp_dir)
 
     try:
-        # 1. Tạo tệp HDF5 mock chứa đồng thời cả split train và val
-        mock_h5 = temp_path / "mock_features.h5"
-        mock_csv = temp_path / "mock_manifest.csv"
-        print(f"[*] [Bước 1] Sinh dữ liệu mock HDF5 cho cả tập train và val: {mock_h5.name}")
-        create_mock_h5_dataset(mock_h5, mock_csv)
+        # 1. Tạo video clips giả lập cho cả train và val
+        print("\n[*] [Bước 1] Khởi tạo các tệp video giả lập (Mock Video Files)...")
+        train_alert_dir = temp_path / "train" / "0_alert"
+        train_drowsy_dir = temp_path / "train" / "1_drowsy"
+        val_alert_dir = temp_path / "val" / "0_alert"
+        val_drowsy_dir = temp_path / "val" / "1_drowsy"
 
-        # 2. Tạo cấu hình TrainConfig thử nghiệm
-        print("[*] [Bước 2] Cấu hình TrainConfig độc lập cho chế độ Dry-Run...")
+        for d in (train_alert_dir, train_drowsy_dir, val_alert_dir, val_drowsy_dir):
+            d.mkdir(parents=True, exist_ok=True)
+
+        def create_dummy_video(file_path: Path, num_frames: int = 15, fps: float = 30.0, color=(100, 150, 200)):
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            writer = cv2.VideoWriter(str(file_path), fourcc, fps, (320, 240))
+            for f_i in range(num_frames):
+                img = np.full((240, 320, 3), color, dtype=np.uint8)
+                cv2.putText(img, f"Frame {f_i}", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+                writer.write(img)
+            writer.release()
+
+        v1_path = train_alert_dir / "sample_alert_1.mp4"
+        v2_path = train_drowsy_dir / "sample_drowsy_1.mp4"
+        v3_path = val_alert_dir / "sample_alert_val.mp4"
+        v4_path = val_drowsy_dir / "sample_drowsy_val.mp4"
+
+        create_dummy_video(v1_path, num_frames=15, fps=30.0, color=(50, 100, 150))
+        create_dummy_video(v2_path, num_frames=20, fps=30.0, color=(150, 50, 50))
+        create_dummy_video(v3_path, num_frames=12, fps=20.0, color=(50, 150, 50))
+        create_dummy_video(v4_path, num_frames=15, fps=25.0, color=(150, 150, 50))
+
+        print(f"    [✓] Đã tạo thành công 4 video mock tại: {temp_dir}")
+
+        # 2. Cấu hình bài test mô phỏng
+        print("\n[*] [Bước 2] Thiết lập cấu hình TrainConfig thử nghiệm...")
         cfg = TrainConfig(
-            train_h5=str(mock_h5),
-            val_h5=str(mock_h5),
-            train_manifest_csv=str(mock_csv),
-            val_manifest_csv=str(mock_csv),
+            dataset_dir=str(temp_path),
+            val_dataset_dir=str(temp_path),
             checkpoint_dir=str(temp_path / "checkpoints"),
             log_dir=str(temp_path / "logs"),
-            tb_log_dir=str(temp_path / "tb_logs"),
-            history_csv_path=str(temp_path / "logs" / "history.csv"),
-            summary_json_path=str(temp_path / "logs" / "summary.json"),
-            plot_curves_path=str(temp_path / "logs" / "curves.png"),
-            plot_cm_path=str(temp_path / "logs" / "cm.png"),
-            plot_roc_path=str(temp_path / "logs" / "roc.png"),
-            save_all_epochs=True,
-            enable_resume=False,
-            resume_epoch=None,
+            tb_log_dir=str(temp_path / "runs"),
+            history_csv_path=str(temp_path / "logs" / "training_history.csv"),
+            summary_json_path=str(temp_path / "logs" / "training_summary.json"),
+            plot_curves_path=str(temp_path / "logs" / "loss_accuracy_curves.png"),
+            plot_cm_path=str(temp_path / "logs" / "confusion_matrix_best.png"),
+            plot_roc_path=str(temp_path / "logs" / "roc_pr_curves.png"),
+            experiment_name="dryrun_test1",
             epochs=2,
             batch_size=2,
             val_batch_size=2,
+            sample_interval=0.1,
             num_workers=0,
             val_num_workers=0,
-            patience=2,
-            val_interval_epochs=1,
-            sample_interval=0.1,
-            seq_len=20,
-            input_dim=128,
-            hidden_dim=96,
-            num_layers=2,
-            use_tqdm=True,
-            experiment_name="dryrun_test",
+            gradient_accumulation_steps=2,
+            device="cuda" if torch.cuda.is_available() else "cpu",
+            amp=False,
+            use_tqdm=False,
+            save_all_epochs=True,
+            enable_resume=False,
             dry_run=True
         )
 
-        # 3. Khởi tạo Trainer và chạy huấn luyện 2 epochs ban đầu
-        print("[*] [Bước 3] Khởi tạo DrowsinessTrainer và thực thi 2 epochs (save_all_epochs=True)...")
-        trainer = DrowsinessTrainer(config=cfg)
+        # 3. Khởi tạo Trainer và chạy huấn luyện 2 epochs
+        print("[*] [Bước 3] Khởi tạo DrowsinessTrainer1 và thực thi 2 epochs (save_all_epochs=True)...")
+        trainer = DrowsinessTrainer1(config=cfg)
         fit_results = trainer.fit()
 
         # 4. Chạy đánh giá cuối cùng
@@ -1510,17 +1800,17 @@ def run_dry_run_test() -> None:
         summary_payload = trainer.evaluate_final(fit_results)
         trainer.close()
 
-        # 5. Kiểm tra tính toàn vẹn của các file kết quả và Checkpoint tất cả các epoch
+        # 5. Kiểm tra tính toàn vẹn của các file kết quả và Checkpoint
         print("\n[*] [Bước 5] Xác thực lưu trữ Checkpoint tất cả các epoch (save_all_epochs):")
-        ckpt_ep1 = temp_path / "checkpoints" / "dryrun_test_epoch_001.pt"
-        ckpt_ep2 = temp_path / "checkpoints" / "dryrun_test_epoch_002.pt"
-        ckpt_last = temp_path / "checkpoints" / "dryrun_test_last.pt"
-        ckpt_best = temp_path / "checkpoints" / "dryrun_test_best.pt"
+        ckpt_ep1 = temp_path / "checkpoints" / "dryrun_test1_epoch_001.pt"
+        ckpt_ep2 = temp_path / "checkpoints" / "dryrun_test1_epoch_002.pt"
+        ckpt_last = temp_path / "checkpoints" / "dryrun_test1_last.pt"
+        ckpt_best = temp_path / "checkpoints" / "dryrun_test1_best.pt"
 
-        assert ckpt_ep1.exists(), "LỖI: Thiếu checkpoint Epoch 1: dryrun_test_epoch_001.pt!"
-        assert ckpt_ep2.exists(), "LỖI: Thiếu checkpoint Epoch 2: dryrun_test_epoch_002.pt!"
-        assert ckpt_last.exists(), "LỖI: Thiếu checkpoint gần nhất: dryrun_test_last.pt!"
-        assert ckpt_best.exists(), "LỖI: Thiếu checkpoint tốt nhất: dryrun_test_best.pt!"
+        assert ckpt_ep1.exists(), "LỖI: Thiếu checkpoint Epoch 1: dryrun_test1_epoch_001.pt!"
+        assert ckpt_ep2.exists(), "LỖI: Thiếu checkpoint Epoch 2: dryrun_test1_epoch_002.pt!"
+        assert ckpt_last.exists(), "LỖI: Thiếu checkpoint gần nhất: dryrun_test1_last.pt!"
+        assert ckpt_best.exists(), "LỖI: Thiếu checkpoint tốt nhất: dryrun_test1_best.pt!"
         print(f"    [✓] Đã tạo thành công: {ckpt_ep1.name}")
         print(f"    [✓] Đã tạo thành công: {ckpt_ep2.name}")
         print(f"    [✓] Đã tạo thành công: {ckpt_last.name}")
@@ -1548,7 +1838,7 @@ def run_dry_run_test() -> None:
 
         # 6a. Thử nghiệm khi enable_resume=False: Phải luôn bắt đầu từ Epoch 1
         cfg_no_resume = replace(cfg, enable_resume=False, resume_epoch=1)
-        trainer_no_resume = DrowsinessTrainer(config=cfg_no_resume)
+        trainer_no_resume = DrowsinessTrainer1(config=cfg_no_resume)
         assert trainer_no_resume.start_epoch == 1, (
             f"LỖI: Khi enable_resume=False, start_epoch phải là 1 nhưng lại là {trainer_no_resume.start_epoch}!"
         )
@@ -1558,7 +1848,7 @@ def run_dry_run_test() -> None:
         # 6b. Thử nghiệm khi enable_resume=True và resume_epoch=1: Bắt đầu từ Epoch 2
         print("\n[*] [Bước 7] Kiểm tra nạp lại từ Epoch 1 (enable_resume=True, resume_epoch=1):")
         cfg_resume_ep1 = replace(cfg, enable_resume=True, resume_epoch=1)
-        trainer_resume_ep1 = DrowsinessTrainer(config=cfg_resume_ep1)
+        trainer_resume_ep1 = DrowsinessTrainer1(config=cfg_resume_ep1)
         assert trainer_resume_ep1.start_epoch == 2, (
             f"LỖI: Khi nạp lại từ Epoch 1, start_epoch phải là 2 nhưng lại là {trainer_resume_ep1.start_epoch}!"
         )
@@ -1570,7 +1860,7 @@ def run_dry_run_test() -> None:
 
         # 6c. Thử nghiệm nạp epoch không tồn tại (vd: epoch 99)
         print("\n[*] [Bước 8] Kiểm tra xử lý ngoại lệ khi nạp Epoch không tồn tại:")
-        dummy_logger = logging.getLogger("TestCheckpointManager")
+        dummy_logger = logging.getLogger("TestCheckpointManager1")
         test_cm = CheckpointManager(cfg, dummy_logger)
         try:
             test_cm.resolve_checkpoint_path(resume_epoch=99)
@@ -1580,8 +1870,25 @@ def run_dry_run_test() -> None:
             assert "Các checkpoint epoch sẵn có" in str(fnf_err), "Ngoại lệ thiếu danh sách các epoch sẵn có!"
             print(f"    [✓] Báo lỗi ngoại lệ thân thiện thành công:\n        {fnf_err.args[0].splitlines()[0]}")
 
+        # 7. Kiểm tra đo đạc thông số VRAM & dọn dẹp bộ nhớ
+        print("\n[*] [Bước 9] Kiểm tra chức năng giám sát VRAM (get_vram_info) & cleanup_cuda_memory:")
+        v_test = get_vram_info()
+        assert isinstance(v_test, dict) and "allocated_gb" in v_test and "total_gb" in v_test, "LỖI cấu trúc get_vram_info!"
+        cleanup_cuda_memory(force_gc=True)
+        print(f"    [✓] get_vram_info hoạt động chuẩn xác: {v_test}")
+
+        # 8. Kiểm tra cơ chế tự phục hồi OOM (_handle_cuda_oom)
+        print("\n[*] [Bước 10] Kiểm tra cơ chế tự phục hồi CUDA OOM (_handle_cuda_oom):")
+        cfg_oom_test = replace(cfg, enable_resume=False)
+        mock_trainer = DrowsinessTrainer1(config=cfg_oom_test)
+        try:
+            mock_trainer._handle_cuda_oom(epoch=1, batch_idx=1, total_batches=2, phase="Mock_OOM_Test")
+            print("    [✓] _handle_cuda_oom xả gradients, dọn dẹp cache VRAM và xử lý an toàn không gây sập!")
+        finally:
+            mock_trainer.close()
+
         print("\n" + "=" * 80)
-        print("   >>> [THÀNH CÔNG 100%] KIỂM THỬ DRY-RUN TOÀN BỘ CƠ CHẾ RESUME & SAVE ALL ĐẠT CHUẨN! <<<")
+        print("   >>> [THÀNH CÔNG 100%] KIỂM THỬ DRY-RUN TOÀN BỘ CƠ CHẾ TRAIN ĐẠT CHUẨN! <<<")
         print("=" * 80)
 
     finally:
@@ -1618,7 +1925,7 @@ def train_pipeline(
     resume_epoch: Optional[int] = None
 ) -> Dict[str, Any]:
     """
-    Hàm giao diện tiện ích cấp cao để khởi chạy toàn bộ pipeline huấn luyện.
+    Hàm giao diện tiện ích cấp cao để khởi chạy toàn bộ pipeline huấn luyện video thô.
     Cho phép gọi trực tiếp từ script Python khác hoặc Jupyter Notebooks.
     """
     cfg = config if config is not None else load_config()
@@ -1633,19 +1940,19 @@ def train_pipeline(
         run_dry_run_test()
         return {"status": "dry_run_completed"}
 
-    trainer = DrowsinessTrainer(config=cfg)
+    trainer = DrowsinessTrainer1(config=cfg)
     fit_results = trainer.fit()
     summary = trainer.evaluate_final(fit_results)
     return summary
 
 
 def main() -> None:
-    """Điểm khởi chạy chính khi thực thi tệp: python train.py."""
+    """Điểm khởi chạy chính khi thực thi tệp: python src/train1.py."""
     config = load_config()
     if config.dry_run:
         run_dry_run_test()
     else:
-        trainer = DrowsinessTrainer(config=config)
+        trainer = DrowsinessTrainer1(config=config)
         fit_results = trainer.fit()
         trainer.evaluate_final(fit_results)
 

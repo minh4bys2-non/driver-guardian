@@ -1,45 +1,46 @@
 # ==============================================================================
 # DRIVER GUARDIAN - DEEP GRU CONFIGURATION FILE
+# Huấn luyện mô hình trực tiếp từ video thô qua NMSFreeDetector BackboneNeck
 # ==============================================================================
 
-# ---- 1. DATASET CONFIGURATION (TRAIN: HDF5, VAL: RAW VIDEO ONNX) ----
+# ---- 1. DATASET CONFIGURATION (RAW VIDEO & NMSFreeDetector) ----
 dataset:
-  # Tập huấn luyện (HDF5FeatureDataset)
-  train_h5: E:\LSTM\checkpoints\dataset_features.h5
-  train_manifest_csv: null
-  include_augmented_train: true
-  
-  # Tập kiểm định (HDF5FeatureDataset)
-  val_h5: null
-  val_manifest_csv: null
-  val_batch_size: 16
-  val_num_workers: 0
-
-  # Tham số khung hình chung
-  seq_len: 50
-  sample_interval: 0.1
+  # Thư mục gốc chứa video thô (đã quét nhãn hoặc chia train/val)
+  dataset_dir: "/home/riftuser/.cache/kagglehub/datasets/nyvantran6634/dataset-datn4ni/versions/1/data_processed"
+  # Tệp manifest CSV/JSON (None hoặc rỗng để tự tìm dataset_merged_split.csv)
+  manifest_file: "dataset_merged_split.csv"
+  # Thư mục tập kiểm định (null: dùng chung dataset_dir/val hoặc tự chia)
+  val_dataset_dir: null
+  # Tệp manifest cho tập kiểm định (null: tự động theo trường split trong manifest)
+  val_manifest: null
+  # Trọng số tối ưu PyTorch .pt của mô hình NMSFreeDetector
+  backbone_neck_checkpoint: "/home/riftuser/workspace/driver-guardian/ai/ObjectDetection_2p6M/checkpoints/2bfb6cc36ef5ab822a944006c746e5d348d67e387501c9027df5b957cf124031/de0c5b23e1ae749b972f10cb5f3e21e2ccf37bd334eb7a7c3091c460073ff310/finetune/best.pt"
+  # Tham số khung hình
+  sample_interval: 0.2
+  seq_len: Null 
   image_size: [640, 640]
-  video_exits: [".avi", ".mp4", ".mkv"]
+  video_exts: [".avi", ".mp4", ".mkv", ".mov"]
   train_ratio: 0.8
   split_by_subject: true
+  min_frames: 10
+  use_augmentation: true
 
 # ---- 2. DATALOADER CONFIGURATION ----
 dataloader:
-  batch_size: 16
+  batch_size: 32
+  val_batch_size: 8
   num_workers: 0
+  val_num_workers: 0
   pin_memory: false
   shuffle: true
   drop_last: false
   persistent_workers: false
   prefetch_factor: null
   seed: 42
-  chunk_size: 16
-  use_dummy_cnn: false
+  chunk_size: 32
 
-# ---- 3. MODEL ARCHITECTURE CONFIGURATION ----
+# ---- 3. MODEL ARCHITECTURE CONFIGURATION (NMSFreeDetector PAFPN + Deep GRU) ----
 model:
-  backbone_onnx_path: "checkpoints/backbone.onnx"
-  backbone_neck_onnx_path: "checkpoints/backbone_neck.onnx"
   cnn_neck_channels: [64, 128, 256]
   cnn_strides: [8, 16, 32]
   cnn_num_features: 3
@@ -48,8 +49,8 @@ model:
   spatial_fusion: "concat"
   adapter_dropout: 0.25
   use_norm: true
-  input_dim: 512
-  hidden_dim: 256 #192
+  input_dim: 256
+  hidden_dim: 192
   num_layers: 2
   num_classes: 2
   dropout: 0.35
@@ -64,7 +65,7 @@ loss:
 
 # ---- 5. OPTIMIZER & SCHEDULER CONFIGURATION ----
 optimizer:
-  epochs: 40
+  epochs: 30
   lr0: 0.001
   lr_min_factor: 0.01
   weight_decay: 0.0001
@@ -73,6 +74,8 @@ optimizer:
   betas: [0.9, 0.999]
   momentum: 0.9
   grad_clip_norm: 1.0
+  gradient_accumulation_steps: 1
+  empty_cache_interval: 2
   use_scheduler: true
   scheduler_type: "cosine"
 
@@ -80,14 +83,14 @@ optimizer:
 logging:
   tb_log_dir: "logs/tensorboard"
   log_dir: "logs"
-  experiment_name: "deepgru_h5train_rawval"
+  experiment_name: "deepgru_raw_nmsfree"
   checkpoint_dir: "checkpoints/experiments"
   save_all_epochs: true
   save_ckpt_interval_epochs: 1
   save_best_only: false
   ckpt_keep_last: null
-  enable_resume: true
-  resume_epoch: 2
+  enable_resume: false
+  resume_epoch: null
   resume: ""
 
   # Early Stopping

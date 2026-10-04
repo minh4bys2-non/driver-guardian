@@ -170,7 +170,8 @@ class CNNAdapter(nn.Module):
             # Nếu đầu vào là tensor không gian 4D [N, C, H, W]
             if p3.dim() == 4:
                 N = p3.shape[0]
-                chunk_size = 32  # Chia chunk nhỏ để giữ đỉnh VRAM dưới 200MB, an toàn tuyệt đối trên RTX 3050 Laptop
+                chunk_size = 16  # Chia chunk nhỏ để giữ đỉnh VRAM dưới 200MB, an toàn tuyệt đối trên RTX 3050 Laptop
+                # print(f"[CNNAdapter] Chia batch {N} thành các chunk nhỏ {chunk_size} để giảm VRAM.")
                 if N > chunk_size:
                     projected_list = []
                     weights_list = [] if (return_weights or self.fusion == "attention") else None

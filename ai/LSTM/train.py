@@ -8,8 +8,9 @@ Mục đích:
     (Training Process Diagnostics).
 
 Luồng dữ liệu:
-    - Tập Huấn luyện (Train): HDF5FeatureDataset từ src/dataset.py (nạp từ file HDF5 .h5)
-    - Tập Kiểm định (Val): HDF5FeatureDataset từ src/dataset.py (nạp từ file HDF5 .h5)
+    - Tập Huấn luyện (Train): RawVideoBackboneNeckDataset từ src/dataset2.py (nạp từ video thô qua OpenCV & BackboneNeck)
+    - Tập Kiểm định (Val): RawVideoBackboneNeckDataset từ src/dataset2.py (nạp từ video thô qua OpenCV & BackboneNeck)
+    - Tăng cường dữ liệu: DetectionAugmenter từ src/augment.py (Temporal Consistency qua shared seed)
     - Mô hình: DeepGRUClassifier từ src/models.py (CNNAdapter + Deep GRU + TemporalAttentionPooling + FC)
     - Hàm mất mát: DrowsinessLoss từ src/loss.py (CrossEntropyLoss hỗ trợ pos_weight)
 
@@ -34,10 +35,16 @@ ROOT_DIR = Path(__file__).resolve().parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
+# Tối ưu hóa bộ cấp phát CUDA Caching Allocator: Chống phân mảnh bộ nhớ khi chuỗi video có độ dài biến thiên
+if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 # Tái xuất (re-export) toàn bộ các lớp và hàm từ src.train
 from src.train import (
     seed_everything,
     setup_logger,
+    get_vram_info,
+    cleanup_cuda_memory,
     MetricsTracker,
     TrainingVisualizer,
     CheckpointManager,
@@ -50,6 +57,8 @@ from src.train import (
 __all__ = [
     "seed_everything",
     "setup_logger",
+    "get_vram_info",
+    "cleanup_cuda_memory",
     "MetricsTracker",
     "TrainingVisualizer",
     "CheckpointManager",

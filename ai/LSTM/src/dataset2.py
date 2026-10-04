@@ -632,11 +632,21 @@ class RawVideoBackboneNeckDataset(Dataset):
 
         # 3. Tăng cường dữ liệu thời gian (Temporal Augmentation) nếu có
         if self.augmenter is not None and self.split == "train":
-            aug_seed = random.randint(0, 1000000)
+            aug_seed = random.randint(0, 2**31 - 1)
             if hasattr(self.augmenter, "apply_sequence"):
                 frames_rgb = self.augmenter.apply_sequence(frames_rgb, seed=aug_seed)
-            else:
-                frames_rgb = [self.augmenter(img, seed=aug_seed) if callable(self.augmenter) else img for img in frames_rgb]
+            elif hasattr(self.augmenter, "augment_video"):
+                aug_res = self.augmenter.augment_video(frames_rgb, seed=aug_seed)
+                frames_rgb = aug_res[0] if isinstance(aug_res, (tuple, list)) else aug_res
+            elif callable(self.augmenter):
+                processed: List[np.ndarray] = []
+                for img in frames_rgb:
+                    out = self.augmenter(img, seed=aug_seed)
+                    if isinstance(out, (tuple, list)):
+                        processed.append(out[0])
+                    else:
+                        processed.append(out)
+                frames_rgb = processed
 
         # 4. Trích xuất trực tiếp đặc trưng qua mô hình PyTorch BackboneNeck
         extractor = self._get_extractor()
@@ -743,6 +753,7 @@ def build_raw_video_dataloaders(
     device: str = "auto",
     use_fp16: bool = False,
     augmenter: Optional[Any] = None,
+    use_augmentation: bool = True,
     seed: int = 42,
     train_ratio: float = 0.8
 ) -> Tuple[DataLoader, DataLoader]:
@@ -750,10 +761,39 @@ def build_raw_video_dataloaders(
     Hàm Factory khởi tạo cặp DataLoader (train_loader, val_loader) nạp video thô
     và trích xuất đặc trưng qua PyTorch BackboneNeck.
 
+    Args:
+        dataset_dir: Thư mục chứa video hoặc đường dẫn manifest CSV/JSON.
+        manifest_file: Đường dẫn tệp CSV/JSON manifest tùy chọn.
+        sample_interval: Chu kỳ lấy mẫu khung hình thời gian (giây), mặc định 0.1s.
+        seq_len: Độ dài khung hình cố định (None = dynamic).
+        checkpoint_path: Đường dẫn tệp trọng số PyTorch (.pt).
+        batch_size: Kích thước batch.
+        num_workers: Số worker nạp dữ liệu.
+        pin_memory: Cờ pin memory vào pinned RAM host.
+        shuffle_train: Xáo trộn tập train.
+        device: Thiết bị ("auto", "cuda", "cpu").
+        use_fp16: Tensor đầu ra FP16.
+        augmenter: Đối tượng Augmenter tùy chỉnh (None = dùng mặc định nếu use_augmentation=True).
+        use_augmentation: Bật/tắt tăng cường dữ liệu cho tập huấn luyện.
+        seed: Hạt giống ngẫu nhiên.
+        train_ratio: Tỷ lệ chia train/val nếu thư mục phẳng.
+
     Returns:
         train_loader: DataLoader cho tập huấn luyện
         val_loader: DataLoader cho tập kiểm định
     """
+    effective_augmenter = None
+    if use_augmentation:
+        if augmenter is not None:
+            effective_augmenter = augmenter
+        else:
+            try:
+                from src.augment import get_video_augmenter
+                effective_augmenter = get_video_augmenter()
+            except Exception as e:
+                logger.warning(f"Không thể khởi tạo DetectionAugmenter từ src.augment: {e}")
+                effective_augmenter = None
+
     train_dataset = RawVideoBackboneNeckDataset(
         dataset_dir=dataset_dir,
         manifest_file=manifest_file,
@@ -763,7 +803,7 @@ def build_raw_video_dataloaders(
         checkpoint_path=checkpoint_path,
         device=device,
         use_fp16=use_fp16,
-        augmenter=augmenter,
+        augmenter=effective_augmenter,
         window_sampling="random"
     )
 

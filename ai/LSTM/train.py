@@ -8,8 +8,9 @@ Mục đích:
     (Training Process Diagnostics).
 
 Luồng dữ liệu:
-    - Tập Huấn luyện (Train): HDF5FeatureDataset từ src/dataset.py (nạp từ file HDF5 .h5)
-    - Tập Kiểm định (Val): HDF5FeatureDataset từ src/dataset.py (nạp từ file HDF5 .h5)
+    - Tập Huấn luyện (Train): RawVideoBackboneNeckDataset từ src/dataset2.py (nạp từ video thô qua OpenCV & BackboneNeck)
+    - Tập Kiểm định (Val): RawVideoBackboneNeckDataset từ src/dataset2.py (nạp từ video thô qua OpenCV & BackboneNeck)
+    - Tăng cường dữ liệu: DetectionAugmenter từ src/augment.py (Temporal Consistency qua shared seed)
     - Mô hình: DeepGRUClassifier từ src/models.py (CNNAdapter + Deep GRU + TemporalAttentionPooling + FC)
     - Hàm mất mát: DrowsinessLoss từ src/loss.py (CrossEntropyLoss hỗ trợ pos_weight)
 

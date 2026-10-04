@@ -1000,7 +1000,18 @@ class DrowsinessTrainer1:
         seq_len = getattr(self.config, "seq_len", None)
         chunk_size = int(getattr(self.config, "chunk_size", 16))
         min_frames = int(getattr(self.config, "min_frames", 1))
-        train_ratio = float(getattr(self.config, "train_ratio", 0.8))
+        use_aug = bool(getattr(self.config, "use_augmentation", True))
+        effective_augmenter = None
+        if use_aug:
+            try:
+                from src.augment import get_video_augmenter
+                effective_augmenter = get_video_augmenter()
+                self.logger.info("[+] Đã kích hoạt bộ tăng cường dữ liệu: DetectionAugmenter (src/augment.py)")
+            except Exception as e:
+                self.logger.warning(f"[!] Không thể nạp DetectionAugmenter: {e}. Tiếp tục không augment.")
+                effective_augmenter = None
+        else:
+            self.logger.info("[-] Tăng cường dữ liệu: ĐÃ TẮT (use_augmentation=False)")
 
         self.logger.info(f"[*] Khởi tạo tập huấn luyện video thô từ: {raw_train_dir.resolve()}")
         train_dataset = RawVideoBackboneNeckDataset(
@@ -1012,6 +1023,7 @@ class DrowsinessTrainer1:
             checkpoint_path=ckpt_path,
             chunk_size=chunk_size,
             device="auto",
+            augmenter=effective_augmenter,
             window_sampling="random",
             min_frames=min_frames
         )

@@ -1,0 +1,133 @@
+=== Diagram 1 ===
+flowchart LR
+    subgraph Stage1["Giai đoạn 1: Trích xuất đặc trưng không gian (Offline / Cực nhanh)"]
+        direction TB
+        RawVideo["Video Camera Cabin<br/>(4 FPS, T bước thời gian)"] --> FaceROI["Cắt vùng khuôn mặt<br/>(Face Crop 480x480)"]
+        FaceROI --> Backbone["YOLOv10 Trunk & PAFPN Neck<br/>(backbone_neck.onnx ~1.64M params)"]
+        Backbone --> Pool["AdaptiveAvgPool2d (1x1)"]
+        Pool --> MultiScale["3 Tầng đặc trưng đa tỷ lệ:<br/>p3 (64-d), p4 (128-d), p5 (256-d)"]
+        MultiScale --> TensorSave["Đóng gói nhị phân Tensor (.pt)<br/>(features_processed_train.pt)"]
+    end
+
+    subgraph Stage2["Giai đoạn 2: Mô hình chuỗi thời gian & Phân loại (datn4ni4.ipynb)"]
+        direction TB
+        TensorLoad["Nạp RAM siêu tốc (< 0.5s)<br/>PreloadedTensorDataset"] --> Augmenter["Temporal Tensor Augmentation<br/>(Gaussian Noise + Time Masking)"]
+        Augmenter --> SpatialAdapter["SpatialFeatureAdapter<br/>(Multi-scale Scale Attention Fusion)"]
+        SpatialAdapter --> DeepGRU["2-Layer Stacked Deep GRU<br/>(hidden_dim = 192, dropout = 0.35)"]
+        DeepGRU --> AttnPool["Temporal Attention Pooling<br/>(Masked Dynamic Sequence Reduction)"]
+        AttnPool --> FCHead["Linear Classification Head<br/>(Dropout 0.35 -> Linear -> 2 classes)"]
+        FCHead --> OutputDecision["Quyết định: Alert (0) vs Drowsy (1)<br/>(Threshold Tuning Th_safe >= 85% Recall)"]
+    end
+
+    TensorSave -.->|"Nạp trực tiếp vào RAM"| TensorLoad
+
+==================================================
+
+=== Diagram 2 ===
+flowchart TD
+    subgraph Inputs["1. Dữ liệu đầu vào (Multi-scale Spatial Tensors)"]
+        P3["Tensor p3: [Batch, Time, 64]"]
+        P4["Tensor p4: [Batch, Time, 128]"]
+        P5["Tensor p5: [Batch, Time, 256]"]
+        Lens["Seq Lens: [Batch] (Độ dài thực tế)"]
+    end
+
+    subgraph SpatialAdapterBlock["2. SpatialFeatureAdapter (314,627 params)"]
+        P3 --> Proj3["Linear(64, 256) + LayerNorm(256) + ReLU"]
+        P4 --> Proj4["Linear(128, 256) + LayerNorm(256) + ReLU"]
+        P5 --> Proj5["Linear(256, 256) + LayerNorm(256) + ReLU"]
+        Proj3 --> V3["v3: [B, T, 256]"]
+        Proj4 --> V4["v4: [B, T, 256]"]
+        Proj5 --> V5["v5: [B, T, 256]"]
+        V3 & V4 & V5 --> CatV["Concat: [B, T, 768]"]
+        CatV --> AttnMLP["MLP: Linear(768, 256) -> ReLU -> Linear(256, 3)"]
+        AttnMLP --> SoftmaxScales["Softmax(dim=-1): Trọng số w1, w2, w3: [B, T, 3, 1]"]
+        V3 & V4 & V5 --> StackV["Stack: [B, T, 3, 256]"]
+        SoftmaxScales & StackV --> WeightedSum["Tổng có trọng số: sum(StackV * Weights, dim=-2)"]
+        WeightedSum --> DropAdapter["Dropout(p=0.25)"]
+        DropAdapter --> OutAdapter["x_fused: [Batch, Time, 256]"]
+    end
+
+    subgraph GRUBlock["3. 2-Layer Stacked GRU (481,536 params)"]
+        OutAdapter --> GRULayer1["GRU Layer 1 (in=256, hidden=192, batch_first=True)"]
+        GRULayer1 --> GRUDrop["Dropout(p=0.35)"]
+        GRUDrop --> GRULayer2["GRU Layer 2 (in=192, hidden=192)"]
+        GRULayer2 --> GRUOut["gru_out: [Batch, Time, 192]<br/>h_n: [2, Batch, 192]"]
+    end
+
+    subgraph DualPathways{"Chế độ hoạt động (return_sequence)"}
+        GRUOut --> DualPathways
+    end
+
+    subgraph StreamBranch["Nhánh Streaming / Real-time"]
+        DualPathways -->|"return_sequence = True"| FCSeq["FC Head trực tiếp trên từng frame:<br/>Dropout(0.35) -> Linear(192, 2)"]
+        FCSeq --> OutSeq["Logits chuỗi: [Batch, Time, 2]"]
+    end
+
+    subgraph ClipBranch["Nhánh Huấn luyện Clip-level (Phương án A)"]
+        DualPathways -->|"return_sequence = False (Mặc định)"| AttnPoolBlock["4. TemporalAttentionPooling (18,625 params)"]
+        Lens -.-> AttnPoolBlock
+        AttnPoolBlock --> FCClip["5. FC Classifier Head (386 params):<br/>Dropout(0.35) -> Linear(192, 2)"]
+        FCClip --> OutClip["Clip Logits: [Batch, 2]"]
+        FCClip --> OutAttn["Attention Weights: [Batch, Time]"]
+    end
+
+==================================================
+
+=== Diagram 3 ===
+flowchart LR
+    P3["p3 (64-d)"] --> L1["Linear(64, 256)"] --> LN1["LayerNorm"] --> R1["ReLU"] --> V3["v3 (256-d)"]
+    P4["p4 (128-d)"] --> L2["Linear(128, 256)"] --> LN2["LayerNorm"] --> R2["ReLU"] --> V4["v4 (256-d)"]
+    P5["p5 (256-d)"] --> L3["Linear(256, 256)"] --> LN3["LayerNorm"] --> R3["ReLU"] --> V5["v5 (256-d)"]
+
+    V3 & V4 & V5 --> Cat["Concat [B, T, 768]"]
+    Cat --> MLP1["Linear(768, 256) + ReLU"]
+    MLP1 --> MLP2["Linear(256, 3)"]
+    MLP2 --> Smax["Softmax -> alpha_3, alpha_4, alpha_5"]
+
+    V3 & V4 & V5 & Smax --> WeightedSum["alpha_3*v3 + alpha_4*v4 + alpha_5*v5"]
+    WeightedSum --> Drop["Dropout(0.25)"] --> Out["Fused [B, T, 256]"]
+
+==================================================
+
+=== Diagram 4 ===
+flowchart TD
+    GRUIn["gru_out: [B, T, 192]"] --> Dense1["Linear(192, 96)"]
+    Dense1 --> TanhAct["Tanh Activation"]
+    TanhAct --> Dense2["Linear(96, 1)"]
+    Dense2 --> RawScores["Raw Attention Scores: [B, T]"]
+
+    SeqLens["seq_lens: [B]"] --> MaskGen["Tạo Mask: t < seq_len"]
+    RawScores & MaskGen --> MaskFill["scores.masked_fill(~mask, -1e9)"]
+    MaskFill --> SoftmaxOp["Softmax(dim=-1)"]
+    SoftmaxOp --> AttnWeights["Trọng số Attention chuẩn hóa: [B, 1, T]<br/>(Padding frames = 0.000000)"]
+
+    AttnWeights & GRUIn --> BMM["Batch Matrix Multiplication (torch.bmm)"]
+    BMM --> Squeeze["Squeeze(1)"]
+    Squeeze --> PooledVector["pooled: [Batch, 192] (Đại diện toàn clip)"]
+
+==================================================
+
+=== Diagram 5 ===
+flowchart TD
+    subgraph SlidingWindow["Phương án 1: Cửa sổ trượt (Sliding Window Clip - Khuyến nghị)"]
+        Cam1["Camera 4 FPS"] --> Buffer["Bộ đệm tròn FIFO: Lưu 40 khung hình gần nhất (~10s)"]
+        Buffer --> InferClip["Chạy mô hình Clip-level: return_sequence = False"]
+        InferClip --> Prob1["Xác suất P(Drowsy) = Softmax(logits)[1]"]
+        Prob1 --> ThreshCheck1{"P(Drowsy) >= th_safe (0.38)?"}
+        ThreshCheck1 -->|"Có"| Alert1["Kích hoạt Cảnh báo Buồn ngủ"]
+        ThreshCheck1 -->|"Không"| Normal1["Trạng thái Bình thường"]
+    end
+
+    subgraph StateStreaming["Phương án 2: Duy trì Trạng thái Ẩn liên tục (Hidden State Passing)"]
+        Cam2["Camera 4 FPS"] --> FrameExt["Trích xuất đặc trưng từng frame [1, 1, 64/128/256]"]
+        FrameExt --> StepInfer["Chạy frame-by-frame: model(features, h_0=h_prev, return_sequence=True)"]
+        StepInfer --> UpdateH["Cập nhật h_prev = h_new"]
+        StepInfer --> SmoothFilter["Bộ lọc trung bình trượt thời gian (Temporal Smoothing 3-5 frames)"]
+        SmoothFilter --> ThreshCheck2{"P_smooth >= th_safe?"}
+        ThreshCheck2 -->|"Có"| Alert2["Kích hoạt Cảnh báo Buồn ngủ"]
+        ThreshCheck2 -->|"Không"| Normal2["Trạng thái Bình thường"]
+    end
+
+==================================================
+

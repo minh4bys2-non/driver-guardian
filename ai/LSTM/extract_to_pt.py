@@ -1,77 +1,101 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 r"""
-File: extract_to_pt.py
+Tệp: extract_to_pt.py
 Mục đích:
-    Triển khai GIAI ĐOẠN 1 của Kế hoạch tối ưu hóa huấn luyện:
-    1. Quét toàn bộ video từ tập dữ liệu (hỗ trợ .mp4, .avi, .mkv, .mov,...).
-    2. Phân chia Train/Validation theo đối tượng (Subject-Independent Split, seed=42)
-       để đảm bảo không rò rỉ dữ liệu khuôn mặt giữa Train và Val (No Data Leakage).
-    3. Lấy mẫu khung hình theo chu kỳ thời gian thực cố định t (sample_interval = 0.5s)
-       đồng bộ 100% với MyLSTMDataset trong dataset.py.
-    4. Trích xuất đặc trưng không gian (p3: 64, p4: 128, p5: 256) qua mô hình ONNX ('backbone_neck.onnx')
-       kết hợp Adaptive Average Pooling (1, 1) và CUDA I/O Binding Zero-Copy.
-    5. Hỗ trợ cơ chế Resume / Cache thông minh theo từng video.
-    6. Đóng gói kết quả:
-       - Nếu seq_len is None (Mặc định): Đóng gói theo CÁCH 1 (List[torch.Tensor]) kèm
-         mảng seq_lens và cờ is_variable_len=True, bảo toàn 100% độ dài tự nhiên.
-       - Nếu seq_len is not None: Pad/clip về độ dài cố định và đóng gói Tensor 3D qua torch.stack.
+    Trích xuất đặc trưng không gian đa tỉ lệ từ bộ dữ liệu video (chuẩn struct_dataset.md)
+    thông qua mô hình ONNX PAFPN (checkpoints/backbone_neck.onnx), lưu trữ lũy tiến vào
+    1 tệp HDF5 (.h5) duy nhất có tích hợp nén và chunking theo khung hình.
+
+Đặc tính cốt lõi:
+    1. Không qua Spatial Pooling: Bảo toàn nguyên vẹn 3 tensor đặc trưng 4D:
+       - p3: [T, 64, 80, 80]
+       - p4: [T, 128, 40, 40]
+       - p5: [T, 256, 20, 20]
+    2. Lưu trữ HDF5 (.h5) có nén: Ghi theo cơ chế Append ("a"), chunking (1, C, H, W)
+       tối ưu cho PyTorch DataLoader lát cắt theo thời gian, thuật toán nén LZF hoặc GZIP.
+    3. Tùy chỉnh tốc độ lấy mẫu: sample_interval (mặc định 0.1s ~ 10 FPS).
+    4. Tăng cường dữ liệu: Tích hợp DetectionAugmenter từ src.augment với tính nhất quán
+       thời gian (chung 1 random seed cho toàn bộ khung hình trong 1 video), áp dụng cho tập train.
+    5. Cơ chế Resume & Chống chịu lỗi: Tự động bỏ qua các video đã hoàn thành thành công,
+       tự động xóa và trích xuất lại các nhóm bị ngắt dở dang.
+    6. Truy vết chi tiết: Ghi nhận thời gian thực vào file CSV theo dõi.
+    7. Hiển thị tiến độ: Thanh tiến trình đa tầng trực quan qua tqdm.
 """
 
 import os
 import sys
 import time
 import json
+import csv
 import random
 import math
 import argparse
 import hashlib
+import gc
 from pathlib import Path
-from typing import List, Tuple, Optional, Dict, Any, Union
+from dataclasses import dataclass
+from typing import List, Tuple, Optional, Dict, Any, Union, Set
 
-# Đảm bảo console Windows hỗ trợ in UTF-8 không bị lỗi charmap
+# Đảm bảo console Windows hỗ trợ in tiếng Việt UTF-8 không bị lỗi charmap
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
-import torch
-import torch.nn.functional as F
-import numpy as np
+# Thêm thư mục gốc vào sys.path để import an toàn
+ROOT_DIR = Path(__file__).resolve().parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+# Ngăn chặn xung đột OpenMP runtime và tối ưu hóa cấp phát CUDA
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+os.environ["ORT_LOG_LEVEL"] = "3"
+
 import cv2
+import numpy as np
+import h5py
 from tqdm import tqdm
 
-from config import TrainConfig
-from augment import DetectionAugmenter, config as DEFAULT_AUG_CONFIG
+import torch
 
 # Nạp thư viện CUDA DLL từ PyTorch nếu chạy trên môi trường Windows
 torch_lib_path = os.path.join(os.path.dirname(torch.__file__), "lib")
 if os.path.exists(torch_lib_path) and hasattr(os, "add_dll_directory"):
     try:
         os.add_dll_directory(torch_lib_path)
-    except Exception as e:
-        print(f"[WARN] Không thể thêm torch DLL directory: {e}")
+    except Exception:
+        pass
 
 try:
     import onnxruntime as ort
-except ImportError as e:
-    raise ImportError("Vui lòng cài đặt onnxruntime-gpu: pip install onnxruntime-gpu") from e
+except ImportError as exc:
+    raise ImportError("Vui lòng cài đặt onnxruntime-gpu: pip install onnxruntime-gpu") from exc
 
-# Giá trị mặc định liên kết từ cấu hình tập trung TrainConfig
-DEFAULT_DATA_DIR = TrainConfig.dataset_dir
-DEFAULT_SEQ_LEN = getattr(TrainConfig, "seq_len", None)  # Mặc định là None!
-DEFAULT_SAMPLE_INTERVAL = getattr(TrainConfig, "sample_interval", 0.5)
-DEFAULT_IMAGE_SIZE = TrainConfig.image_size[0] if isinstance(TrainConfig.image_size, (tuple, list)) else TrainConfig.image_size
-DEFAULT_VIDEO_EXTS = ",".join(TrainConfig.video_exts) if isinstance(TrainConfig.video_exts, (tuple, list)) else str(TrainConfig.video_exts)
-DEFAULT_SPLIT_BY_SUBJECT = getattr(TrainConfig, "split_by_subject", True)
-DEFAULT_TRAIN_RATIO = TrainConfig.train_ratio
+from src.augment import DetectionAugmenter, config as DEFAULT_AUG_CONFIG
 
 
 # ==============================================================================
-# 1. TIỀN XỬ LÝ ẢNH & RUNTIME ONNX VỚI CUDA ZERO-COPY
+# 1. CẤU TRÚC DỮ LIỆU ĐẠI DIỆN VIDEO (DATA STRUCTURES)
 # ==============================================================================
-def letterbox(image: np.ndarray, new_size: int = 640, color=(114, 114, 114)) -> np.ndarray:
-    """Resize ảnh giữ nguyên tỉ lệ (aspect ratio) với padding đồng màu (mặc định 640x640)."""
+@dataclass
+class VideoClipItem:
+    """Đại diện cho một video clip trong bộ dữ liệu."""
+    path: Path
+    split: str          # "train" hoặc "val"
+    label: int          # 0 (alert) hoặc 1 (drowsy)
+    label_name: str     # "0_alert" hoặc "1_drowsy"
+    clip_name: str      # Tên tệp (vd: sust_n_1.mp4)
+    video_id: str       # Khóa định danh (vd: train_0_alert_sust_n_1)
+    source_dataset: str # Nguồn dataset (sust, uta-rldd, vbddd, unknown)
+    subject_id: Optional[str] = None
+
+
+# ==============================================================================
+# 2. TIỀN XỬ LÝ ẢNH & LẤY MẪU KHUNG HÌNH (VIDEO SAMPLING)
+# ==============================================================================
+def letterbox(image: np.ndarray, new_size: int = 640, color: Tuple[int, int, int] = (114, 114, 114)) -> np.ndarray:
+    """Resize ảnh giữ nguyên tỉ lệ (aspect ratio) với padding đồng màu (chuẩn 640x640)."""
     h, w = image.shape[:2]
     scale = min(new_size / h, new_size / w)
     new_w = max(1, int(round(w * scale)))
@@ -85,895 +109,902 @@ def letterbox(image: np.ndarray, new_size: int = 640, color=(114, 114, 114)) -> 
     return canvas
 
 
-class CloneONNXCUDARuntime:
-    """Quản lý suy luận ONNX Runtime trên GPU CUDA với I/O Binding (hỗ trợ CPU fallback)."""
+class VideoSampler:
+    """Đọc video và lấy mẫu khung hình theo chu kỳ thời gian (sample_interval)."""
 
-    def __init__(self, onnx_model_path: str, device_id: int = 0):
-        self.onnx_model_path = str(onnx_model_path)
+    @staticmethod
+    def sample_frames(
+        video_path: Union[str, Path],
+        sample_interval: float = 0.1,
+        img_size: int = 640
+    ) -> Tuple[List[np.ndarray], float, float]:
+        """
+        Đọc và lấy mẫu các khung hình trong video.
+
+        Args:
+            video_path: Đường dẫn tệp video.
+            sample_interval: Khoảng cách thời gian (giây) giữa 2 frame lấy mẫu.
+            img_size: Kích thước cạnh ảnh sau letterbox (mặc định 640).
+
+        Returns:
+            frames_rgb: Danh sách các ảnh RGB numpy uint8 [img_size, img_size, 3].
+            fps: FPS gốc của video.
+            duration_s: Thời lượng video tính bằng giây.
+        """
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            raise RuntimeError(f"Không thể mở video qua OpenCV: {video_path}")
+
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        if not fps or fps <= 0 or math.isnan(fps):
+            fps = 30.0
+
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        duration_s = total_frames / fps if fps > 0 else 0.0
+
+        step = max(1, int(round(fps * sample_interval)))
+        frames_rgb: List[np.ndarray] = []
+        frame_idx = 0
+
+        while True:
+            ret, frame_bgr = cap.read()
+            if not ret or frame_bgr is None:
+                break
+
+            if frame_idx % step == 0:
+                frame_lb = letterbox(frame_bgr, new_size=img_size)
+                frame_rgb = cv2.cvtColor(frame_lb, cv2.COLOR_BGR2RGB)
+                frames_rgb.append(frame_rgb)
+
+            frame_idx += 1
+
+        cap.release()
+        return frames_rgb, float(fps), float(duration_s)
+
+
+# ==============================================================================
+# 3. ĐỘNG CƠ SUY LUẬN ONNX (STREAMING MINI-CHUNK FEATURE EXTRACTOR)
+# ==============================================================================
+class ONNXFeatureExtractor:
+    """Quản lý suy luận mô hình ONNX Backbone+Neck trên GPU CUDA / CPU theo mini-chunk."""
+
+    def __init__(self, model_path: Union[str, Path], device_id: int = 0):
+        self.model_path = str(model_path)
         self.device_id = device_id
 
-        if not os.path.exists(self.onnx_model_path):
-            raise FileNotFoundError(f"Không tìm thấy file ONNX: {self.onnx_model_path}")
+        if not os.path.exists(self.model_path):
+            raise FileNotFoundError(f"Không tìm thấy file trọng số ONNX: {self.model_path}")
 
-        self.session_options = ort.SessionOptions()
-        self.session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        self.session_options.log_severity_level = 3
+        sess_options = ort.SessionOptions()
+        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        sess_options.log_severity_level = 3
 
-        cuda_options = {
-            "device_id": self.device_id,
-            "arena_extend_strategy": "kNextPowerOfTwo",
-            "cudnn_conv_algo_search": "HEURISTIC",
-            "do_copy_in_default_stream": True,
-        }
-        providers = [
-            ("CUDAExecutionProvider", cuda_options),
-            "CPUExecutionProvider"
-        ]
+        available_providers = ort.get_available_providers()
+        if "CUDAExecutionProvider" in available_providers:
+            cuda_options = {
+                "device_id": self.device_id,
+                "arena_extend_strategy": "kNextPowerOfTwo",
+                "cudnn_conv_algo_search": "HEURISTIC",
+                "do_copy_in_default_stream": True,
+            }
+            providers = [("CUDAExecutionProvider", cuda_options), "CPUExecutionProvider"]
+            self.device_type = f"cuda:{self.device_id}"
+        else:
+            providers = ["CPUExecutionProvider"]
+            self.device_type = "cpu"
 
-        print(f"[+] Khởi tạo ONNX Runtime InferenceSession trên CUDA:{self.device_id}...")
-        self.session = ort.InferenceSession(
-            self.onnx_model_path,
-            sess_options=self.session_options,
-            providers=providers,
-        )
+        self.session = ort.InferenceSession(self.model_path, sess_options=sess_options, providers=providers)
+        self.active_providers = self.session.get_providers()
 
-        active = self.session.get_providers()
-        print(f"[+] Active Providers: {active}")
-        self.use_cuda = "CUDAExecutionProvider" in active
-        if not self.use_cuda:
-            print(f"[WARN] CUDAExecutionProvider không khả dụng. Fallback sang CPUExecutionProvider.")
-
-        input_meta = self.session.get_inputs()[0]
-        self.input_name = input_meta.name
-        self.expected_h = input_meta.shape[2] if len(input_meta.shape) > 2 and isinstance(input_meta.shape[2], int) else None
-        self.expected_w = input_meta.shape[3] if len(input_meta.shape) > 3 and isinstance(input_meta.shape[3], int) else None
+        # Đọc thông tin I/O
+        self.input_name = self.session.get_inputs()[0].name
         self.output_names = [o.name for o in self.session.get_outputs()]
 
-    def forward(self, input_tensor: torch.Tensor) -> List[torch.Tensor]:
-        """Suy luận trực tiếp: Zero-copy CUDA I/O Binding nếu có CUDA, hoặc session.run thông thường nếu CPU."""
-        if self.use_cuda:
-            if not input_tensor.is_cuda:
-                input_tensor = input_tensor.to(f"cuda:{self.device_id}", non_blocking=True)
-            if not input_tensor.is_contiguous():
-                input_tensor = input_tensor.contiguous()
+        # Xác định index vị trí cho p3, p4, p5
+        self.idx_p3 = self.output_names.index("p3") if "p3" in self.output_names else 0
+        self.idx_p4 = self.output_names.index("p4") if "p4" in self.output_names else 1
+        self.idx_p5 = self.output_names.index("p5") if "p5" in self.output_names else 2
 
-            io_binding = self.session.io_binding()
-            io_binding.bind_input(
-                name=self.input_name,
-                device_type="cuda",
-                device_id=self.device_id,
-                element_type=np.float32,
-                shape=tuple(input_tensor.shape),
-                buffer_ptr=input_tensor.data_ptr(),
-            )
-            for out_name in self.output_names:
-                io_binding.bind_output(out_name, device_type="cuda", device_id=self.device_id)
-
-            self.session.run_with_iobinding(io_binding)
-            raw_outputs = io_binding.get_outputs()
-            return [torch.from_dlpack(out) for out in raw_outputs]
-        else:
-            np_in = input_tensor.detach().cpu().numpy()
-            if not np_in.flags.c_contiguous:
-                np_in = np.ascontiguousarray(np_in)
-            outs = self.session.run(self.output_names, {self.input_name: np_in})
-            return [torch.from_numpy(out) for out in outs]
-
-
-# ==============================================================================
-# 2. HÀM ĐỌC VIDEO & TRÍCH XUẤT ĐẶC TRƯNG MỖI VIDEO
-# ==============================================================================
-def extract_video_metadata(video_path: Path) -> Tuple[int, str]:
-    """
-    Trích xuất nhãn (0: driving, 1: drowsiness) và định danh đối tượng (subject) từ tên file video.
-    Đồng bộ 100% quy tắc tách nhãn với MyLSTMDataset trong dataset.py.
-    """
-    stem = video_path.stem
-    name_lower = stem.lower()
-    parts = stem.split("-")
-
-    label = None
-    if len(parts) >= 2:
-        penultimate = parts[-2].lower()
-        if penultimate in ("driving", "alert", "normal"):
-            label = 0
-        elif penultimate in ("drowsiness", "drowsy"):
-            label = 1
-
-    if label is None:
-        if "drowsiness" in name_lower or "drowsy" in name_lower or stem.startswith("d_") or stem == "d":
-            label = 1
-        elif "driving" in name_lower or "alert" in name_lower or "normal" in name_lower or stem.startswith("n_") or stem == "n":
-            label = 0
-
-    if label is None:
-        raise ValueError(f"Không thể xác định nhãn từ tên file video: {video_path.name}")
-
-    # Xác định subject người tham gia để chia Subject-Independent Split
-    if len(parts) >= 4:
-        if parts[0].lower() == "sust":
-            subject = parts[1]  # ví dụ 'sust-d_1-drowsiness-1' -> 'd_1'
-        else:
-            subject = parts[0]  # ví dụ 'subject0-littleBright-driving-1' -> 'subject0'
-    elif len(parts) >= 2:
-        subject = parts[0]
-    else:
-        subject = stem
-
-    return label, subject
-
-
-def read_and_sample_video_frames(
-        video_path: Path,
-        seq_len: Optional[int] = None,
-        sample_interval: float = 0.5,
-        img_size: int = 640
-) -> Tuple[List[np.ndarray], int]:
-    """
-    Đọc nhanh video tuần tự, letterbox sang kích thước cố định và định dạng RGB (uint8).
-    Đồng bộ 100% với logic lấy mẫu thời gian của MyLSTMDataset trong dataset.py:
-    - Cứ mỗi khoảng thời gian sample_interval (mặc định 0.5s) lấy 1 khung hình qua frame_step = sample_interval * fps.
-    - Nếu seq_len is None: Lấy toàn bộ các khung hình thực tế của video theo chu kỳ t (không padding).
-    - Nếu seq_len is not None: Pad lặp lại khung hình cuối cùng hoặc cắt ngắn về đúng seq_len.
-
-    Returns:
-        frames_rgb: Danh sách ảnh numpy RGB uint8 [img_size, img_size, 3]
-        actual_frame_count: Số khung hình thực tế trích xuất được từ video trước khi padding
-    """
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        raise RuntimeError(f"Không thể mở video: {video_path}")
-
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    fps = float(cap.get(cv2.CAP_PROP_FPS))
-    if fps <= 0 or math.isnan(fps) or math.isinf(fps):
-        fps = 30.0  # Mặc định 30 FPS nếu header không chứa thông tin hợp lệ
-
-    frame_step = max(sample_interval * fps, 1.0)
-    frames = []
-
-    if total_frames <= 0:
-        # Fallback đọc tuần tự nếu header không ghi tổng số frame
-        raw_frames = []
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            raw_frames.append(frame)
-        cap.release()
-
-        n_raw = len(raw_frames)
-        if n_raw == 0:
-            raise ValueError(f"Video không chứa khung hình nào: {video_path}")
-
-        indices = []
-        k = 0
-        while True:
-            idx = int(round(k * frame_step))
-            if idx >= n_raw:
-                break
-            indices.append(idx)
-            k += 1
-            if seq_len is not None and len(indices) >= seq_len:
-                break
-
-        for idx in indices:
-            rgb = cv2.cvtColor(raw_frames[idx], cv2.COLOR_BGR2RGB)
-            lb = letterbox(rgb, new_size=img_size)
-            frames.append(lb)
-    else:
-        indices = []
-        k = 0
-        while True:
-            idx = int(round(k * frame_step))
-            if idx >= total_frames:
-                break
-            indices.append(idx)
-            k += 1
-            if seq_len is not None and len(indices) >= seq_len:
-                break
-
-        for idx in indices:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-            ret, frame = cap.read()
-            if ret:
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                lb = letterbox(rgb, new_size=img_size)
-                frames.append(lb)
-            else:
-                blank = np.zeros((img_size, img_size, 3), dtype=np.uint8)
-                frames.append(blank)
-        cap.release()
-
-    actual_frames = len(frames)
-    if actual_frames == 0:
-        actual_frames = 1
-        frames = [np.zeros((img_size, img_size, 3), dtype=np.uint8)]
-
-    # Chỉ thực hiện padding nếu seq_len được chỉ định cụ thể
-    if seq_len is not None:
-        while len(frames) < seq_len:
-            frames.append(frames[-1].copy())
-        frames = frames[:seq_len]
-
-    return frames, actual_frames
-
-
-def forward_video_chunks(
+    def extract_chunks(
+        self,
         frames_rgb: List[np.ndarray],
-        runner: CloneONNXCUDARuntime,
-        chunk_size: int = 24,
-        device: str = "cuda:0"
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Forward danh sách khung hình RGB qua mô hình ONNX theo từng mini-chunk
-    kết hợp Adaptive Average Pooling (1, 1). Hỗ trợ độ dài chuỗi linh hoạt bất kỳ.
+        chunk_size: int = 16,
+        use_fp16: bool = True,
+        show_inner_progress: bool = False
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Trích xuất đặc trưng nguyên bản p3, p4, p5 theo từng mini-chunk chống tràn VRAM.
 
-    Returns:
-        p3_tensor: [T, 64] on CPU
-        p4_tensor: [T, 128] on CPU
-        p5_tensor: [T, 256] on CPU
-    """
-    seq_len = len(frames_rgb)
-    tensor_list = [
-        torch.from_numpy(np.ascontiguousarray(f.transpose(2, 0, 1))).float() / 255.0
-        for f in frames_rgb
-    ]
-    video_tensor = torch.stack(tensor_list, dim=0)  # [T, 3, H, W]
+        Returns:
+            p3: np.ndarray [T, 64, 80, 80]
+            p4: np.ndarray [T, 128, 40, 40]
+            p5: np.ndarray [T, 256, 20, 20]
+        """
+        T = len(frames_rgb)
+        dtype = np.float16 if use_fp16 else np.float32
 
-    # Ánh xạ index theo tên output thực tế ('p3', 'p4', 'p5')
-    name_to_idx = {name: i for i, name in enumerate(runner.output_names)}
-    idx_p3 = name_to_idx.get("p3", 0)
-    idx_p4 = name_to_idx.get("p4", 1)
-    idx_p5 = name_to_idx.get("p5", 2)
+        if T == 0:
+            return (
+                np.empty((0, 64, 80, 80), dtype=dtype),
+                np.empty((0, 128, 40, 40), dtype=dtype),
+                np.empty((0, 256, 20, 20), dtype=dtype)
+            )
 
-    target_device = device if (runner.use_cuda and torch.cuda.is_available()) else "cpu"
+        p3_chunks: List[np.ndarray] = []
+        p4_chunks: List[np.ndarray] = []
+        p5_chunks: List[np.ndarray] = []
 
-    # Forward theo mini-chunks để tiết kiệm VRAM và tăng tốc
-    p3_chunks, p4_chunks, p5_chunks = [], [], []
-    for i in range(0, seq_len, chunk_size):
-        chunk = video_tensor[i: i + chunk_size].to(target_device, non_blocking=True)
-        outs = runner.forward(chunk)
-        # outs: p3=[B, 64, 80, 80], p4=[B, 128, 40, 40], p5=[B, 256, 20, 20]
-        p3_chunks.append(F.adaptive_avg_pool2d(outs[idx_p3], (1, 1)).flatten(1).cpu())
-        p4_chunks.append(F.adaptive_avg_pool2d(outs[idx_p4], (1, 1)).flatten(1).cpu())
-        p5_chunks.append(F.adaptive_avg_pool2d(outs[idx_p5], (1, 1)).flatten(1).cpu())
+        chunk_range = range(0, T, chunk_size)
+        if show_inner_progress and T > chunk_size:
+            chunk_range = tqdm(
+                chunk_range,
+                desc="    -> Forwarding Chunks",
+                leave=False,
+                unit="chunk",
+                dynamic_ncols=True
+            )
 
-    p3_tensor = torch.cat(p3_chunks, dim=0)  # [T, 64]
-    p4_tensor = torch.cat(p4_chunks, dim=0)  # [T, 128]
-    p5_tensor = torch.cat(p5_chunks, dim=0)  # [T, 256]
-    return p3_tensor, p4_tensor, p5_tensor
+        for i in chunk_range:
+            batch_slice = frames_rgb[i : i + chunk_size]
+            # Stack ảnh [B, H, W, 3] -> transpose sang [B, 3, H, W]
+            batch_np = np.stack(batch_slice, axis=0).transpose(0, 3, 1, 2)
+            batch_np = np.ascontiguousarray(batch_np, dtype=np.float32) / 255.0
 
+            outputs = self.session.run(self.output_names, {self.input_name: batch_np})
 
-def extract_single_video_features(
-        video_path: Path,
-        runner: CloneONNXCUDARuntime,
-        seq_len: Optional[int] = None,
-        sample_interval: float = 0.5,
-        img_size: int = 640,
-        chunk_size: int = 24,
-        device: str = "cuda:0",
-        augmenter: Optional[DetectionAugmenter] = None,
-        aug_seed: Optional[int] = None
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-    """
-    Đọc nhanh video tuần tự theo sample_interval, letterbox, tùy chọn áp dụng tăng cường dữ liệu,
-    forward ONNX theo chunk và pool về 1D.
+            p3_chunk = outputs[self.idx_p3]
+            p4_chunk = outputs[self.idx_p4]
+            p5_chunk = outputs[self.idx_p5]
 
-    Returns:
-        p3_tensor: [T, 64] on CPU
-        p4_tensor: [T, 128] on CPU
-        p5_tensor: [T, 256] on CPU
-        actual_frame_count: số khung hình thực tế trong video
-    """
-    frames_rgb, actual_frames = read_and_sample_video_frames(
-        video_path=video_path,
-        seq_len=seq_len,
-        sample_interval=sample_interval,
-        img_size=img_size
-    )
+            if use_fp16:
+                p3_chunk = p3_chunk.astype(np.float16)
+                p4_chunk = p4_chunk.astype(np.float16)
+                p5_chunk = p5_chunk.astype(np.float16)
 
-    if augmenter is not None:
-        frames_rgb, _, _, _ = augmenter.augment_video(
-            frames=frames_rgb,
-            boxes_list=None,
-            labels_list=None,
-            seed=aug_seed
-        )
+            p3_chunks.append(p3_chunk)
+            p4_chunks.append(p4_chunk)
+            p5_chunks.append(p5_chunk)
 
-    p3_tensor, p4_tensor, p5_tensor = forward_video_chunks(
-        frames_rgb=frames_rgb,
-        runner=runner,
-        chunk_size=chunk_size,
-        device=device
-    )
+            del batch_np, outputs
 
-    return p3_tensor, p4_tensor, p5_tensor, actual_frames
+        p3_full = np.concatenate(p3_chunks, axis=0)
+        p4_full = np.concatenate(p4_chunks, axis=0)
+        p5_full = np.concatenate(p5_chunks, axis=0)
+        return p3_full, p4_full, p5_full
 
 
 # ==============================================================================
-# 3. QUẢN LÝ PHÂN CHIA DATASET (SUBJECT-INDEPENDENT & STRATIFIED)
+# 4. QUẢN LÝ LƯU TRỮ HDF5 (HDF5 PERSISTENCE & CHUNKING)
 # ==============================================================================
-def prepare_dataset_split(
-        dataset_dir: Path,
-        split_json_path: Path,
-        train_ratio: float = 0.8,
-        split_by_subject: bool = True,
-        seed: int = 42,
-        video_exts: Tuple[str, ...] = (".mp4", ".avi", ".mkv", ".mov")
-) -> Tuple[List[Tuple[Path, int]], List[Tuple[Path, int]]]:
+class HDF5StorageManager:
+    """Quản lý tệp HDF5 ghi lũy tiến (append mode), chunking theo frame và nén dữ liệu."""
+
+    def __init__(self, h5_path: Union[str, Path], compression: str = "lzf", use_fp16: bool = True):
+        self.h5_path = Path(h5_path)
+        self.h5_path.parent.mkdir(parents=True, exist_ok=True)
+        self.compression = compression
+        self.use_fp16 = use_fp16
+
+        # Mở ở chế độ append ("a")
+        self.h5_file = h5py.File(str(self.h5_path), "a")
+
+    def is_video_completed(self, split: str, label_name: str, video_id: str) -> bool:
+        """Kiểm tra video đã được ghi trọn vẹn và an toàn vào HDF5 hay chưa."""
+        group_path = f"{split}/{label_name}/{video_id}"
+        if group_path in self.h5_file:
+            grp = self.h5_file[group_path]
+            is_comp = grp.attrs.get("is_completed", False)
+            if is_comp and ("p3" in grp) and ("p4" in grp) and ("p5" in grp):
+                return True
+        return False
+
+    def save_video_features(
+        self,
+        split: str,
+        label_name: str,
+        video_id: str,
+        p3: np.ndarray,
+        p4: np.ndarray,
+        p5: np.ndarray,
+        attrs: Dict[str, Any]
+    ) -> str:
+        """
+        Lưu 3 tensor đặc trưng p3, p4, p5 vào nhóm /{split}/{label_name}/{video_id}.
+
+        Chunking (1, C, H, W) cho phép đọc từng frame độc lập cực nhanh khi train PyTorch.
+        """
+        group_path = f"{split}/{label_name}/{video_id}"
+
+        # Nếu nhóm đã tồn tại dở dang do sự cố trước đó, xóa sạch để ghi lại
+        if group_path in self.h5_file:
+            del self.h5_file[group_path]
+
+        grp = self.h5_file.create_group(group_path)
+        T = p3.shape[0]
+
+        # Cấu hình chunking theo từng frame
+        chunk_p3 = (1, 64, 80, 80) if T > 0 else None
+        chunk_p4 = (1, 128, 40, 40) if T > 0 else None
+        chunk_p5 = (1, 256, 20, 20) if T > 0 else None
+
+        comp_kwargs: Dict[str, Any] = {"compression": self.compression}
+        if self.compression == "gzip":
+            comp_kwargs["compression_opts"] = 4
+
+        grp.create_dataset("p3", data=p3, chunks=chunk_p3, **comp_kwargs)
+        grp.create_dataset("p4", data=p4, chunks=chunk_p4, **comp_kwargs)
+        grp.create_dataset("p5", data=p5, chunks=chunk_p5, **comp_kwargs)
+
+        # Ghi các thuộc tính metadata
+        for k, v in attrs.items():
+            if v is not None:
+                grp.attrs[k] = v
+
+        # Đánh dấu hoàn tất nguyên tử (Atomic transaction flag)
+        grp.attrs["is_completed"] = True
+
+        # Đẩy dữ liệu ngay xuống đĩa
+        self.h5_file.flush()
+        return group_path
+
+    def flush(self):
+        """Cam kết toàn bộ buffer xuống tệp đĩa cứng."""
+        if self.h5_file:
+            self.h5_file.flush()
+
+    def close(self):
+        """Đóng tệp HDF5 an toàn."""
+        if self.h5_file:
+            try:
+                self.h5_file.flush()
+                self.h5_file.close()
+            except Exception:
+                pass
+
+
+# ==============================================================================
+# 5. QUẢN LÝ TỆP CSV TRUY VẾT & PHỤC HỒI (MANIFEST CSV TRACKER)
+# ==============================================================================
+CSV_FIELDNAMES = [
+    "video_id", "split", "label", "label_name", "orig_file",
+    "source_dataset", "orig_duration_s", "orig_fps", "sample_interval",
+    "num_frames", "p3_shape", "p4_shape", "p5_shape", "dtype",
+    "compression", "is_augmented", "aug_seed", "h5_group_path",
+    "status", "error_msg", "timestamp"
+]
+
+
+class ManifestCSVTracker:
+    """Quản lý tệp CSV truy vết tiến trình và tra cứu phục hồi (Resume)."""
+
+    def __init__(self, csv_path: Union[str, Path]):
+        self.csv_path = Path(csv_path)
+        self.csv_path.parent.mkdir(parents=True, exist_ok=True)
+        self.completed_video_ids: Set[str] = set()
+
+        # Đọc dữ liệu cũ nếu tệp đã tồn tại
+        if self.csv_path.exists() and self.csv_path.stat().st_size > 0:
+            with open(self.csv_path, mode="r", encoding="utf-8", newline="") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    if row.get("status") == "SUCCESS" and "video_id" in row:
+                        self.completed_video_ids.add(row["video_id"])
+
+        # Mở file ở chế độ append
+        file_exists = self.csv_path.exists() and (self.csv_path.stat().st_size > 0)
+        self._file = open(self.csv_path, mode="a", encoding="utf-8", newline="")
+        self._writer = csv.DictWriter(self._file, fieldnames=CSV_FIELDNAMES)
+
+        if not file_exists:
+            self._writer.writeheader()
+            self._file.flush()
+
+    def is_completed(self, video_id: str) -> bool:
+        """Tra cứu nhanh O(1) trạng thái đã hoàn thành."""
+        return video_id in self.completed_video_ids
+
+    def record_success(
+        self,
+        video_id: str,
+        split: str,
+        label: int,
+        label_name: str,
+        orig_file: str,
+        source_dataset: str,
+        orig_duration_s: float,
+        orig_fps: float,
+        sample_interval: float,
+        num_frames: int,
+        p3_shape: Tuple,
+        p4_shape: Tuple,
+        p5_shape: Tuple,
+        dtype: str,
+        compression: str,
+        is_augmented: bool,
+        aug_seed: int,
+        h5_group_path: str
+    ):
+        """Ghi nhận bản ghi thành công."""
+        row = {
+            "video_id": video_id,
+            "split": split,
+            "label": label,
+            "label_name": label_name,
+            "orig_file": orig_file,
+            "source_dataset": source_dataset,
+            "orig_duration_s": round(orig_duration_s, 2),
+            "orig_fps": round(orig_fps, 2),
+            "sample_interval": sample_interval,
+            "num_frames": num_frames,
+            "p3_shape": str(p3_shape),
+            "p4_shape": str(p4_shape),
+            "p5_shape": str(p5_shape),
+            "dtype": dtype,
+            "compression": compression,
+            "is_augmented": is_augmented,
+            "aug_seed": aug_seed,
+            "h5_group_path": h5_group_path,
+            "status": "SUCCESS",
+            "error_msg": "",
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+        }
+        self._writer.writerow(row)
+        self._file.flush()
+        self.completed_video_ids.add(video_id)
+
+    def record_failure(
+        self,
+        video_id: str,
+        split: str,
+        label: int,
+        label_name: str,
+        orig_file: str,
+        source_dataset: str,
+        error_msg: str
+    ):
+        """Ghi nhận bản ghi thất bại."""
+        row = {
+            "video_id": video_id,
+            "split": split,
+            "label": label,
+            "label_name": label_name,
+            "orig_file": orig_file,
+            "source_dataset": source_dataset,
+            "orig_duration_s": 0.0,
+            "orig_fps": 0.0,
+            "sample_interval": 0.0,
+            "num_frames": 0,
+            "p3_shape": "",
+            "p4_shape": "",
+            "p5_shape": "",
+            "dtype": "",
+            "compression": "",
+            "is_augmented": False,
+            "aug_seed": -1,
+            "h5_group_path": "",
+            "status": "FAILED",
+            "error_msg": str(error_msg),
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+        }
+        self._writer.writerow(row)
+        self._file.flush()
+
+    def close(self):
+        """Đóng file CSV."""
+        if self._file and not self._file.closed:
+            self._file.flush()
+            self._file.close()
+
+
+# ==============================================================================
+# 6. QUÉT VÀ THU THẬP BỘ DỮ LIỆU (DATASET SCANNING)
+# ==============================================================================
+def infer_source_dataset(filename: str) -> str:
+    """Suy đoán nguồn dataset từ tiền tố tên video."""
+    fn_lower = filename.lower()
+    if fn_lower.startswith("sust_"):
+        return "sust"
+    if fn_lower.startswith("uta_") or "rldd" in fn_lower:
+        return "uta-rldd"
+    if fn_lower.startswith("vbddd_"):
+        return "vbddd"
+    return "unknown"
+
+
+def scan_structured_dataset(
+    data_dir: Union[str, Path],
+    video_exts: Tuple[str, ...] = (".mp4", ".avi", ".mkv", ".mov")
+) -> Tuple[List[VideoClipItem], List[VideoClipItem]]:
     """
-    Quét video, phân chia Train/Val theo Subject-Independent Split (mặc định)
-    hoặc Stratified Split ở cấp độ Video ID trước khi trích xuất.
+    Quét trực tiếp cấu trúc cây thư mục:
+        data_dir/train/0_alert/*.mp4, *.avi...
+        data_dir/train/1_drowsy/*.mp4, *.avi...
+        data_dir/val/0_alert/*.mp4, *.avi...
+        data_dir/val/1_drowsy/*.mp4, *.avi...
     """
-    if split_json_path.exists():
-        print(f"[+] Tìm thấy file cấu hình phân chia có sẵn: {split_json_path}")
-        try:
-            with open(split_json_path, "r", encoding="utf-8") as f:
-                split_info = json.load(f)
+    data_dir = Path(data_dir)
+    if not data_dir.exists():
+        raise FileNotFoundError(f"Không tìm thấy thư mục dataset: {data_dir}")
 
-            saved_mode = split_info.get("metadata", {}).get("split_by_subject", None)
-            if saved_mode is None or saved_mode == split_by_subject:
-                train_items = [(dataset_dir / item["name"], item["label"]) for item in split_info.get("train", [])]
-                val_items = [(dataset_dir / item["name"], item["label"]) for item in split_info.get("val", [])]
+    train_items: List[VideoClipItem] = []
+    val_items: List[VideoClipItem] = []
 
-                all_items = train_items + val_items
-                if all_items and all(p.exists() for p, _ in all_items[:10]):
-                    print(f"[+] Đã tải phân chia: Train={len(train_items)} video, Val={len(val_items)} video (SplitBySubject={split_by_subject}).")
-                    return train_items, val_items
-        except Exception as e:
-            print(f"[WARN] Lỗi khi nạp split_json hiện tại ({e}), sẽ phân chia lại.")
+    def _scan_folder(folder_path: Path, split_name: str) -> List[VideoClipItem]:
+        items = []
+        if not folder_path.exists():
+            return items
 
-        print(f"[WARN] Cấu hình phân chia cũ không khớp hoặc file không tồn tại. Đang quét và phân chia lại...")
-
-    if not dataset_dir.exists():
-        fallback_dir = Path(r"D:\Project\AI\dataset\filtered_SUST\in_threshold")
-        if fallback_dir.exists():
-            print(f"[WARN] Thư mục '{dataset_dir}' không tồn tại. Tự động chuyển sang fallback: {fallback_dir}")
-            dataset_dir = fallback_dir
-        else:
-            raise FileNotFoundError(f"Thư mục chứa dataset không tồn tại: {dataset_dir}")
-
-    print(f"[+] Quét toàn bộ video từ thư mục: {dataset_dir}...")
-    normalized_exts = {ext.lower() if ext.startswith(".") else f".{ext.lower()}" for ext in video_exts}
-
-    video_files = [
-        f for f in dataset_dir.iterdir()
-        if f.is_file() and f.suffix.lower() in normalized_exts
-    ]
-    if not video_files:
-        video_files = [
-            f for f in dataset_dir.rglob("*")
-            if f.is_file() and f.suffix.lower() in normalized_exts
+        label_subdirs = [
+            ("0_alert", 0),
+            ("1_drowsy", 1)
         ]
-    video_files = sorted(video_files)
 
-    if not video_files:
-        raise FileNotFoundError(
-            f"Không tìm thấy video nào thuộc các định dạng {sorted(list(normalized_exts))} trong: {dataset_dir}"
-        )
+        for folder_name, label_val in label_subdirs:
+            sub_p = folder_path / folder_name
+            if not sub_p.exists():
+                continue
 
-    items_with_subject = []
-    for vf in video_files:
-        try:
-            lbl, subj = extract_video_metadata(vf)
-            items_with_subject.append((vf, lbl, subj))
-        except Exception:
-            continue
+            for ext in video_exts:
+                for video_file in sub_p.glob(f"*{ext}"):
+                    if not video_file.is_file():
+                        continue
 
-    print(f"[+] Tìm thấy tổng cộng {len(items_with_subject)} video hợp lệ.")
-    if not items_with_subject:
-        raise ValueError(f"Không thể trích xuất nhãn 'driving' hoặc 'drowsiness' từ video trong: {dataset_dir}")
+                    stem = video_file.stem
+                    video_id = f"{split_name}_{folder_name}_{stem}"
+                    source = infer_source_dataset(video_file.name)
 
-    rng = random.Random(seed)
-    train_subjects_list = []
-    val_subjects_list = []
+                    item = VideoClipItem(
+                        path=video_file,
+                        split=split_name,
+                        label=label_val,
+                        label_name=folder_name,
+                        clip_name=video_file.name,
+                        video_id=video_id,
+                        source_dataset=source
+                    )
+                    items.append(item)
 
-    if split_by_subject:
-        print(f"[*] Áp dụng phân chia theo đối tượng người tham gia (Subject-Independent Split)...")
-        subjects_dict = {}
-        for vf, lbl, subj in items_with_subject:
-            subjects_dict.setdefault(subj, []).append((vf, lbl))
+        items.sort(key=lambda x: str(x.path))
+        return items
 
-        # Phân nhóm subjects theo nhãn chủ đạo để cân bằng nhãn tổng thể
-        subj_0, subj_1 = [], []
-        for subj, vlist in subjects_dict.items():
-            n_0 = sum(1 for _, l in vlist if l == 0)
-            n_1 = sum(1 for _, l in vlist if l == 1)
-            if n_1 >= n_0:
-                subj_1.append(subj)
-            else:
-                subj_0.append(subj)
+    train_items = _scan_folder(data_dir / "train", "train")
+    val_items = _scan_folder(data_dir / "val", "val")
 
-        rng.shuffle(subj_0)
-        rng.shuffle(subj_1)
-
-        sp_0 = int(round(len(subj_0) * train_ratio))
-        sp_1 = int(round(len(subj_1) * train_ratio))
-
-        train_subjs = set(subj_0[:sp_0] + subj_1[:sp_1])
-        val_subjs = set(subj_0[sp_0:] + subj_1[sp_1:])
-
-        train_items = []
-        val_items = []
-        for subj, vlist in subjects_dict.items():
-            if subj in train_subjs:
-                train_items.extend(vlist)
-            else:
-                val_items.extend(vlist)
-
-        train_subjects_list = sorted(list(train_subjs))
-        val_subjects_list = sorted(list(val_subjs))
-        print(f"    - Tổng số subjects: {len(subjects_dict)} (Train: {len(train_subjs)}, Val: {len(val_subjs)})")
-    else:
-        print(f"[*] Áp dụng phân chia phân tầng thuần theo video (Stratified Video Split)...")
-        class_0 = [(vf, lbl) for vf, lbl, _ in items_with_subject if lbl == 0]
-        class_1 = [(vf, lbl) for vf, lbl, _ in items_with_subject if lbl == 1]
-
-        rng.shuffle(class_0)
-        rng.shuffle(class_1)
-
-        split_0 = int(round(len(class_0) * train_ratio))
-        split_1 = int(round(len(class_1) * train_ratio))
-
-        train_items = class_0[:split_0] + class_1[:split_1]
-        val_items = class_0[split_0:] + class_1[split_1:]
-
-    rng.shuffle(train_items)
-    rng.shuffle(val_items)
-
-    # Lưu siêu dữ liệu phân bổ
-    split_info = {
-        "metadata": {
-            "dataset_dir": str(dataset_dir),
-            "seed": seed,
-            "train_ratio": train_ratio,
-            "split_by_subject": split_by_subject,
-            "total_videos": len(items_with_subject),
-            "train_count": len(train_items),
-            "val_count": len(val_items),
-            "train_subjects": train_subjects_list,
-            "val_subjects": val_subjects_list,
-            "created_at": time.strftime("%Y-%m-%d %H:%M:%S")
-        },
-        "train": [
-            {"name": p.relative_to(dataset_dir).as_posix() if p.is_relative_to(dataset_dir) else p.name, "label": lbl}
-            for p, lbl in train_items],
-        "val": [
-            {"name": p.relative_to(dataset_dir).as_posix() if p.is_relative_to(dataset_dir) else p.name, "label": lbl}
-            for p, lbl in val_items]
-    }
-
-    split_json_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(split_json_path, "w", encoding="utf-8") as f:
-        json.dump(split_info, f, indent=4, ensure_ascii=False)
-
-    print(f"[+] Đã lưu cấu hình phân bổ độc lập tại: {split_json_path}")
-    print(f"    - Tập Train: {len(train_items)} videos ({len(train_items) / len(items_with_subject) * 100:.1f}%)")
-    print(f"    - Tập Val:   {len(val_items)} videos ({len(val_items) / len(items_with_subject) * 100:.1f}%)")
+    # Nếu không tìm thấy thư mục train/val, thử quét trực tiếp theo nhãn tại root
+    if len(train_items) == 0 and len(val_items) == 0:
+        print("[!] Không tìm thấy thư mục train/val, quét theo nhãn trực tiếp tại thư mục gốc...")
+        direct_items = _scan_folder(data_dir, "train")
+        train_items = direct_items
 
     return train_items, val_items
 
 
 # ==============================================================================
-# 4. QUY TRÌNH TRÍCH XUẤT CHÍNH CHO TỪNG TẬP (HỖ TRỢ CÁCH 1: LIST[TENSOR])
+# 7. ĐIỀU PHỐI TRÍCH XUẤT CHO TỪNG PHÂN TẬP (SPLIT EXTRACTION CONTROLLER)
 # ==============================================================================
-def process_split_set(
-        split_name: str,
-        items: List[Tuple[Path, int]],
-        runner: CloneONNXCUDARuntime,
-        output_pt_path: Path,
-        cache_dir: Path,
-        seq_len: Optional[int] = None,
-        sample_interval: float = 0.5,
-        img_size: int = 640,
-        chunk_size: int = 24,
-        use_fp16: bool = False,
-        augmenter: Optional[DetectionAugmenter] = None,
-        num_aug: int = 0,
-        include_original: bool = True,
-        base_seed: int = 42,
-        force_recompute: bool = False
-) -> None:
+def process_split(
+    split_name: str,
+    items: List[VideoClipItem],
+    extractor: ONNXFeatureExtractor,
+    h5_manager: HDF5StorageManager,
+    tracker: ManifestCSVTracker,
+    sample_interval: float = 0.1,
+    img_size: int = 640,
+    chunk_size: int = 16,
+    use_fp16: bool = True,
+    augmenter: Optional[DetectionAugmenter] = None,
+    num_aug: int = 1,
+    include_original: bool = True,
+    base_seed: int = 42,
+    force_recompute: bool = False,
+    gc_interval: int = 25
+) -> Dict[str, int]:
     """
-    Trích xuất đặc trưng cho một phân tập (Train hoặc Val), hỗ trợ tăng cường dữ liệu và cache từng video.
-    Khi seq_len is None: Đóng gói theo CÁCH 1 (List[torch.Tensor]) bảo toàn độ dài tự nhiên của từng video.
+    Xử lý trích xuất và ghi HDF5 cho toàn bộ video trong 1 phân tập (train hoặc val).
     """
-    is_augmented_split = (augmenter is not None and num_aug > 0)
-    actual_include_original = include_original if is_augmented_split else True
+    stats = {"total": len(items), "processed": 0, "skipped": 0, "failed": 0, "aug_created": 0}
+    if len(items) == 0:
+        print(f"[*] Phân tập [{split_name.upper()}]: Không có video nào để xử lý.")
+        return stats
 
-    print(f"\n{'=' * 75}")
-    print(f"[*] BẮT ĐẦU TRÍCH XUẤT ĐẶC TRƯNG CHO PHÂN TẬP: {split_name.upper()} ({len(items)} VIDEOS)")
-    print(f"[*] Cơ chế lấy mẫu      : t = {sample_interval}s cố định (Đồng bộ MyLSTMDataset)")
-    print(f"[*] Cấu hình seq_len     : {seq_len if seq_len is not None else 'None (Cách 1: List[torch.Tensor] chuỗi động)'}")
-    if is_augmented_split:
-        aug_info = f"BẬT (Số bản augment={num_aug}, Giữ bản gốc={'Có' if actual_include_original else 'Không'})"
-    else:
-        aug_info = "TẮT (Chỉ trích xuất video gốc)"
-    print(f"[*] Tăng cường dữ liệu   : {aug_info}")
-    print(f"{'=' * 75}")
+    dtype_str = "float16" if use_fp16 else "float32"
 
-    split_cache_dir = cache_dir / split_name
-    split_cache_dir.mkdir(parents=True, exist_ok=True)
+    # Khởi tạo thanh tiến trình cấp cao qua tqdm
+    pbar = tqdm(
+        items,
+        desc=f"[{split_name.upper()}] Extraction",
+        unit="video",
+        dynamic_ncols=True
+    )
 
-    p3_all, p4_all, p5_all = [], [], []
-    labels_all, video_ids_all, seq_lens_all = [], [], []
+    for item_idx, item in enumerate(pbar):
+        # Xác định các biến thể cần xử lý cho video này
+        variants: List[Tuple[str, bool, int]] = []
+        # Định dạng: (variant_id, is_aug, seed)
 
-    # Khởi động trước (Warm-up) mô hình
-    print("[+] Khởi động (Warm-up) ONNX Execution Provider...")
-    warmup_device = f"cuda:{runner.device_id}" if (runner.use_cuda and torch.cuda.is_available()) else "cpu"
-    dummy = torch.zeros(chunk_size, 3, img_size, img_size, device=warmup_device)
-    runner.forward(dummy)
-    print("[+] Khởi động hoàn tất!")
+        if split_name == "train" and augmenter is not None:
+            if include_original:
+                variants.append((item.video_id, False, -1))
+            for a_idx in range(1, num_aug + 1):
+                aug_id = f"{item.video_id}_aug{a_idx:02d}"
+                var_seed = (base_seed + abs(hash(item.video_id)) + a_idx) % (2**31 - 1)
+                variants.append((aug_id, True, var_seed))
+        else:
+            variants.append((item.video_id, False, -1))
 
-    start_time = time.time()
-    for idx, (video_path, label) in enumerate(tqdm(items, desc=f"[{split_name.upper()}]")):
-        video_id = video_path.stem
+        # Kiểm tra xem toàn bộ các biến thể của video này đã hoàn thành chưa
+        all_variants_done = True
+        for var_id, _, _ in variants:
+            is_csv_done = tracker.is_completed(var_id)
+            is_h5_done = h5_manager.is_video_completed(item.split, item.label_name, var_id)
+            if force_recompute or not (is_csv_done and is_h5_done):
+                all_variants_done = False
+                break
 
-        # Xác định danh sách các biến thể cần xử lý cho video này
-        targets = []
-        if actual_include_original:
-            targets.append({
-                "sub_id": video_id,
-                "is_aug": False,
-                "aug_idx": 0,
-                "seed": None,
+        if all_variants_done:
+            stats["skipped"] += len(variants)
+            pbar.set_postfix({
+                "video": item.clip_name[:14],
+                "skip": stats["skipped"],
+                "status": "Skipped (Cached)"
             })
+            continue
 
-        if is_augmented_split:
-            for k in range(1, num_aug + 1):
-                aug_id = f"{video_id}_aug{k}"
-                aug_seed = (base_seed + int(hashlib.md5(aug_id.encode("utf-8")).hexdigest()[:8], 16)) % (2 ** 31 - 1)
-                targets.append({
-                    "sub_id": aug_id,
-                    "is_aug": True,
-                    "aug_idx": k,
-                    "seed": aug_seed,
-                })
-
-        # Kiểm tra xem những target nào chưa có trong cache hoặc cache không khớp sample_interval
-        needed_targets = []
-        for t in targets:
-            cache_file = split_cache_dir / f"{t['sub_id']}.pt"
-            if force_recompute or not cache_file.exists():
-                needed_targets.append(t)
-            else:
-                try:
-                    cdata = torch.load(cache_file, map_location="cpu")
-                    c_interval = cdata.get("sample_interval", None)
-                    if c_interval is not None and abs(c_interval - sample_interval) > 1e-4:
-                        needed_targets.append(t)
-                except Exception:
-                    needed_targets.append(t)
-
-        # Nếu cần trích xuất ít nhất một target, chỉ đọc và giải mã video một lần duy nhất
-        if len(needed_targets) > 0:
-            try:
-                raw_frames, actual_frames = read_and_sample_video_frames(
-                    video_path=video_path,
-                    seq_len=seq_len,
-                    sample_interval=sample_interval,
-                    img_size=img_size
+        # 1. Đọc và lấy mẫu video gốc
+        try:
+            raw_frames_rgb, orig_fps, duration_s = VideoSampler.sample_frames(
+                video_path=item.path,
+                sample_interval=sample_interval,
+                img_size=img_size
+            )
+            T = len(raw_frames_rgb)
+        except Exception as e:
+            stats["failed"] += len(variants)
+            for var_id, _, _ in variants:
+                tracker.record_failure(
+                    video_id=var_id,
+                    split=item.split,
+                    label=item.label,
+                    label_name=item.label_name,
+                    orig_file=str(item.path),
+                    source_dataset=item.source_dataset,
+                    error_msg=f"Lỗi đọc video: {e}"
                 )
-            except Exception as e:
-                print(f"\n[ERROR] Lỗi khi đọc video {video_path.name}: {e}")
+            pbar.set_postfix({"video": item.clip_name[:14], "status": f"Read Err: {str(e)[:15]}"})
+            continue
+
+        # 2. Xử lý từng biến thể (Gốc & Augment)
+        for var_id, is_aug, seed in variants:
+            # Kiểm tra riêng từng biến thể
+            if not force_recompute and tracker.is_completed(var_id) and h5_manager.is_video_completed(item.split, item.label_name, var_id):
+                stats["skipped"] += 1
                 continue
 
-            for t in needed_targets:
-                try:
-                    if t["is_aug"]:
-                        aug_frames, _, _, _ = augmenter.augment_video(
-                            frames=raw_frames,
-                            boxes_list=None,
-                            labels_list=None,
-                            seed=t["seed"]
-                        )
-                        p3, p4, p5 = forward_video_chunks(
-                            frames_rgb=aug_frames,
-                            runner=runner,
-                            chunk_size=chunk_size,
-                            device=f"cuda:{runner.device_id}"
-                        )
-                    else:
-                        p3, p4, p5 = forward_video_chunks(
-                            frames_rgb=raw_frames,
-                            runner=runner,
-                            chunk_size=chunk_size,
-                            device=f"cuda:{runner.device_id}"
-                        )
+            try:
+                # Áp dụng Augment nếu là bản sao tăng cường
+                if is_aug and augmenter is not None:
+                    target_frames, _, _, _ = augmenter.augment_video(raw_frames_rgb, seed=seed)
+                else:
+                    target_frames = raw_frames_rgb
 
-                    cache_file = split_cache_dir / f"{t['sub_id']}.pt"
-                    torch.save({
-                        "video_id": t["sub_id"],
-                        "label": label,
-                        "p3": p3,
-                        "p4": p4,
-                        "p5": p5,
-                        "actual_frames": actual_frames,
-                        "sample_interval": sample_interval,
-                        "is_augmented": t["is_aug"],
-                        "aug_seed": t["seed"]
-                    }, cache_file)
-                except Exception as e:
-                    print(f"\n[ERROR] Lỗi khi xử lý mẫu {t['sub_id']}: {e}")
+                # 3. Trích xuất đặc trưng nguyên bản qua ONNX
+                p3, p4, p5 = extractor.extract_chunks(
+                    frames_rgb=target_frames,
+                    chunk_size=chunk_size,
+                    use_fp16=use_fp16,
+                    show_inner_progress=False
+                )
 
-        # Nạp dữ liệu từ cache cho tất cả targets của video này
-        for t in targets:
-            cache_file = split_cache_dir / f"{t['sub_id']}.pt"
-            if cache_file.exists():
-                cached_data = torch.load(cache_file, map_location="cpu")
-                p3_all.append(cached_data["p3"])
-                p4_all.append(cached_data["p4"])
-                p5_all.append(cached_data["p5"])
-                labels_all.append(cached_data["label"])
-                video_ids_all.append(cached_data["video_id"])
-                seq_lens_all.append(cached_data.get("actual_frames", cached_data["p3"].shape[0]))
+                # 4. Ghi trực tiếp vào tệp HDF5
+                attrs = {
+                    "label": item.label,
+                    "label_name": item.label_name,
+                    "seq_len": T,
+                    "sample_interval": sample_interval,
+                    "orig_fps": orig_fps,
+                    "orig_duration_s": duration_s,
+                    "is_augmented": is_aug,
+                    "aug_seed": seed,
+                    "source_dataset": item.source_dataset,
+                    "orig_file": str(item.path),
+                    "created_at": time.strftime("%Y-%m-%d %H:%M:%S")
+                }
 
-    total_duration = time.time() - start_time
-    print(f"\n[+] Hoàn tất trích xuất {len(video_ids_all)} mẫu tập {split_name.upper()} trong {total_duration / 60:.2f} phút!")
+                h5_group_path = h5_manager.save_video_features(
+                    split=item.split,
+                    label_name=item.label_name,
+                    video_id=var_id,
+                    p3=p3,
+                    p4=p4,
+                    p5=p5,
+                    attrs=attrs
+                )
 
-    if len(video_ids_all) == 0:
-        print(f"[WARN] Không có mẫu nào được trích xuất cho phân tập {split_name.upper()}!")
-        return
+                # 5. Ghi nhận thành công vào CSV truy vết
+                tracker.record_success(
+                    video_id=var_id,
+                    split=item.split,
+                    label=item.label,
+                    label_name=item.label_name,
+                    orig_file=str(item.path),
+                    source_dataset=item.source_dataset,
+                    orig_duration_s=duration_s,
+                    orig_fps=orig_fps,
+                    sample_interval=sample_interval,
+                    num_frames=T,
+                    p3_shape=p3.shape,
+                    p4_shape=p4.shape,
+                    p5_shape=p5.shape,
+                    dtype=dtype_str,
+                    compression=h5_manager.compression,
+                    is_augmented=is_aug,
+                    aug_seed=seed,
+                    h5_group_path=h5_group_path
+                )
 
-    # Đóng gói dữ liệu theo Cách 1 (List[torch.Tensor]) nếu seq_len is None
-    print(f"[+] Đang đóng gói Tensor cho tập {split_name}...")
-    final_labels = torch.tensor(labels_all, dtype=torch.long)
-    final_seq_lens = torch.tensor(seq_lens_all, dtype=torch.int32)
+                if is_aug:
+                    stats["aug_created"] += 1
+                stats["processed"] += 1
 
-    if seq_len is None:
-        print(f"    -> Áp dụng CÁCH 1: Lưu trữ List[torch.Tensor] (chuỗi động không padding)...")
-        final_p3 = p3_all  # List[Tensor [T_i, 64]]
-        final_p4 = p4_all  # List[Tensor [T_i, 128]]
-        final_p5 = p5_all  # List[Tensor [T_i, 256]]
-        is_var_len = True
-    else:
-        print(f"    -> Đóng gói Tensor 3D cố định kích thước [{len(p3_all)}, {seq_len}, C]...")
-        final_p3 = torch.stack(p3_all, dim=0)  # [N, seq_len, 64]
-        final_p4 = torch.stack(p4_all, dim=0)  # [N, seq_len, 128]
-        final_p5 = torch.stack(p5_all, dim=0)  # [N, seq_len, 256]
-        is_var_len = False
+                del p3, p4, p5
+                if is_aug:
+                    del target_frames
 
-    if use_fp16:
-        print("[+] Ép kiểu sang float16 để tối ưu 50% dung lượng lưu trữ...")
-        if is_var_len:
-            final_p3 = [t.half() for t in final_p3]
-            final_p4 = [t.half() for t in final_p4]
-            final_p5 = [t.half() for t in final_p5]
-        else:
-            final_p3 = final_p3.half()
-            final_p4 = final_p4.half()
-            final_p5 = final_p5.half()
+            except Exception as e:
+                stats["failed"] += 1
+                tracker.record_failure(
+                    video_id=var_id,
+                    split=item.split,
+                    label=item.label,
+                    label_name=item.label_name,
+                    orig_file=str(item.path),
+                    source_dataset=item.source_dataset,
+                    error_msg=f"Lỗi forward/lưu H5: {e}"
+                )
 
-    num_alerts = (final_labels == 0).sum().item()
-    num_drowsy = (final_labels == 1).sum().item()
-    num_orig = sum(1 for vid in video_ids_all if "_aug" not in vid)
-    num_aug_count = sum(1 for vid in video_ids_all if "_aug" in vid)
+        del raw_frames_rgb
 
-    save_dict = {
-        "p3": final_p3,
-        "p4": final_p4,
-        "p5": final_p5,
-        "labels": final_labels,
-        "video_ids": video_ids_all,
-        "seq_lens": final_seq_lens,
-        "is_variable_len": is_var_len,
-        "sample_interval": sample_interval,
-        "dtype": "float16" if use_fp16 else "float32",
-        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "augmented": is_augmented_split,
-        "num_aug": num_aug if is_augmented_split else 0,
-        "include_original": actual_include_original,
-    }
+        # Cập nhật thông số thời gian thực lên tqdm postfix
+        gpu_mem_str = "N/A"
+        if torch.cuda.is_available():
+            alloc_mb = torch.cuda.memory_allocated() / (1024 ** 2)
+            gpu_mem_str = f"{alloc_mb:.0f}MB"
 
-    output_pt_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(save_dict, str(output_pt_path))
+        pbar.set_postfix({
+            "video": item.clip_name[:14],
+            "frames": T,
+            "skip": stats["skipped"],
+            "gpu": gpu_mem_str,
+            "status": "OK"
+        })
 
-    file_size_mb = output_pt_path.stat().st_size / (1024 * 1024)
-    print(f"[SUCCESS] Đã lưu thành công tập {split_name.upper()} vào: {output_pt_path.resolve()}")
-    print(f"          - Kích thước tệp: {file_size_mb:.2f} MB")
-    print(f"          - Tổng số mẫu:   {len(video_ids_all)} (Gốc: {num_orig}, Augment: {num_aug_count})")
-    print(f"          - Phân bố nhãn:  Tỉnh táo (0) = {num_alerts}, Buồn ngủ (1) = {num_drowsy}")
-    if is_var_len:
-        print(f"          - Cấu trúc Tensor: List[{len(final_p3)}] (min_len={final_seq_lens.min().item()}, max_len={final_seq_lens.max().item()}, mean_len={final_seq_lens.float().mean().item():.1f})")
-    else:
-        print(f"          - Tensor p3:     {list(final_p3.shape)}")
-        print(f"          - Tensor p4:     {list(final_p4.shape)}")
-        print(f"          - Tensor p5:     {list(final_p5.shape)}")
-    print(f"          - Labels:        {list(final_labels.shape)}")
+        # Thu gom rác bộ nhớ định kỳ
+        if (item_idx + 1) % gc_interval == 0:
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    pbar.close()
+    return stats
 
 
 # ==============================================================================
-# 5. ĐIỂM VÀO CHÍNH (MAIN ENTRY POINT)
+# 8. HÀM ĐIỀU KHIỂN CHÍNH (MAIN CLI ENTRYPOINT)
 # ==============================================================================
-def parse_seq_len(val: Any) -> Optional[int]:
-    """Helper chuyển đổi tham số CLI seq_len sang int hoặc None."""
-    if val is None or str(val).strip().lower() in ("none", "null", ""):
-        return None
-    try:
-        parsed = int(val)
-        return parsed if parsed > 0 else None
-    except ValueError:
-        raise argparse.ArgumentTypeError(f"seq_len phải là số nguyên dương hoặc None, nhận được: {val}")
-
-
 def main():
-    parser = argparse.ArgumentParser(description="Trích xuất đặc trưng video (.mp4, .avi, ...) ra file .pt theo MyLSTMDataset")
-    parser.add_argument("--data_dir", type=str, default=DEFAULT_DATA_DIR,
-                        help=f"Thư mục chứa video dữ liệu (mặc định: {DEFAULT_DATA_DIR})")
-    parser.add_argument("--video_exts", type=str, default=DEFAULT_VIDEO_EXTS,
-                        help=f"Danh sách phần mở rộng video hỗ trợ (mặc định: {DEFAULT_VIDEO_EXTS})")
-    parser.add_argument("--onnx_path", type=str,
-                        default=r"D:\Project\DATN\driver-guardian\ai\LSTM\backbone_neck.onnx",
-                        help="Đường dẫn file mô hình ONNX")
-    parser.add_argument("--output_dir", type=str, default="extracted_features_pt",
-                        help="Thư mục xuất kết quả")
-    parser.add_argument("--train_name", type=str, default="features_sust_train.pt",
-                        help="Tên file tensor train đầu ra (mặc định: features_sust_train.pt)")
-    parser.add_argument("--val_name", type=str, default="features_sust_val.pt",
-                        help="Tên file tensor val đầu ra (mặc định: features_sust_val.pt)")
+    parser = argparse.ArgumentParser(
+        description="Trích xuất đặc trưng video không gian nguyên bản (p3, p4, p5) sang tệp HDF5 (.h5) nén."
+    )
 
-    # Tham số lấy mẫu chuỗi thời gian đồng bộ MyLSTMDataset
-    parser.add_argument("--seq_len", type=parse_seq_len, default=DEFAULT_SEQ_LEN,
-                        help="Số khung hình cố định mỗi video (mặc định: None - Cách 1: giữ nguyên độ dài tự nhiên)")
-    parser.add_argument("--sample_interval", type=float, default=DEFAULT_SAMPLE_INTERVAL,
-                        help=f"Khoảng thời gian t (giây) giữa 2 lần lấy mẫu (mặc định: {DEFAULT_SAMPLE_INTERVAL}s)")
-    parser.add_argument("--split_by_subject", action=argparse.BooleanOptionalAction, default=DEFAULT_SPLIT_BY_SUBJECT,
-                        help="Bật/tắt phân chia Train/Val theo đối tượng người tham gia (mặc định: True)")
-    parser.add_argument("--train_ratio", type=float, default=DEFAULT_TRAIN_RATIO,
-                        help=f"Tỷ lệ phân chia tập Train (mặc định: {DEFAULT_TRAIN_RATIO})")
+    # Đường dẫn thư mục & tệp
+    parser.add_argument(
+        "--data_dir", type=str, default=r"E:\LSTM\data_processed",
+        help="Đường dẫn thư mục dataset phân tầng theo struct_dataset.md (mặc định: E:\\LSTM\\data_processed)"
+    )
+    parser.add_argument(
+        "--output_h5", type=str, default="checkpoints/dataset_features.h5",
+        help="Đường dẫn tệp .h5 đầu ra (mặc định: checkpoints/dataset_features.h5)"
+    )
+    parser.add_argument(
+        "--manifest_csv", type=str, default="checkpoints/dataset_manifest.csv",
+        help="Đường dẫn tệp .csv truy vết và phục hồi tiến trình (mặc định: checkpoints/dataset_manifest.csv)"
+    )
+    parser.add_argument(
+        "--onnx_path", type=str, default="checkpoints/backbone_neck.onnx",
+        help="Đường dẫn tệp trọng số ONNX Backbone + Neck"
+    )
 
-    parser.add_argument("--img_size", type=int, default=DEFAULT_IMAGE_SIZE, help="Kích thước resize letterbox")
-    parser.add_argument("--chunk_size", type=int, default=24, help="Batch size khi forward ONNX")
-    parser.add_argument("--device_id", type=int, default=0, help="CUDA device index")
-    parser.add_argument("--limit", type=int, default=None,
-                        help="Giới hạn số lượng video để chạy thử nghiệm (ví dụ: --limit 10)")
-    parser.add_argument("--fp16", action="store_true", help="Lưu đặc trưng dạng float16 (giảm 50%% dung lượng)")
+    # Tham số trích xuất & mô hình
+    parser.add_argument(
+        "--sample_interval", type=float, default=0.1,
+        help="Khoảng thời gian (giây) giữa 2 khung hình lấy mẫu (mặc định: 0.1s ~ 10 FPS)"
+    )
+    parser.add_argument(
+        "--img_size", type=int, default=640,
+        help="Kích thước ảnh letterbox vuông đưa vào ONNX (mặc định: 640)"
+    )
+    parser.add_argument(
+        "--chunk_size", type=int, default=16,
+        help="Kích thước mini-batch khi forward ONNX trên GPU (mặc định: 16)"
+    )
+    parser.add_argument(
+        "--device_id", type=int, default=0,
+        help="CUDA GPU Device ID (mặc định: 0)"
+    )
+    parser.add_argument(
+        "--compression", type=str, default="lzf", choices=["lzf", "gzip"],
+        help="Thuật toán nén HDF5: 'lzf' (tối ưu tốc độ) hoặc 'gzip' (tối ưu dung lượng)"
+    )
+    parser.add_argument(
+        "--fp16", action=argparse.BooleanOptionalAction, default=True,
+        help="Lưu trữ đặc trưng dạng float16 để giảm 50%% dung lượng đĩa (mặc định: True)"
+    )
 
-    # Tham số tăng cường dữ liệu (Data Augmentation) từ augment.py
-    parser.add_argument("--augment", action=argparse.BooleanOptionalAction, default=True,
-                        help="Bật/tắt tăng cường dữ liệu từ augment.py (mặc định: True)")
-    parser.add_argument("--num_aug", type=int, default=1,
-                        help="Số bản sao tăng cường cho mỗi video trong tập áp dụng augment (mặc định: 1)")
-    parser.add_argument("--include_original", action=argparse.BooleanOptionalAction, default=True,
-                        help="Giữ lại video gốc bên cạnh các bản sao tăng cường (mặc định: True)")
-    parser.add_argument("--augment_splits", type=str, default="train",
-                        help="Các phân tập áp dụng tăng cường, phân cách bởi dấu phẩy (mặc định: train)")
-    parser.add_argument("--aug_seed", type=int, default=42,
-                        help="Random seed cơ sở cho việc tăng cường dữ liệu (mặc định: 42)")
-    parser.add_argument("--aug_config", type=str, default=None,
-                        help="Đường dẫn file JSON cấu hình augment tùy chỉnh (mặc định: dùng config mặc định từ augment.py)")
-    parser.add_argument("--force_recompute", action="store_true", default=False,
-                        help="Bắt buộc trích xuất lại từ đầu, bỏ qua cache hiện có")
+    # Tăng cường dữ liệu (Augmentation từ src/augment.py)
+    parser.add_argument(
+        "--augment", action=argparse.BooleanOptionalAction, default=True,
+        help="Bật/tắt tăng cường dữ liệu cho tập train (mặc định: True)"
+    )
+    parser.add_argument(
+        "--num_aug", type=int, default=1,
+        help="Số bản sao tăng cường cho mỗi video trong tập train (mặc định: 1)"
+    )
+    parser.add_argument(
+        "--include_original", action=argparse.BooleanOptionalAction, default=True,
+        help="Giữ lại video gốc bên cạnh các bản sao tăng cường (mặc định: True)"
+    )
+    parser.add_argument(
+        "--aug_seed", type=int, default=42,
+        help="Random seed cơ sở cho việc tăng cường dữ liệu (mặc định: 42)"
+    )
+
+    # Cơ chế Resume & Giới hạn chạy thử nghiệm
+    parser.add_argument(
+        "--force_recompute", action="store_true", default=False,
+        help="Bắt buộc trích xuất lại từ đầu, bỏ qua cache và bản ghi đã có"
+    )
+    parser.add_argument(
+        "--limit", type=int, default=None,
+        help="Giới hạn số lượng video để chạy thử nghiệm nhanh (ví dụ: --limit 2)"
+    )
+    parser.add_argument(
+        "--gc_interval", type=int, default=25,
+        help="Tần suất gọi gc.collect() và empty_cache (sau mỗi N video)"
+    )
+
     args = parser.parse_args()
 
-    dataset_dir = Path(args.data_dir)
+    # Chuyển đổi các đường dẫn
+    data_dir = Path(args.data_dir)
+    output_h5_path = Path(args.output_h5)
+    manifest_csv_path = Path(args.manifest_csv)
     onnx_path = Path(args.onnx_path)
-    output_dir = Path(args.output_dir)
-    cache_dir = output_dir / "cache"
 
-    video_exts = tuple(ext.strip() for ext in args.video_exts.split(",") if ext.strip())
-    augment_splits = [s.strip().lower() for s in args.augment_splits.split(",") if s.strip()]
-
-    split_json_path = output_dir / "dataset_split.json"
-    train_pt_path = output_dir / args.train_name
-    val_pt_path = output_dir / args.val_name
-
-    print("=" * 75)
-    print("      HỆ THỐNG TRÍCH XUẤT ĐẶC TRƯNG LOCAL SANG PYTORCH TENSOR (.PT)      ")
-    print("      ĐỒNG BỘ THEO MYLSTMDATASET (TEMPORAL SAMPLING & SUBJECT SPLIT)     ")
-    print("=" * 75)
-    print(f"[*] Dataset Directory : {dataset_dir}")
-    print(f"[*] Video Exts        : {video_exts}")
-    print(f"[*] ONNX Model Path   : {onnx_path}")
-    print(f"[*] Output Directory  : {output_dir}")
-    print(f"[*] Sample Interval   : {args.sample_interval}s")
-    print(f"[*] Sequence Length   : {args.seq_len if args.seq_len is not None else 'None (Cách 1: List[torch.Tensor] tự nhiên)'}")
-    print(f"[*] Split By Subject  : {args.split_by_subject}")
-    print(f"[*] Train Ratio       : {args.train_ratio}")
-    print(f"[*] Chunk Size        : {args.chunk_size}")
-    print(f"[*] Precision         : {'Float16' if args.fp16 else 'Float32'}")
-    print(f"[*] Augmentation      : {'BẬT' if args.augment else 'TẮT'}")
-    if args.augment:
-        print(f"    - Augment Splits  : {augment_splits}")
-        print(f"    - Num Aug Copies  : {args.num_aug}")
-        print(f"    - Include Original: {args.include_original}")
-        print(f"    - Base Seed       : {args.aug_seed}")
-    if args.force_recompute:
-        print(f"[*] Force Recompute   : TRUE (Bỏ qua cache hiện có)")
+    print("=" * 80)
+    print("      HỆ THỐNG TRÍCH XUẤT ĐẶC TRƯNG NGUYÊN BẢN SANG HDF5 (.H5) CÓ NÉN       ")
+    print("       (KHÔNG SPATIAL POOLING - BẢO TOÀN ĐA TẦNG ĐẶC TRƯNG P3, P4, P5)       ")
+    print("=" * 80)
+    print(f"[*] Thư mục Dataset   : {data_dir}")
+    print(f"[*] File HDF5 xuất ra : {output_h5_path}")
+    print(f"[*] File CSV truy vết : {manifest_csv_path}")
+    print(f"[*] Trọng số ONNX     : {onnx_path}")
+    print(f"[*] Chu kỳ lấy mẫu    : {args.sample_interval}s (~{1.0 / args.sample_interval:.1f} FPS)")
+    print(f"[*] Kích thước ảnh    : {args.img_size}x{args.img_size}")
+    print(f"[*] Kích thước chunk  : {args.chunk_size} frames/batch")
+    print(f"[*] Định dạng dữ liệu : {'Float16' if args.fp16 else 'Float32'}")
+    print(f"[*] Thuật toán nén    : {args.compression.upper()}")
+    print(f"[*] Tăng cường (Train): {'BẬT' if args.augment else 'TẮT'} (num_aug={args.num_aug}, include_orig={args.include_original})")
+    print(f"[*] Chế độ Resume     : {'GHI ĐÈ (Force Recompute)' if args.force_recompute else 'TỰ ĐỘNG BỎ QUA ĐÃ CÓ (Auto Skip)'}")
     if args.limit:
-        print(f"[*] TEST MODE         : Giới hạn xử lý {args.limit} video!")
-    print("=" * 75)
+        print(f"[*] CHẾ ĐỘ THỬ NGHIỆM : Giới hạn tối đa {args.limit} video mỗi tập!")
+    print("=" * 80)
 
-    # 1. Phân chia Train/Validation theo Subject-Independent Split
-    train_items, val_items = prepare_dataset_split(
-        dataset_dir=dataset_dir,
-        split_json_path=split_json_path,
-        train_ratio=args.train_ratio,
-        split_by_subject=args.split_by_subject,
-        seed=42,
-        video_exts=video_exts
-    )
+    # 1. Quét bộ dữ liệu
+    print("[1/4] Đang quét cấu trúc thư mục dữ liệu...")
+    train_items, val_items = scan_structured_dataset(data_dir)
+    print(f"      Tìm thấy: {len(train_items)} clips tập Train, {len(val_items)} clips tập Val.")
 
     if args.limit:
-        train_limit = max(1, int(args.limit * args.train_ratio))
-        val_limit = max(1, args.limit - train_limit)
-        train_items = train_items[:train_limit]
-        val_items = val_items[:val_limit]
-        print(f"[*] Áp dụng giới hạn: Train={len(train_items)} video, Val={len(val_items)} video.")
+        train_items = train_items[:args.limit]
+        val_items = val_items[:args.limit]
+        print(f"      Áp dụng --limit: Train={len(train_items)} clips, Val={len(val_items)} clips.")
+
+    if len(train_items) == 0 and len(val_items) == 0:
+        print("[!] Không tìm thấy video clip nào hợp lệ. Vui lòng kiểm tra lại đường dẫn dataset.")
+        return
 
     # 2. Khởi tạo ONNX Runtime
-    runner = CloneONNXCUDARuntime(str(onnx_path), device_id=args.device_id)
+    print(f"[2/4] Đang khởi tạo mô hình ONNX Runtime...")
+    extractor = ONNXFeatureExtractor(model_path=onnx_path, device_id=args.device_id)
+    print(f"      Active Execution Providers: {extractor.active_providers}")
 
-    # Tự động đồng bộ img_size theo yêu cầu của mô hình ONNX nếu có
-    actual_img_size = args.img_size
-    if runner.expected_h is not None and runner.expected_h > 0:
-        if actual_img_size != runner.expected_h:
-            print(f"[!] Tự động điều chỉnh img_size từ {actual_img_size} -> {runner.expected_h} để khớp với input của mô hình ONNX.")
-            actual_img_size = runner.expected_h
-
-    # 3. Khởi tạo DetectionAugmenter nếu bật augmentation
+    # 3. Khởi tạo Augmenter
     augmenter = None
-    if args.augment and args.num_aug > 0 and len(augment_splits) > 0:
-        aug_cfg = dict(DEFAULT_AUG_CONFIG)
-        if args.aug_config:
-            aug_cfg_path = Path(args.aug_config)
-            if aug_cfg_path.exists():
-                with open(aug_cfg_path, "r", encoding="utf-8") as f:
-                    custom_cfg = json.load(f)
-                    aug_cfg.update(custom_cfg)
-                print(f"[+] Đã nạp cấu hình augment tùy chỉnh từ: {aug_cfg_path}")
-            else:
-                print(f"[WARN] Không tìm thấy file {aug_cfg_path}, dùng cấu hình mặc định từ augment.py")
-        augmenter = DetectionAugmenter(aug_cfg)
-        print(f"[+] Đã khởi tạo DetectionAugmenter với cấu hình:\n    {aug_cfg}")
+    if args.augment and args.num_aug > 0:
+        augmenter = DetectionAugmenter(DEFAULT_AUG_CONFIG)
+        print(f"      Đã nạp DetectionAugmenter với cấu hình mặc định từ src.augment.")
 
-    # 4. Trích xuất tuần tự cho Train và Validation
-    should_augment_train = args.augment and ("train" in augment_splits)
-    process_split_set(
-        split_name="train",
-        items=train_items,
-        runner=runner,
-        output_pt_path=train_pt_path,
-        cache_dir=cache_dir,
-        seq_len=args.seq_len,
-        sample_interval=args.sample_interval,
-        img_size=actual_img_size,
-        chunk_size=args.chunk_size,
-        use_fp16=args.fp16,
-        augmenter=augmenter if should_augment_train else None,
-        num_aug=args.num_aug if should_augment_train else 0,
-        include_original=args.include_original,
-        base_seed=args.aug_seed,
-        force_recompute=args.force_recompute
+    # 4. Khởi tạo HDF5 Storage Manager & Manifest CSV Tracker
+    print(f"[3/4] Đang kết nối tệp HDF5 và CSV Manifest...")
+    h5_manager = HDF5StorageManager(
+        h5_path=output_h5_path,
+        compression=args.compression,
+        use_fp16=args.fp16
     )
+    tracker = ManifestCSVTracker(csv_path=manifest_csv_path)
+    print(f"      Đã nạp sẵn {len(tracker.completed_video_ids)} bản ghi đã hoàn thành từ CSV.")
 
-    should_augment_val = args.augment and ("val" in augment_splits)
-    process_split_set(
-        split_name="val",
-        items=val_items,
-        runner=runner,
-        output_pt_path=val_pt_path,
-        cache_dir=cache_dir,
-        seq_len=args.seq_len,
-        sample_interval=args.sample_interval,
-        img_size=actual_img_size,
-        chunk_size=args.chunk_size,
-        use_fp16=args.fp16,
-        augmenter=augmenter if should_augment_val else None,
-        num_aug=args.num_aug if should_augment_val else 0,
-        include_original=args.include_original,
-        base_seed=args.aug_seed,
-        force_recompute=args.force_recompute
-    )
+    # 5. Thực thi trích xuất tuần tự
+    print("\n[4/4] Bắt đầu quá trình trích xuất đặc trưng...")
+    start_time = time.time()
 
-    print("\n" + "=" * 75)
-    print("      [HOÀN TẤT GIAI ĐOẠN 1] TRÍCH XUẤT ĐẶC TRƯNG THÀNH CÔNG!     ")
-    print("=" * 75)
-    print(f"1. Cấu hình phân bổ : {split_json_path.resolve()}")
-    print(f"2. File Train Tensor: {train_pt_path.resolve()}")
-    print(f"3. File Val Tensor  : {val_pt_path.resolve()}")
-    print("=" * 75)
+    try:
+        # Xử lý tập Train
+        print(f"\n--- TIẾN HÀNH TRÍCH XUẤT TẬP TRAIN ({len(train_items)} CLIPS) ---")
+        train_stats = process_split(
+            split_name="train",
+            items=train_items,
+            extractor=extractor,
+            h5_manager=h5_manager,
+            tracker=tracker,
+            sample_interval=args.sample_interval,
+            img_size=args.img_size,
+            chunk_size=args.chunk_size,
+            use_fp16=args.fp16,
+            augmenter=augmenter,
+            num_aug=args.num_aug,
+            include_original=args.include_original,
+            base_seed=args.aug_seed,
+            force_recompute=args.force_recompute,
+            gc_interval=args.gc_interval
+        )
+
+        # Xử lý tập Val
+        print(f"\n--- TIẾN HÀNH TRÍCH XUẤT TẬP VAL ({len(val_items)} CLIPS) ---")
+        val_stats = process_split(
+            split_name="val",
+            items=val_items,
+            extractor=extractor,
+            h5_manager=h5_manager,
+            tracker=tracker,
+            sample_interval=args.sample_interval,
+            img_size=args.img_size,
+            chunk_size=args.chunk_size,
+            use_fp16=args.fp16,
+            augmenter=None,  # Không augment tập val
+            num_aug=0,
+            include_original=True,
+            base_seed=args.aug_seed,
+            force_recompute=args.force_recompute,
+            gc_interval=args.gc_interval
+        )
+
+    except KeyboardInterrupt:
+        print("\n[!] Phát hiện thao tác ngắt người dùng (Ctrl+C). Đang lưu và đóng file an toàn...")
+    finally:
+        h5_manager.close()
+        tracker.close()
+
+    elapsed = time.time() - start_time
+    print("\n" + "=" * 80)
+    print("                  BÁO CÁO TỔNG KẾT TRÍCH XUẤT ĐẶC TRƯNG                  ")
+    print("=" * 80)
+    print(f"[*] Tổng thời gian thực thi: {elapsed:.2f} giây ({elapsed / 60.0:.2f} phút)")
+    print(f"[*] Tập Train:")
+    print(f"    - Thành công : {train_stats['processed']} mẫu")
+    print(f"    - Bỏ qua     : {train_stats['skipped']} mẫu (đã có sẵn)")
+    print(f"    - Lỗi        : {train_stats['failed']} mẫu")
+    print(f"[*] Tập Val:")
+    print(f"    - Thành công : {val_stats['processed']} mẫu")
+    print(f"    - Bỏ qua     : {val_stats['skipped']} mẫu (đã có sẵn)")
+    print(f"    - Lỗi        : {val_stats['failed']} mẫu")
+    print(f"[*] Tệp HDF5 lưu trữ       : {output_h5_path.resolve()}")
+    if output_h5_path.exists():
+        size_mb = output_h5_path.stat().st_size / (1024 ** 2)
+        print(f"    Dung lượng tệp HDF5    : {size_mb:.2f} MB")
+    print(f"[*] Tệp CSV theo dõi       : {manifest_csv_path.resolve()}")
+    print("=" * 80)
+    print("[SUCCESS] Hoàn tất pipeline trích xuất đặc trưng an toàn!")
 
 
 if __name__ == "__main__":

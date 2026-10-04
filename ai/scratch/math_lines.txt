@@ -1,0 +1,396 @@
+Line 1: # TÀI LIỆU THIẾT KẾ KIẾN TRÚC MÔ HÌNH DEEP GRU V4
+Line 2: ## Hệ Thống Nhận Diện Tài Xế Buồn Ngủ (Driver Guardian DMS)
+Line 3: ### Căn cứ thực thi: Notebook [`datn4ni4.ipynb`](file:///D:/Project/DATN/driver-guardian/ai/LSTM/datn4ni4.ipynb)
+Line 4: **Ngày lập tài liệu:** 30/09/2026  
+Line 5: **Phiên bản mô hình:** Deep GRU Architecture v4 (Two-Stage Decoupled Pipeline, Temporal Attention Pooling, Recall-First Dual F1/F2)
+Line 6: 
+Line 7: ---
+Line 8: 
+Line 9: ## 1. TỔNG QUAN KIẾN TRÚC HỆ THỐNG (SYSTEM OVERVIEW)
+Line 10: 
+Line 11: Hệ thống **Driver Guardian** được thiết kế để phát hiện trạng thái buồn ngủ của người lái xe trong thời gian thực thông qua camera giám sát cabin xe (Driver Monitoring System - DMS). Để đảm bảo tính toán thời gian thực trên các thiết bị nhúng và biên (Edge AI / In-cabin SoC), hệ thống áp dụng kiến trúc **Two-Stage Decoupled Pipeline** (Đường ống xử lý hai giai đoạn tách rời):
+Line 12: 
+Line 13: ```mermaid
+Line 14: flowchart LR
+Line 15:     subgraph Stage1["Giai đoạn 1: Trích xuất đặc trưng không gian (Offline / Cực nhanh)"]
+Line 16:         direction TB
+Line 17:         RawVideo["Video Camera Cabin<br/>(4 FPS, T bước thời gian)"] --> FaceROI["Cắt vùng khuôn mặt<br/>(Face Crop 480x480)"]
+Line 18:         FaceROI --> Backbone["YOLOv10 Trunk & PAFPN Neck<br/>(backbone_neck.onnx ~1.64M params)"]
+Line 19:         Backbone --> Pool["AdaptiveAvgPool2d (1x1)"]
+Line 20:         Pool --> MultiScale["3 Tầng đặc trưng đa tỷ lệ:<br/>p3 (64-d), p4 (128-d), p5 (256-d)"]
+Line 21:         MultiScale --> TensorSave["Đóng gói nhị phân Tensor (.pt)<br/>(features_processed_train.pt)"]
+Line 22:     end
+Line 23: 
+Line 24:     subgraph Stage2["Giai đoạn 2: Mô hình chuỗi thời gian & Phân loại (datn4ni4.ipynb)"]
+Line 25:         direction TB
+Line 26:         TensorLoad["Nạp RAM siêu tốc (< 0.5s)<br/>PreloadedTensorDataset"] --> Augmenter["Temporal Tensor Augmentation<br/>(Gaussian Noise + Time Masking)"]
+Line 27:         Augmenter --> SpatialAdapter["SpatialFeatureAdapter<br/>(Multi-scale Scale Attention Fusion)"]
+Line 28:         SpatialAdapter --> DeepGRU["2-Layer Stacked Deep GRU<br/>(hidden_dim = 192, dropout = 0.35)"]
+Line 29:         DeepGRU --> AttnPool["Temporal Attention Pooling<br/>(Masked Dynamic Sequence Reduction)"]
+Line 30:         AttnPool --> FCHead["Linear Classification Head<br/>(Dropout 0.35 -> Linear -> 2 classes)"]
+Line 31:         FCHead --> OutputDecision["Quyết định: Alert (0) vs Drowsy (1)<br/>(Threshold Tuning Th_safe >= 85% Recall)"]
+Line 32:     end
+Line 33: 
+Line 34:     TensorSave -.->|"Nạp trực tiếp vào RAM"| TensorLoad
+Line 35: ```
+Line 36: 
+Line 37: ### Triết lý thiết kế then chốt của Phiên bản v4 (`datn4ni4.ipynb`):
+Line 38: 1. **Giải quyết triệt để vấn đề nhiễu Gradient do Zero-Padding (Phương án A):** Ở các phiên bản cũ (v2, v3), việc gán nhãn video cho từng frame độc lập (frame-level loss) trên các đoạn được chèn zero-padding khiến gradient lan truyền ngược bị méo mó, mô hình bị ép học các đặc trưng rác. Phiên bản v4 áp dụng **Temporal Attention Pooling** với cơ chế **Attention Masking âm vô cùng ($-10^9$)**, triệt tiêu 100% trọng số của các frame padding và cô đọng toàn bộ chuỗi $T$ khung hình thành một vector ngữ cảnh đại diện duy nhất cho toàn clip.
+Line 39: 2. **Kiểm soát Overfitting toàn diện (Model Regularization & Pruning):** Giảm số tầng GRU từ 3 xuống 2 tầng, thu nhỏ chiều ẩn từ 256 xuống 192, tăng Dropout lên 0.35, nâng hệ số suy giảm trọng số `weight_decay = 1e-3` (gấp 10 lần), bổ sung `TemporalTensorAugmenter` (nhiễu Gaussian + Time Masking ngẫu nhiên 15% frames).
+Line 40: 3. **Chiến lược Song hành $F_1$ và $F_2$ Score (Safety-Critical DMS):** Bên cạnh $F_1$-Score cân bằng chuẩn mực, mô hình đưa $F_2$-Score (ưu tiên độ nhạy Recall gấp 2 lần Precision) làm kim chỉ nam để phạt nặng lỗi bỏ sót tài xế buồn ngủ (False Negative - $FN$), kết hợp cùng mô-đun quét ngưỡng tối ưu an toàn $th_{\text{safe}}$ đạt $Recall \ge 85\%$.
+Line 41: 
+Line 42: ---
+Line 43: 
+Line 44: ## 2. SƠ ĐỒ KIẾN TRÚC MÔ HÌNH VÀ LUỒNG DỮ LIỆU TENSOR
+Line 45: 
+Line 46: Dưới đây là sơ đồ chi tiết luồng biến đổi kích thước Tensor qua từng khối bên trong mô hình `DeepGRUClassifier`:
+Line 47: 
+Line 48: ```mermaid
+Line 49: flowchart TD
+Line 50:     subgraph Inputs["1. Dữ liệu đầu vào (Multi-scale Spatial Tensors)"]
+Line 51:         P3["Tensor p3: [Batch, Time, 64]"]
+Line 52:         P4["Tensor p4: [Batch, Time, 128]"]
+Line 53:         P5["Tensor p5: [Batch, Time, 256]"]
+Line 54:         Lens["Seq Lens: [Batch] (Độ dài thực tế)"]
+Line 55:     end
+Line 56: 
+Line 57:     subgraph SpatialAdapterBlock["2. SpatialFeatureAdapter (314,627 params)"]
+Line 58:         P3 --> Proj3["Linear(64, 256) + LayerNorm(256) + ReLU"]
+Line 59:         P4 --> Proj4["Linear(128, 256) + LayerNorm(256) + ReLU"]
+Line 60:         P5 --> Proj5["Linear(256, 256) + LayerNorm(256) + ReLU"]
+Line 61:         Proj3 --> V3["v3: [B, T, 256]"]
+Line 62:         Proj4 --> V4["v4: [B, T, 256]"]
+Line 63:         Proj5 --> V5["v5: [B, T, 256]"]
+Line 64:         V3 & V4 & V5 --> CatV["Concat: [B, T, 768]"]
+Line 65:         CatV --> AttnMLP["MLP: Linear(768, 256) -> ReLU -> Linear(256, 3)"]
+Line 66:         AttnMLP --> SoftmaxScales["Softmax(dim=-1): Trọng số w1, w2, w3: [B, T, 3, 1]"]
+Line 67:         V3 & V4 & V5 --> StackV["Stack: [B, T, 3, 256]"]
+Line 68:         SoftmaxScales & StackV --> WeightedSum["Tổng có trọng số: sum(StackV * Weights, dim=-2)"]
+Line 69:         WeightedSum --> DropAdapter["Dropout(p=0.25)"]
+Line 70:         DropAdapter --> OutAdapter["x_fused: [Batch, Time, 256]"]
+Line 71:     end
+Line 72: 
+Line 73:     subgraph GRUBlock["3. 2-Layer Stacked GRU (481,536 params)"]
+Line 74:         OutAdapter --> GRULayer1["GRU Layer 1 (in=256, hidden=192, batch_first=True)"]
+Line 75:         GRULayer1 --> GRUDrop["Dropout(p=0.35)"]
+Line 76:         GRUDrop --> GRULayer2["GRU Layer 2 (in=192, hidden=192)"]
+Line 77:         GRULayer2 --> GRUOut["gru_out: [Batch, Time, 192]<br/>h_n: [2, Batch, 192]"]
+Line 78:     end
+Line 79: 
+Line 80:     GRUOut --> DualPathways{"Chế độ hoạt động<br/>(return_sequence)"}
+Line 81: 
+Line 82:     subgraph StreamBranch["Nhánh Streaming / Real-time"]
+Line 83:         FCSeq["FC Head trực tiếp trên từng frame:<br/>Dropout(0.35) -> Linear(192, 2)"]
+Line 84:         OutSeq["Logits chuỗi: [Batch, Time, 2]"]
+Line 85:         FCSeq --> OutSeq
+Line 86:     end
+Line 87: 
+Line 88:     subgraph ClipBranch["Nhánh Huấn luyện Clip-level (Phương án A)"]
+Line 89:         AttnPoolBlock["4. TemporalAttentionPooling (18,625 params)"]
+Line 90:         FCClip["5. FC Classifier Head (386 params):<br/>Dropout(0.35) -> Linear(192, 2)"]
+Line 91:         OutClip["Clip Logits: [Batch, 2]"]
+Line 92:         OutAttn["Attention Weights: [Batch, Time]"]
+Line 93:         AttnPoolBlock --> FCClip
+Line 94:         FCClip --> OutClip
+Line 95:         FCClip --> OutAttn
+Line 96:     end
+Line 97: 
+Line 98:     DualPathways -->|"return_sequence = True"| FCSeq
+Line 99:     DualPathways -->|"return_sequence = False (Mặc định)"| AttnPoolBlock
+Line 100:     Lens -.-> AttnPoolBlock
+Line 101: ```
+Line 102: 
+Line 103: ### Bảng tóm tắt biến đổi Tensor Shapes qua từng trạm:
+Line 104: 
+Line 105: | Thứ tự | Khối chức năng | Đầu vào (Input Tensor) | Đầu ra (Output Tensor) | Kích thước mẫu thực nghiệm ($B=64, T=80$) |
+Line 106: | :---: | :--- | :--- | :--- | :--- |
+Line 107: | **0** | **Đầu vào thô** | Tệp nhị phân `.pt` | `p3, p4, p5, seq_lens` | $p_3: [64, 80, 64]$, $p_4: [64, 80, 128]$, $p_5: [64, 80, 256]$ |
+Line 108: | **1** | **Projection** | $p_i$ từng tầng | $v_3, v_4, v_5$ | Mỗi tầng đều được ánh xạ về $[64, 80, 256]$ |
+Line 109: | **2** | **Scale Attention** | $v_3, v_4, v_5$ | $w_{\text{scales}}$ | $[64, 80, 3]$ (Trọng số phân bổ cho 3 thang đo) |
+Line 110: | **3** | **Fused Features** | $w_{\text{scales}} \odot v_i$ | `x_fused` | $[64, 80, 256]$ |
+Line 111: | **4** | **GRU Layer 1** | `x_fused` | `gru_l1` | $[64, 80, 192]$ |
+Line 112: | **5** | **GRU Layer 2** | `Dropout(gru_l1)` | `gru_out` | $[64, 80, 192]$ |
+Line 113: | **6** | **Temporal Masking**| `gru_out, seq_lens` | `attn_weights` | $[64, 80]$ (Các frame ngoài `seq_lens` có trọng số = $0.000000$) |
+Line 114: | **7** | **Attention Pooling**| $\text{BMM}(W, \text{gru\_out})$ | `pooled` | $[64, 192]$ (Vector ngữ cảnh duy nhất đại diện toàn clip) |
+Line 115: | **8** | **FC Classifier Head**| `pooled` | `logits` | $[64, 2]$ (Logit cho nhãn 0: Alert và nhãn 1: Drowsy) |
+Line 116: 
+Line 117: ---
+Line 118: 
+Line 119: ## 3. CÔNG DỤNG VÀ THIẾT KẾ CHI TIẾT TỪNG LAYER
+Line 120: 
+Line 121: ### 3.1. Khối `SpatialFeatureAdapter` (Bộ Thích Ứng & Hợp Nhất Đặc Trưng Đa Tầng)
+Line 122: * **Vị trí:** Tầng tiếp nhận đầu tiên của mô hình `DeepGRUClassifier`.
+Line 123: * **Mục tiêu kỹ thuật:** Tiếp nhận 3 tầng đặc trưng không gian từ PAFPN neck (`backbone_neck.onnx`):
+Line 124:   * Tầng $p_3$ ($64$ kênh): Chi tiết cục bộ độ phân giải cao (khóe mắt nhắm/mở, chuyển động vi mô khóe miệng ngáp).
+Line 125:   * Tầng $p_4$ ($128$ kênh): Đặc trưng ngữ nghĩa tầm trung (hướng nhìn của ánh mắt, trạng thái nghiêng đầu).
+Line 126:   * Tầng $p_5$ ($256$ kênh): Đặc trưng toàn cục độ phân giải thấp (toàn bộ tư thế đầu, biểu cảm khuôn mặt mệt mỏi).
+Line 127: * **Cơ chế Fusion:** Mặc định sử dụng **Multi-Scale Scale Attention** (`fusion="attention"`). Thay vì chỉ nối chuỗi (`concat`) làm phình kích thước vector hoặc cộng gộp cơ học (`sum`/`mean`) làm mất cân đối tín hiệu, khối này dùng một mạng nơ-ron nhỏ để học xem tại mỗi khung hình, tỷ lệ đặc trưng nào là quan trọng nhất:
+Line 128:   $$\mathbf{v}_i = \text{ReLU}(\text{LayerNorm}(\mathbf{W}_i \mathbf{p}_i + \mathbf{b}_i)), \quad i \in \{3, 4, 5\}$$
+Line 129:   $$\boldsymbol{\alpha} = \text{Softmax}\left(\mathbf{W}_{\text{attn2}} \cdot \text{ReLU}\left(\mathbf{W}_{\text{attn1}} [\mathbf{v}_3, \mathbf{v}_4, \mathbf{v}_5] + \mathbf{b}_{\text{attn1}}\right) + \mathbf{b}_{\text{attn2}}\right)$$
+Line 130:   $$\mathbf{x}_{\text{fused}} = \text{Dropout}\left(\sum_{i=3}^5 \alpha_i \mathbf{v}_i\right)$$
+Line 131: 
+Line 132: ```mermaid
+Line 133: flowchart LR
+Line 134:     P3["p3 (64-d)"] --> L1["Linear(64, 256)"] --> LN1["LayerNorm"] --> R1["ReLU"] --> V3["v3 (256-d)"]
+Line 135:     P4["p4 (128-d)"] --> L2["Linear(128, 256)"] --> LN2["LayerNorm"] --> R2["ReLU"] --> V4["v4 (256-d)"]
+Line 136:     P5["p5 (256-d)"] --> L3["Linear(256, 256)"] --> LN3["LayerNorm"] --> R3["ReLU"] --> V5["v5 (256-d)"]
+Line 137: 
+Line 138:     V3 & V4 & V5 --> Cat["Concat [B, T, 768]"]
+Line 139:     Cat --> MLP1["Linear(768, 256) + ReLU"]
+Line 140:     MLP1 --> MLP2["Linear(256, 3)"]
+Line 141:     MLP2 --> Smax["Softmax -> alpha_3, alpha_4, alpha_5"]
+Line 142: 
+Line 143:     V3 & V4 & V5 & Smax --> WeightedSum["alpha_3*v3 + alpha_4*v4 + alpha_5*v5"]
+Line 144:     WeightedSum --> Drop["Dropout(0.25)"] --> Out["Fused [B, T, 256]"]
+Line 145: ```
+Line 146: 
+Line 147: #### Bảng thông số chi tiết của `SpatialFeatureAdapter`:
+Line 148: | Layer bên trong | Cấu hình tham số | Kích thước trọng số / Bias | Số tham số | Công dụng |
+Line 149: | :--- | :--- | :--- | :---: | :--- |
+Line 150: | `projection.0.0` (Linear) | in=64, out=256 | Trọng số: `[256, 64]`, Bias: `[256]` | 16,640 | Chiếu đặc trưng $p_3$ từ 64-d lên không gian chuẩn 256-d |
+Line 151: | `projection.0.1` (LayerNorm) | normalized_shape=256 | Trọng số: `[256]`, Bias: `[256]` | 512 | Chuẩn hóa đặc trưng nhánh $p_3$, ổn định phân phối gradient |
+Line 152: | `projection.1.0` (Linear) | in=128, out=256 | Trọng số: `[256, 128]`, Bias: `[256]` | 33,024 | Chiếu đặc trưng $p_4$ từ 128-d lên không gian chuẩn 256-d |
+Line 153: | `projection.1.1` (LayerNorm) | normalized_shape=256 | Trọng số: `[256]`, Bias: `[256]` | 512 | Chuẩn hóa đặc trưng nhánh $p_4$ |
+Line 154: | `projection.2.0` (Linear) | in=256, out=256 | Trọng số: `[256, 256]`, Bias: `[256]` | 65,792 | Chiếu đặc trưng $p_5$ từ 256-d lên không gian chuẩn 256-d |
+Line 155: | `projection.2.1` (LayerNorm) | normalized_shape=256 | Trọng số: `[256]`, Bias: `[256]` | 512 | Chuẩn hóa đặc trưng nhánh $p_5$ |
+Line 156: | `attention_mlp.0` (Linear) | in=768, out=256 | Trọng số: `[256, 768]`, Bias: `[256]` | 196,864 | Tầng ẩn tổng hợp tương tác chéo giữa cả 3 nhánh tỷ lệ |
+Line 157: | `attention_mlp.2` (Linear) | in=256, out=3 | Trọng số: `[3, 256]`, Bias: `[3]` | 771 | Dự đoán điểm số thô cho 3 thang tỷ lệ không gian |
+Line 158: | `dropout` (Dropout) | p=0.25 | Không có trọng số | 0 | Chống đồng thích nghi (co-adaptation) giữa các nhánh |
+Line 159: | **TỔNG CỘNG KHỐI ADAPTER**| | | **314,627** | **Chiếm 38.59% tổng tham số toàn mô hình** |
+Line 160: 
+Line 161: ---
+Line 162: 
+Line 163: ### 3.2. Khối `DeepGRUClassifier` (Lõi Học Đặc Trưng Chuỗi Thời Gian - Temporal Backbone)
+Line 164: * **Vị trí:** Trung tâm của mô hình, nhận đầu vào từ `SpatialFeatureAdapter`.
+Line 165: * **Mục tiêu kỹ thuật:** Học các quy luật biến thiên theo thời gian của khuôn mặt tài xế (tần suất nháy mắt, thời gian nhắm mắt PERCLOS, chu kỳ ngáp dài $\ge 2.5s$, hiện tượng đầu gật gù liên tiếp).
+Line 166: * **Cấu hình:** `nn.GRU(input_size=256, hidden_size=192, num_layers=2, batch_first=True, dropout=0.35)`.
+Line 167: * **Lý do lựa chọn GRU thay vì LSTM:**
+Line 168:   1. **Tinh gọn cấu trúc:** GRU kết hợp cổng quên (Forget Gate) và cổng nhập (Input Gate) thành một **Update Gate ($z_t$)** duy nhất, đồng thời loại bỏ trạng thái ô nhớ độc lập ($c_t$), chỉ duy trì trạng thái ẩn ($h_t$).
+Line 169:   2. **Tiết kiệm 25% tham số:** Ứng với cùng số chiều $H$, LSTM cần $4 \times (D \cdot H + H^2)$ tham số, trong khi GRU chỉ cần $3 \times (D \cdot H + H^2)$. Điều này giảm tải từ 642k xuống còn 481k params ở phần recurrent.
+Line 170:   3. **Hội tụ nhanh hơn & Giảm nguy cơ Overfit:** Trên tập dữ liệu độ dài ngắn đến trung bình ($T \in [30, 80]$ frames tại 4 FPS, tương đương $7.5s - 20s$), GRU hội tụ ổn định và ghi nhận hiện tượng ít bị học vẹt hơn đáng kể so với LSTM 3 tầng trước đó.
+Line 171: 
+Line 172: $$\begin{aligned}
+Line 173: r_t &= \sigma(W_{ir} x_t + b_{ir} + W_{hr} h_{t-1} + b_{hr}) \quad &\text{(Reset Gate - Điều chỉnh lượng thông tin quá khứ cần quên)} \\
+Line 174: z_t &= \sigma(W_{iz} x_t + b_{iz} + W_{hz} h_{t-1} + b_{hz}) \quad &\text{(Update Gate - Cân bằng giữa quá khứ và ứng viên mới)} \\
+Line 175: n_t &= \tanh(W_{in} x_t + b_{in} + r_t \odot (W_{hn} h_{t-1} + b_{hn})) \quad &\text{(Candidate State - Ứng viên trạng thái mới)} \\
+Line 176: h_t &= (1 - z_t) \odot n_t + z_t \odot h_{t-1} \quad &\text{(New Hidden State - Trạng thái ẩn thời điểm } t)
+Line 177: \end{aligned}$$
+Line 178: 
+Line 179: #### Bảng thông số chi tiết của khối GRU:
+Line 180: | Layer bên trong | Cấu hình tham số | Kích thước Tensor | Số tham số | Công dụng |
+Line 181: | :--- | :--- | :--- | :---: | :--- |
+Line 182: | `gru.weight_ih_l0` | input=256, gates=3*192 | `[576, 256]` | 147,456 | Ma trận trọng số từ đầu vào vào 3 cổng của Layer 0 |
+Line 183: | `gru.weight_hh_l0` | hidden=192, gates=3*192 | `[576, 192]` | 110,592 | Ma trận trọng số hồi quy giữa các bước thời gian Layer 0 |
+Line 184: | `gru.bias_ih_l0` | gates=3*192 | `[576]` | 576 | Vector độ chệch từ đầu vào Layer 0 |
+Line 185: | `gru.bias_hh_l0` | gates=3*192 | `[576]` | 576 | Vector độ chệch hồi quy Layer 0 |
+Line 186: | `gru.weight_ih_l1` | input=192, gates=3*192 | `[576, 192]` | 110,592 | Ma trận trọng số từ Layer 0 lên Layer 1 |
+Line 187: | `gru.weight_hh_l1` | hidden=192, gates=3*192 | `[576, 192]` | 110,592 | Ma trận trọng số hồi quy của Layer 1 |
+Line 188: | `gru.bias_ih_l1` | gates=3*192 | `[576]` | 576 | Vector độ chệch từ Layer 0 lên Layer 1 |
+Line 189: | `gru.bias_hh_l1` | gates=3*192 | `[576]` | 576 | Vector độ chệch hồi quy Layer 1 |
+Line 190: | `dropout` giữa 2 layer| p=0.35 | Không có trọng số | 0 | Chống phụ thuộc quá mức vào các nơ-ron giữa 2 tầng |
+Line 191: | **TỔNG CỘNG KHỐI GRU**| | | **481,536** | **Chiếm 59.07% tổng tham số toàn mô hình** |
+Line 192: 
+Line 193: ---
+Line 194: 
+Line 195: ### 3.3. Khối `TemporalAttentionPooling` (Gom Tụ Chuỗi Có Trọng Số Chú Ý & Triệt Tiêu Padding Mask)
+Line 196: * **Vị trí:** Tiếp nhận đầu ra chuỗi thời gian `gru_out: [Batch, Time, 192]` từ khối GRU.
+Line 197: * **Mục tiêu kỹ thuật (Phương án A):**
+Line 198:   * Trong một video clip, không phải frame nào cũng có biểu hiện buồn ngủ. Một tài xế buồn ngủ chỉ chợp mắt hoặc ngáp trong vài giây cụ thể (ví dụ: frames 20 đến 45), trong khi các frame đầu hoặc cuối có thể vẫn đang mở mắt bình thường.
+Line 199:   * Nếu dùng Mean Pooling thuần túy, tín hiệu buồn ngủ bị pha loãng bởi các frame tỉnh táo.
+Line 200:   * Nếu dùng Max Pooling, dễ bị nhiễu do một khung hình bị nhòe hoặc chớp mắt sinh lý bình thường.
+Line 201:   * Tầng Attention Pooling tự động học mức độ "đáng chú ý" $e_t$ của từng khung hình trong toàn chuỗi.
+Line 202: * **Cơ chế Masking triệt tiêu 100% Zero-Padding:**
+Line 203:   Khi xử lý theo lô (Mini-batch), các clip có độ dài khác nhau ($T \in [30, 80]$) phải chèn số 0 vào sau. Tầng Attention Pooling giải quyết triệt để rác zero-padding bằng mặt nạ logic:
+Line 204:   $$\text{mask}_{b, t} = (t < \text{seq\_len}_b)$$
+Line 205:   $$s_{b, t} = \begin{cases} e_{b, t}, & \text{nếu } \text{mask}_{b, t} = \text{True} \\ -10^9, & \text{nếu } \text{mask}_{b, t} = \text{False (frame padding)} \end{cases}$$
+Line 206:   $$\mathbf{w}_{b, t} = \frac{\exp(s_{b, t})}{\sum_{k=1}^T \exp(s_{b, k})}$$
+Line 207:   Vì $e^{-10^9} \to 0$, trọng số $\mathbf{w}$ tại mọi frame padding bằng chính xác **$0.000000$**, triệt tiêu toàn bộ gradient lan truyền ngược vào vùng số 0!
+Line 208:   $$\mathbf{v}_{\text{pooled}} = \sum_{t=1}^T \mathbf{w}_{b, t} \cdot \mathbf{h}_{b, t} \quad \left(\text{Thực thi qua phép nhân lô: } \mathbf{w} \times \mathbf{H} \in \mathbb{R}^{B \times 192}\right)$$
+Line 209: 
+Line 210: ```mermaid
+Line 211: flowchart TD
+Line 212:     GRUIn["gru_out: [B, T, 192]"] --> Dense1["Linear(192, 96)"]
+Line 213:     Dense1 --> TanhAct["Tanh Activation"]
+Line 214:     TanhAct --> Dense2["Linear(96, 1)"]
+Line 215:     Dense2 --> RawScores["Raw Attention Scores: [B, T]"]
+Line 216: 
+Line 217:     SeqLens["seq_lens: [B]"] --> MaskGen["Tạo Mask: t < seq_len"]
+Line 218:     RawScores & MaskGen --> MaskFill["scores.masked_fill(~mask, -1e9)"]
+Line 219:     MaskFill --> SoftmaxOp["Softmax(dim=-1)"]
+Line 220:     SoftmaxOp --> AttnWeights["Trọng số Attention chuẩn hóa: [B, 1, T]<br/>(Padding frames = 0.000000)"]
+Line 221: 
+Line 222:     AttnWeights & GRUIn --> BMM["Batch Matrix Multiplication (torch.bmm)"]
+Line 223:     BMM --> Squeeze["Squeeze(1)"]
+Line 224:     Squeeze --> PooledVector["pooled: [Batch, 192] (Đại diện toàn clip)"]
+Line 225: ```
+Line 226: 
+Line 227: #### Bảng thông số chi tiết của `TemporalAttentionPooling`:
+Line 228: | Layer bên trong | Cấu hình tham số | Kích thước Tensor | Số tham số | Công dụng |
+Line 229: | :--- | :--- | :--- | :---: | :--- |
+Line 230: | `attn.0` (Linear) | in=192, out=96 | Trọng số: `[96, 192]`, Bias: `[96]` | 18,528 | Nén biểu diễn ẩn của GRU vào không gian đánh giá chú ý |
+Line 231: | `attn.1` (Tanh) | Phi tuyến tính | Không có trọng số | 0 | Tạo tính phi tuyến đối xứng cho điểm số chú ý |
+Line 232: | `attn.2` (Linear) | in=96, out=1 | Trọng số: `[1, 96]`, Bias: `[1]` | 97 | Chiếu về giá trị vô hướng (scalar score) cho từng frame |
+Line 233: | **TỔNG CỘNG KHỐI POOLING**| | | **18,625** | **Chiếm 2.29% tổng tham số toàn mô hình** |
+Line 234: 
+Line 235: ---
+Line 236: 
+Line 237: ### 3.4. Khối `FC Classifier Head` (Tầng Phân Loại Nhị Phân Cuối Cùng)
+Line 238: * **Vị trí:** Tầng kết thúc của mô hình.
+Line 239: * **Cấu hình:** `nn.Sequential(nn.Dropout(p=0.35), nn.Linear(in_features=192, out_features=2))`.
+Line 240: * **Công dụng:**
+Line 241:   * Tiếp nhận vector ngữ cảnh `pooled: [Batch, 192]` (ở chế độ clip-level) hoặc `gru_out: [Batch, Time, 192]` (ở chế độ streaming-level).
+Line 242:   * Áp dụng Dropout với xác suất ngắt kết nối $p=0.35$ để ngăn chặn tình trạng phụ thuộc vào một số ít đặc trưng trọng yếu.
+Line 243:   * Chiếu tuyến tính về 2 nơ-ron đầu ra:
+Line 244:     * Index 0: Điểm số đại diện cho lớp **Tỉnh táo (Alert)**.
+Line 245:     * Index 1: Điểm số đại diện cho lớp **Buồn ngủ (Drowsy)**.
+Line 246: * **Số lượng tham số:** Trọng số `[2, 192]` (384) + Bias `[2]` (2) = **386 tham số** (Chiếm 0.05%).
+Line 247: 
+Line 248: ---
+Line 249: 
+Line 250: ### 3.5. Các Khối Chức Năng Bổ Trợ Đặc Thù Trong `datn4ni4.ipynb`
+Line 251: 
+Line 252: #### 1. Bộ tăng cường dữ liệu Tensor thời gian (`TemporalTensorAugmenter`)
+Line 253: * **Feature Gaussian Noise Injection:** Thêm nhiễu phân phối chuẩn $\mathcal{N}(0, 0.02^2)$ vào vector đặc trưng không gian với xác suất 30% (`p_noise=0.30`). Giúp mô hình không phụ thuộc cứng nhắc vào các giá trị điểm ảnh chính xác, tăng khả năng chống chịu điều kiện ánh sáng cabin xe thay đổi (ngược sáng, ban đêm, bóng cây).
+Line 254: * **Time Masking (Random Frame Dropping):** Che ngẫu nhiên 15% số frame trong chuỗi với xác suất 20% (`p_drop=0.20`, `drop_ratio=0.15`). Mô phỏng trường hợp camera bị mất frame hoặc khuôn mặt bị che khuất tạm thời (tài xế đưa tay gãi mặt, chỉnh kính).
+Line 255: 
+Line 256: #### 2. Hàm mất mát bất đối xứng phạt bỏ sót (`DrowsinessClipLoss`)
+Line 257: * Sử dụng `nn.CrossEntropyLoss` kết hợp trọng số lớp phạt nặng $FN$:
+Line 258:   $$\mathcal{L} = - \sum_{c \in \{0, 1\}} w_c \cdot y_c \cdot \log(\hat{y}_c), \quad \text{với } \mathbf{w} = [1.0, 1.35]$$
+Line 259: * **Mục đích an toàn giao thông:** Việc cảnh báo nhầm khi tài xế tỉnh táo ($FP$) chỉ gây chút phiền toái nhỏ (nghe tiếng bíp), nhưng việc bỏ sót khi tài xế ngủ gật thật sự ($FN$) sẽ trực tiếp dẫn tới tai nạn giao thông thảm khốc. Hệ số $pos\_weight = 1.35$ buộc hàm mất mát phạt nặng các trường hợp mô hình tự tin dự đoán sai lớp Buồn ngủ.
+Line 260: 
+Line 261: #### 3. Bộ tối ưu hóa và Chiến lược điều lịch (Optimizer & Scheduler)
+Line 262: * **AdamW:** `lr0 = 5e-4`, `weight_decay = 1e-3` (Tăng cường phân rã trọng số để chống Overfitting).
+Line 263: * **CosineAnnealingLR:** Giảm dần tốc độ học theo quỹ đạo hàm Cosine từ `5e-4` về `2.5e-7` qua 40 epochs.
+Line 264: * **Automatic Mixed Precision (AMP FP16):** Tăng tốc độ huấn luyện lên gấp đôi và tiết kiệm 50% dung lượng VRAM GPU.
+Line 265: * **Gradient Clipping:** `grad_clip_norm = 1.0` ngăn chặn hiện tượng bùng nổ gradient (Exploding Gradients) khi truyền qua chuỗi dài.
+Line 266: 
+Line 267: ---
+Line 268: 
+Line 269: ## 4. BẢNG TỔNG HỢP KIỂM TOÁN THAM SỐ TOÀN MÔ HÌNH (MODEL PARAMETER AUDIT)
+Line 270: 
+Line 271: Bảng phân bổ chi tiết tham số thực tế đo đạc trực tiếp từ mã nguồn `datn4ni4.ipynb`:
+Line 272: 
+Line 273: | Tên Khối Module | Các Layer Con Chính | Kích Thước Tensor Trọng Số / Bias | Số Lượng Tham Số | Tỷ Trọng (%) |
+Line 274: | :--- | :--- | :--- | :---: | :---: |
+Line 275: | **`spatial_adapter`** | `projection.0` ($p_3 \to 256$) | Linear `[256, 64]`, LayerNorm `[256]` | 17,152 | 2.10% |
+Line 276: | | `projection.1` ($p_4 \to 256$) | Linear `[256, 128]`, LayerNorm `[256]` | 33,536 | 4.11% |
+Line 277: | | `projection.2` ($p_5 \to 256$) | Linear `[256, 256]`, LayerNorm `[256]` | 66,304 | 8.13% |
+Line 278: | | `attention_mlp` (Inter-scale) | Linear `[256, 768]`, Linear `[3, 256]` | 197,635 | 24.25% |
+Line 279: | **`gru`** | Layer 0 (Input $\to$ Hidden) | $W_{ih}$ `[576, 256]`, $W_{hh}$ `[576, 192]`, Biases | 259,200 | 31.80% |
+Line 280: | | Layer 1 (Hidden $\to$ Hidden) | $W_{ih}$ `[576, 192]`, $W_{hh}$ `[576, 192]`, Biases | 222,336 | 27.27% |
+Line 281: | **`temporal_pooling`**| Attention MLP (Seq reduction) | Linear `[96, 192]`, Linear `[1, 96]`, Biases | 18,625 | 2.29% |
+Line 282: | **`fc_out`** | Binary Classifier Head | Linear `[2, 192]`, Bias `[2]` | 386 | 0.05% |
+Line 283: | **TỔNG CỘNG MÔ HÌNH** | **Toàn bộ DeepGRUClassifier** | **815,174 tham số (~0.815M)** | **815,174** | **100.00%** |
+Line 284: 
+Line 285: ### So sánh với các phiên bản tiền nhiệm:
+Line 286: * **Bản Deep LSTM v1/v2:** Sử dụng 3 tầng LSTM `hidden_dim = 256` không nén tỷ lệ $\to$ Số tham số vượt quá **1,240,000** tham số (Bị Overfitting nghiêm trọng, hiện tượng rò rỉ gradient qua padding).
+Line 287: * **Bản Deep GRU v4 (`datn4ni4.ipynb`):** Tinh gọn chỉ còn **815,174 tham số (Giảm 34.3% tổng số tham số so với bản cũ, riêng khối Recurrent giảm hơn 50%)**. Mô hình hoàn toàn nhẹ, kích thước checkpoint lưu trữ trên đĩa cứng chỉ đạt **~3.3 MB** (định dạng float32), cực kỳ lý tưởng để nạp lên Raspberry Pi 4/5, Jetson Nano, hoặc thiết bị Android/iOS.
+Line 288: 
+Line 289: ---
+Line 290: 
+Line 291: ## 5. PHÂN TÍCH ƯU ĐIỂM VÀ NHƯỢC ĐIỂM CỦA CÁC KHỐI
+Line 292: 
+Line 293: ### 5.1. Khối `SpatialFeatureAdapter`
+Line 294: 
+Line 295: ```
+Line 296:   Ưu điểm:
+Line 297:   [+] Tận dụng trọn vẹn sức mạnh đa tỷ lệ (Multi-Scale) của PAFPN Neck: Giữ được cả chi tiết vi mô (khóe mắt, mi mắt qua p3) lẫn biểu cảm toàn cảnh khuôn mặt (qua p5).
+Line 298:   [+] Cơ chế Attention thích ứng động: Khác với phép Concat cứng nhắc, Attention MLP tự gán trọng số cho từng tỷ lệ theo từng frame (ví dụ: khi tài xế cúi đầu, p5 được tăng quyền số; khi mắt nhắm hờ, p3 được tăng quyền số).
+Line 299:   [+] Chuẩn hóa LayerNorm độc lập trên từng nhánh: Giúp phân phối giá trị các tầng đặc trưng cân bằng trước khi đưa vào MLP, tránh việc tầng p5 (giá trị lớn) lấn át tầng p3.
+Line 300: 
+Line 301:   Nhược điểm:
+Line 302:   [-] Tốn thêm 314k tham số (chiếm gần 39% mô hình) cho phần MLP phối hợp đặc trưng.
+Line 303:   [-] Nếu dữ liệu huấn luyện ít biến động, cơ chế Attention giữa các scale có thể bị bão hòa (trọng số 3 tầng có xu hướng tiệm cận nhau quanh mức ~0.33).
+Line 304: ```
+Line 305: 
+Line 306: ### 5.2. Khối `DeepGRUClassifier` (2-Layer Stacked GRU)
+Line 307: 
+Line 308: ```
+Line 309:   Ưu điểm:
+Line 310:   [+] Cân bằng tối ưu giữa năng lực biểu diễn và tốc độ suy luận: 2 tầng GRU đủ sâu để phân tầng ngữ nghĩa (Tầng 1 học chuyển động cục bộ của các frame kế cận; Tầng 2 học nhịp điệu hành vi toàn clip).
+Line 311:   [+] Loại bỏ hoàn toàn cell state độc lập: Giảm 25% phép nhân ma trận so với LSTM, tiết kiệm băng thông bộ nhớ RAM/VRAM, tránh lỗi tràn bộ nhớ khi chạy trên thiết bị biên.
+Line 312:   [+] Thiết kế 2 chiều linh hoạt: Hỗ trợ cả chế độ Clip-level (`return_sequence=False` cho huấn luyện ổn định) lẫn Frame-level (`return_sequence=True` cho inference luồng liên tục).
+Line 313: 
+Line 314:   Nhược điểm:
+Line 315:   [-] Bản chất tính toán tuần tự (Sequential Nature): Không thể song song hóa hoàn toàn theo chiều thời gian như Transformer hoặc TCN trong quá trình huấn luyện.
+Line 316:   [-] Vẫn có giới hạn ngữ cảnh: Mặc dù GRU lưu giữ ngữ cảnh tốt hơn RNN truyền thống, khi chuỗi vượt quá 150 frames (khoảng > 35 giây), trạng thái ẩn có thể bắt đầu suy hao thông tin của những giây đầu tiên.
+Line 317: ```
+Line 318: 
+Line 319: ### 5.3. Khối `TemporalAttentionPooling` (Masked Sequence Reduction - Phương án A)
+Line 320: 
+Line 321: ```
+Line 322:   Ưu điểm:
+Line 323:   [+] Triệt tiêu 100% rác Gradient từ Zero-Padding: Nhờ cơ chế `masked_fill(~mask, -1e9)`, các frame padding hoàn toàn không đóng góp vào biểu diễn ngữ cảnh và không làm lệch trọng số hồi quy.
+Line 324:   [+] Tập trung đúng vào thời điểm vàng (Salient Temporal Event): Tự động dồn trọng số chú ý cao vào những giây tài xế có hành vi bất thường (ngáp, nhắm mắt kéo dài) thay vì trung bình đều như Mean-Pooling.
+Line 325:   [+] Chi phí tính toán siêu nhẹ: Chỉ tốn 18.6k tham số nhưng mang lại bước nhảy vọt về độ chính xác và ổn định hội tụ.
+Line 326:   [+] Trực quan hóa giải thích được (Explainable AI - XAI): Vector trọng số chú ý `attn_weights` có thể vẽ ra đồ thị để kiểm chứng xem mô hình có thực sự nhìn vào khoảnh khắc tài xế ngủ gật hay không.
+Line 327: 
+Line 328:   Nhược điểm:
+Line 329:   [-] Khi huấn luyện theo chế độ Clip Pooling, mô hình không sinh nhãn tức thời cho từng frame riêng lẻ mà chỉ ra quyết định cho toàn clip (Khắc phục bằng cờ `return_sequence=True` khi triển khai thực tế).
+Line 330: ```
+Line 331: 
+Line 332: ### 5.4. Khối Phân Loại Đầu Ra & Chiến Lược Huấn Luyện (Clip Loss, F1/F2 Song Hành)
+Line 333: 
+Line 334: ```
+Line 335:   Ưu điểm:
+Line 336:   [+] Ưu tiên an toàn tuyệt đối cho hệ thống DMS: Nhờ `pos_weight = 1.35` và giám sát theo dõi theo F2-Score, mô hình chủ động phạt nặng lỗi bỏ sót (FN), nâng cao độ nhạy phát hiện buồn ngủ.
+Line 337:   [+] Mô-đun Quét Ngưỡng An Toàn (Threshold Tuner): Cho phép tách rời ngưỡng quyết định khỏi mốc 0.50 cố định. Bằng việc chọn ngưỡng tối ưu th_safe (ví dụ: 0.38 - 0.44), hệ thống giảm mạnh số ca tài xế ngủ gật bị lọt lưới trong khi vẫn kiểm soát tốt báo động giả.
+Line 338:   [+] Cơ chế Dual Checkpoints: Đồng thời lưu giữ cả `best_gru_f1.pth` (cho các bài toán yêu cầu cân bằng chuẩn xác) và `best_gru_f2.pth` (cho môi trường xe hơi thực tế đòi hỏi an toàn tối thượng).
+Line 339: 
+Line 340:   Nhược điểm:
+Line 341:   [-] Việc thiên lệch trọng số về Recall (thông qua pos_weight và F2) sẽ làm giảm nhẹ chỉ số Precision (tăng số ca cảnh báo nhầm khi tài xế đang tỉnh nhưng có biểu cảm mệt mỏi hoặc nheo mắt). Cần kết hợp bộ lọc làm mịn thời gian (Temporal Smoothing / Debounce Filter) ở tầng ứng dụng xe hơi.
+Line 342: ```
+Line 343: 
+Line 344: ---
+Line 345: 
+Line 346: ## 6. HƯỚNG DẪN TRIỂN KHAI VÀ KHUYẾN NGHỊ THỰC TẾ (INFERENCE & DEPLOYMENT GUIDE)
+Line 347: 
+Line 348: ### 6.1. Phương Thức Nạp Trọng Số Độc Lập
+Line 349: Mô hình `DeepGRUClassifier` trong `datn4ni4.ipynb` hỗ trợ phương thức khởi tạo tĩnh `from_checkpoint`, tự động nhận diện kiến trúc và nạp trọng số tương thích:
+Line 350: 
+Line 351: ```python
+Line 352: import torch
+Line 353: from LSTM.model_v4 import DeepGRUClassifier  # hoặc import từ cell mã nguồn
+Line 354: 
+Line 355: # Nạp checkpoint tối ưu F2 an toàn cho xe hơi
+Line 356: checkpoint_path = "runs_output/checkpoints/best_gru_f2.pth"
+Line 357: model = DeepGRUClassifier.from_checkpoint(checkpoint_path, map_location="cpu")
+Line 358: model.eval()
+Line 359: ```
+Line 360: 
+Line 361: ### 6.2. Triển Khai Trong Môi Trường Thời Gian Thực (In-Vehicle Real-Time Streaming)
+Line 362: Khi tích hợp vào ứng dụng xe hơi chạy với camera thời gian thực, có 2 phương án suy luận:
+Line 363: 
+Line 364: ```mermaid
+Line 365: flowchart TD
+Line 366:     subgraph SlidingWindow["Phương án 1: Cửa sổ trượt (Sliding Window Clip - Khuyến nghị)"]
+Line 367:         Cam1["Camera 4 FPS"] --> Buffer["Bộ đệm tròn FIFO: Lưu 40 khung hình gần nhất (~10s)"]
+Line 368:         Buffer --> InferClip["Chạy mô hình Clip-level: return_sequence = False"]
+Line 369:         InferClip --> Prob1["Xác suất P(Drowsy) = Softmax(logits)[1]"]
+Line 370:         Prob1 --> ThreshCheck1{"P(Drowsy) >= th_safe (0.38)?"}
+Line 371:         ThreshCheck1 -->|"Có"| Alert1["Kích hoạt Cảnh báo Buồn ngủ"]
+Line 372:         ThreshCheck1 -->|"Không"| Normal1["Trạng thái Bình thường"]
+Line 373:     end
+Line 374: 
+Line 375:     subgraph StateStreaming["Phương án 2: Duy trì Trạng thái Ẩn liên tục (Hidden State Passing)"]
+Line 376:         Cam2["Camera 4 FPS"] --> FrameExt["Trích xuất đặc trưng từng frame [1, 1, 64/128/256]"]
+Line 377:         FrameExt --> StepInfer["Chạy frame-by-frame: model(features, h_0=h_prev, return_sequence=True)"]
+Line 378:         StepInfer --> UpdateH["Cập nhật h_prev = h_new"]
+Line 379:         StepInfer --> SmoothFilter["Bộ lọc trung bình trượt thời gian (Temporal Smoothing 3-5 frames)"]
+Line 380:         SmoothFilter --> ThreshCheck2{"P_smooth >= th_safe?"}
+Line 381:         ThreshCheck2 -->|"Có"| Alert2["Kích hoạt Cảnh báo Buồn ngủ"]
+Line 382:         ThreshCheck2 -->|"Không"| Normal2["Trạng thái Bình thường"]
+Line 383:     end
+Line 384: ```
+Line 385: 
+Line 386: ### 6.3. Khuyến Nghị Phân Cấp Cảnh Báo An Toàn (Multi-Level DMS Alarm):
+Line 387: Dựa trên kết quả từ tệp cấu hình `threshold_config.json` sinh ra từ notebook `datn4ni4.ipynb`:
+Line 388: 1. **Mức 1 - Cảnh báo nhắc nhở nhẹ ($th \in [0.35, 0.45]$ kéo dài $\ge 2$ giây):**
+Line 389:    * Phát âm thanh "Bíp" nhắc nhở nhẹ nhàng hoặc hiển thị biểu tượng tách cà phê trên màn hình đồng hồ tốc độ (Cluster Dashboard).
+Line 390: 2. **Mức 2 - Cảnh báo nguy hiểm ($th \ge 0.50$ kéo dài $\ge 1.5$ giây hoặc mắt nhắm liên tục):**
+Line 391:    * Báo động âm thanh cường độ cao, kích hoạt rung vô lăng hoặc siết dây đai an toàn điện tử (Haptic Feedback) để đánh thức tài xế ngay lập tức.
+Line 392: 3. **Bộ lọc chống báo động giả (Debounce Logic):**
+Line 393:    * Không kích hoạt chuông báo nếu hiện tượng chỉ xuất hiện dưới $1.0$ giây (tương đương $\le 4$ frames tại 4 FPS) để loại trừ hành vi chớp mắt tự nhiên hoặc tài xế nheo mắt do ánh nắng chói chiếu vào kính lái.
+Line 394: 
+Line 395: ---
+Line 396: *Tài liệu được biên soạn phục vụ công tác nghiệm thu Đồ án Tốt nghiệp & hoàn thiện hệ thống Driver Guardian.*

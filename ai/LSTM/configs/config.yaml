@@ -1,0 +1,111 @@
+# ==============================================================================
+# DRIVER GUARDIAN - DEEP GRU CONFIGURATION FILE
+# ==============================================================================
+
+# ---- 1. DATASET CONFIGURATION (TRAIN: HDF5, VAL: RAW VIDEO ONNX) ----
+dataset:
+  # Tập huấn luyện (HDF5FeatureDataset)
+  train_h5: E:\LSTM\checkpoints\dataset_features.h5
+  train_manifest_csv: null
+  include_augmented_train: true
+  
+  # Tập kiểm định (HDF5FeatureDataset)
+  val_h5: null
+  val_manifest_csv: null
+  val_batch_size: 16
+  val_num_workers: 0
+
+  # Tham số khung hình chung
+  seq_len: 50
+  sample_interval: 0.1
+  image_size: [640, 640]
+  video_exits: [".avi", ".mp4", ".mkv"]
+  train_ratio: 0.8
+  split_by_subject: true
+
+# ---- 2. DATALOADER CONFIGURATION ----
+dataloader:
+  batch_size: 16
+  num_workers: 0
+  pin_memory: false
+  shuffle: true
+  drop_last: false
+  persistent_workers: false
+  prefetch_factor: null
+  seed: 42
+  chunk_size: 16
+  use_dummy_cnn: false
+
+# ---- 3. MODEL ARCHITECTURE CONFIGURATION ----
+model:
+  backbone_onnx_path: "checkpoints/backbone.onnx"
+  backbone_neck_onnx_path: "checkpoints/backbone_neck.onnx"
+  cnn_neck_channels: [64, 128, 256]
+  cnn_strides: [8, 16, 32]
+  cnn_num_features: 3
+  cnn_out_channels: 448
+  cnn_spatial_size: [20, 20]
+  spatial_fusion: "concat"
+  adapter_dropout: 0.25
+  use_norm: true
+  input_dim: 512
+  hidden_dim: 256 #192
+  num_layers: 2
+  num_classes: 2
+  dropout: 0.35
+  supervision_mode: "attention_pooling"
+
+# ---- 4. LOSS CONFIGURATION ----
+loss:
+  loss_type: "ce"
+  bce_eps: 1.0e-7
+  bce_reduction: "mean"
+  pos_weight: null
+
+# ---- 5. OPTIMIZER & SCHEDULER CONFIGURATION ----
+optimizer:
+  epochs: 40
+  lr0: 0.001
+  lr_min_factor: 0.01
+  weight_decay: 0.0001
+  warmup_epochs: 1.0
+  optimizer: "adamw"
+  betas: [0.9, 0.999]
+  momentum: 0.9
+  grad_clip_norm: 1.0
+  use_scheduler: true
+  scheduler_type: "cosine"
+
+# ---- 6. CHECKPOINTS, EARLY STOPPING & DIAGNOSTICS CONFIGURATION ----
+logging:
+  tb_log_dir: "logs/tensorboard"
+  log_dir: "logs"
+  experiment_name: "deepgru_h5train_rawval"
+  checkpoint_dir: "checkpoints/experiments"
+  save_ckpt_interval_epochs: 5
+  save_best_only: false
+  ckpt_keep_last: 3
+  resume: ""
+
+  # Early Stopping
+  early_stopping: true
+  patience: 10
+  monitor_metric: "val_f1"
+  monitor_mode: "max"
+  min_delta: 0.0001
+
+  # File kết quả và biểu đồ chẩn đoán
+  history_csv_path: "logs/training_history.csv"
+  summary_json_path: "logs/training_summary.json"
+  plot_curves_path: "logs/loss_accuracy_curves.png"
+  plot_cm_path: "logs/confusion_matrix_best.png"
+  plot_roc_path: "logs/roc_pr_curves.png"
+  dry_run: false
+
+# ---- 7. RUNTIME & HARDWARE CONFIGURATION ----
+runtime:
+  device: "cuda"
+  amp: true
+  log_interval: 10
+  val_interval_epochs: 1
+  use_tqdm: true

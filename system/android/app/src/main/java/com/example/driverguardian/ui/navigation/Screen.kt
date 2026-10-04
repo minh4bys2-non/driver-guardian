@@ -1,6 +1,8 @@
 package com.example.driverguardian.ui.navigation
 
 sealed class Screen(val route: String) {
+    data object Login : Screen("login")
+    data object DriverProfileSetup : Screen("driver_profile_setup")
     data object Home : Screen("home")
     data object Selection : Screen("selection")
     data object PreTripCheck : Screen("pre_trip_check")

@@ -1,0 +1,207 @@
+package com.example.driverguardian.data.remote.dto
+
+import com.example.driverguardian.domain.model.AuthTokens
+import com.example.driverguardian.domain.model.Driver
+import com.example.driverguardian.domain.model.DriverSummary
+import com.example.driverguardian.domain.model.DrowsinessEvent
+import com.example.driverguardian.domain.model.DrivingSession
+import com.example.driverguardian.domain.model.ModelVersion
+import com.example.driverguardian.domain.model.TripSession
+import com.example.driverguardian.domain.model.UserProfile
+import com.example.driverguardian.domain.model.Vehicle
+import com.google.gson.annotations.SerializedName
+
+data class DriverResponseDto(
+    @SerializedName("driver_id") val driverId: Int,
+    @SerializedName("driver_code") val driverCode: String,
+    @SerializedName("full_name") val fullName: String,
+    @SerializedName("phone_number") val phoneNumber: String?,
+    @SerializedName("license_number") val licenseNumber: String?,
+    @SerializedName("status") val status: String,
+    @SerializedName("created_at") val createdAt: String
+)
+
+data class VehicleResponseDto(
+    @SerializedName("vehicle_id") val vehicleId: Int,
+    @SerializedName("plate_number") val plateNumber: String,
+    @SerializedName("vehicle_name") val vehicleName: String?,
+    @SerializedName("vehicle_type") val vehicleType: String?,
+    @SerializedName("device_code") val deviceCode: String?,
+    @SerializedName("status") val status: String,
+    @SerializedName("created_at") val createdAt: String,
+    @SerializedName("driver_id") val driverId: Int? = null
+)
+
+data class ModelVersionResponseDto(
+    @SerializedName("model_version_id") val modelVersionId: Int,
+    @SerializedName("version_name") val versionName: String,
+    @SerializedName("model_type") val modelType: String?,
+    @SerializedName("file_name") val fileName: String?,
+    @SerializedName("description") val description: String?,
+    @SerializedName("is_active") val isActive: String,
+    @SerializedName("deployed_at") val deployedAt: String
+)
+
+data class DrivingSessionCreateDto(
+    @SerializedName("driver_id") val driverId: Int,
+    @SerializedName("vehicle_id") val vehicleId: Int,
+    @SerializedName("model_version_id") val modelVersionId: Int
+)
+
+data class DrivingSessionResponseDto(
+    @SerializedName("session_id") val sessionId: Int,
+    @SerializedName("driver_id") val driverId: Int,
+    @SerializedName("vehicle_id") val vehicleId: Int,
+    @SerializedName("model_version_id") val modelVersionId: Int?,
+    @SerializedName("start_time") val startTime: String,
+    @SerializedName("duration_seconds") val durationSeconds: Int,
+    @SerializedName("total_alerts") val totalAlerts: Int,
+    @SerializedName("status") val status: String,
+    @SerializedName("sync_status") val syncStatus: String,
+    @SerializedName("end_time") val endTime: String? = null,
+    @SerializedName("safety_score") val safetyScore: Double? = null
+)
+
+data class TripSessionResponseDto(
+    @SerializedName("session_id") val sessionId: Int,
+    @SerializedName("driver_id") val driverId: Int,
+    @SerializedName("driver_name") val driverName: String,
+    @SerializedName("vehicle_id") val vehicleId: Int,
+    @SerializedName("vehicle_name") val vehicleName: String?,
+    @SerializedName("plate_number") val plateNumber: String,
+    @SerializedName("model_version_id") val modelVersionId: Int?,
+    @SerializedName("version_name") val versionName: String?,
+    @SerializedName("start_time") val startTime: String,
+    @SerializedName("end_time") val endTime: String?,
+    @SerializedName("duration_seconds") val durationSeconds: Int,
+    @SerializedName("total_alerts") val totalAlerts: Int,
+    @SerializedName("safety_score") val safetyScore: Double?,
+    @SerializedName("status") val status: String,
+    @SerializedName("sync_status") val syncStatus: String
+)
+
+data class DrowsinessEventCreateDto(
+    @SerializedName("session_id") val sessionId: Int,
+    @SerializedName("driver_state") val driverState: String,
+    @SerializedName("alert_level") val alertLevel: Int,
+    @SerializedName("confidence") val confidence: Double?,
+    @SerializedName("duration_ms") val durationMs: Int?
+)
+
+data class DrowsinessEventResponseDto(
+    @SerializedName("event_id") val eventId: Int,
+    @SerializedName("session_id") val sessionId: Int,
+    @SerializedName("event_time") val eventTime: String,
+    @SerializedName("driver_state") val driverState: String,
+    @SerializedName("alert_level") val alertLevel: Int,
+    @SerializedName("confidence") val confidence: Double?,
+    @SerializedName("drowsiness_score") val drowsinessScore: Double? = null,
+    @SerializedName("ear_value") val earValue: Double? = null,
+    @SerializedName("mar_value") val marValue: Double? = null,
+    @SerializedName("head_pose") val headPose: String? = null,
+    @SerializedName("duration_ms") val durationMs: Int?,
+    @SerializedName("acknowledged") val acknowledged: String,
+    @SerializedName("sync_status") val syncStatus: String
+)
+
+data class GoogleAuthRequestDto(
+    @SerializedName("id_token") val idToken: String
+)
+
+data class RefreshTokenRequestDto(
+    @SerializedName("refresh_token") val refreshToken: String
+)
+
+data class LogoutRequestDto(
+    @SerializedName("refresh_token") val refreshToken: String? = null
+)
+
+data class DriverSummaryDto(
+    @SerializedName("driver_id") val driverId: Int,
+    @SerializedName("driver_code") val driverCode: String,
+    @SerializedName("full_name") val fullName: String
+)
+
+data class UserProfileResponseDto(
+    @SerializedName("user_id") val userId: Int,
+    @SerializedName("email") val email: String,
+    @SerializedName("display_name") val displayName: String?,
+    @SerializedName("avatar_url") val avatarUrl: String?,
+    @SerializedName("role") val role: String,
+    @SerializedName("driver") val driver: DriverSummaryDto?
+)
+
+data class AuthTokensResponseDto(
+    @SerializedName("access_token") val accessToken: String,
+    @SerializedName("refresh_token") val refreshToken: String,
+    @SerializedName("token_type") val tokenType: String = "bearer",
+    @SerializedName("expires_in") val expiresIn: Int = 1800,
+    @SerializedName("user") val user: UserProfileResponseDto
+)
+
+data class DriverProfileCreateDto(
+    @SerializedName("full_name") val fullName: String,
+    @SerializedName("phone_number") val phoneNumber: String?,
+    @SerializedName("license_number") val licenseNumber: String
+)
+
+data class DriverProfileUpdateDto(
+    @SerializedName("full_name") val fullName: String? = null,
+    @SerializedName("phone_number") val phoneNumber: String? = null,
+    @SerializedName("license_number") val licenseNumber: String? = null
+)
+
+data class VehicleCreateDto(
+    @SerializedName("plate_number") val plateNumber: String,
+    @SerializedName("vehicle_name") val vehicleName: String,
+    @SerializedName("vehicle_type") val vehicleType: String,
+    @SerializedName("device_code") val deviceCode: String? = null
+)
+
+data class VehicleUpdateDto(
+    @SerializedName("plate_number") val plateNumber: String? = null,
+    @SerializedName("vehicle_name") val vehicleName: String? = null,
+    @SerializedName("vehicle_type") val vehicleType: String? = null,
+    @SerializedName("device_code") val deviceCode: String? = null
+)
+
+fun DriverResponseDto.toDomain() = Driver(driverId, driverCode, fullName, phoneNumber, licenseNumber, status, createdAt)
+fun VehicleResponseDto.toDomain() = Vehicle(vehicleId, plateNumber, vehicleName, vehicleType, deviceCode, status, createdAt, driverId)
+fun ModelVersionResponseDto.toDomain() = ModelVersion(modelVersionId, versionName, modelType, fileName, description, isActive, deployedAt)
+fun DrivingSessionResponseDto.toDomain() = DrivingSession(
+    id = sessionId,
+    driverId = driverId,
+    vehicleId = vehicleId,
+    modelVersionId = modelVersionId,
+    startTime = startTime,
+    durationSeconds = durationSeconds,
+    totalAlerts = totalAlerts,
+    status = status,
+    syncStatus = syncStatus,
+    endTime = endTime,
+    safetyScore = safetyScore
+)
+fun TripSessionResponseDto.toDomain() = TripSession(
+    sessionId, driverId, driverName, vehicleId, vehicleName, plateNumber,
+    modelVersionId, versionName, startTime, endTime, durationSeconds,
+    totalAlerts, safetyScore, status, syncStatus
+)
+fun DrowsinessEventResponseDto.toDomain() = DrowsinessEvent(
+    id = eventId,
+    sessionId = sessionId,
+    eventTime = eventTime,
+    driverState = driverState,
+    alertLevel = alertLevel,
+    confidence = confidence,
+    durationMs = durationMs,
+    acknowledged = acknowledged,
+    syncStatus = syncStatus,
+    drowsinessScore = drowsinessScore,
+    earValue = earValue,
+    marValue = marValue,
+    headPose = headPose
+)
+
+fun DriverSummaryDto.toDomain() = DriverSummary(driverId, driverCode, fullName)
+fun UserProfileResponseDto.toDomain() = UserProfile(userId, email, displayName, avatarUrl, role, driver?.toDomain())
+fun AuthTokensResponseDto.toTokensDomain() = AuthTokens(accessToken, refreshToken, tokenType, expiresIn)

@@ -40,6 +40,8 @@ class TrainConfig:
     val_num_workers: int = 0  # Số worker tiến trình nạp tập val (0 để chạy tối ưu với ONNX trên GPU)
     min_frames: int = 10  # Số khung hình tối thiểu cho mỗi video clip
     dataset_dir: str = r"D:\Project\AI\dataset\filtered_SUST\in_threshold"  # Đường dẫn tới thư mục video thô (filtered_SUST)
+    manifest_file: Optional[str] = None  # Đường dẫn tệp CSV/JSON manifest cho dataset video thô (tùy chọn)
+    backbone_neck_checkpoint: Optional[str] = None  # Đường dẫn checkpoint .pt của BackboneNeck (None = dùng mặc định)
     
     # Thông số khung hình chung
     seq_len: Optional[int] = None  # Số lượng khung hình cố định cho mỗi video (None: lấy toàn bộ video)
@@ -105,10 +107,13 @@ class TrainConfig:
     log_dir: str = "logs"  # Thư mục lưu log text (.log)
     experiment_name: str = "deepgru_h5train_rawval"  # Tên bài thử nghiệm (experiment)
     checkpoint_dir: str = "checkpoints/experiments"  # Thư mục lưu checkpoint mô hình (.pt)
-    save_ckpt_interval_epochs: int = 5  # Số epoch giữa 2 lần lưu checkpoint định kỳ
+    save_ckpt_interval_epochs: int = 1  # Số epoch giữa 2 lần lưu checkpoint định kỳ (khi save_all_epochs=False)
     save_best_only: bool = False  # True: Chỉ lưu best checkpoint | False: Lưu định kỳ + last/best
-    ckpt_keep_last: int = 3  # Số lượng checkpoint định kỳ giữ lại
-    resume: str = ""  # Đường dẫn file checkpoint để huấn luyện tiếp (rỗng = train từ đầu)
+    ckpt_keep_last: Optional[int] = None  # Số lượng checkpoint định kỳ giữ lại (None hoặc 0 = giữ toàn bộ)
+    save_all_epochs: bool = True  # True: Lưu checkpoint cho TẤT CẢ các epoch | False: Lưu theo chu kỳ
+    enable_resume: bool = False  # Cờ bật/tắt nạp lại: True = Cho phép resume | False = Luôn train mới từ Epoch 1
+    resume_epoch: Optional[int] = None  # Số epoch cụ thể cần nạp lại (vd: 10). Chỉ có tác dụng khi enable_resume=True
+    resume: str = ""  # Đường dẫn file checkpoint, số epoch hoặc bí danh ('last', 'best') để huấn luyện tiếp
     
     # Cơ chế Dừng sớm (Early Stopping)
     early_stopping: bool = True  # Bật/tắt Early Stopping
@@ -174,6 +179,11 @@ class TrainConfig:
         assert self.epochs > 0, "epochs phải > 0"
         assert self.lr0 > 0.0, "lr0 phải > 0"
         assert self.patience > 0, "patience phải > 0"
+        if self.resume_epoch is not None:
+            assert self.resume_epoch >= 1, "resume_epoch phải là số nguyên dương >= 1"
+        if not self.enable_resume and (self.resume_epoch is not None or self.resume):
+            # Cảnh báo nhẹ người dùng rằng cờ enable_resume đang tắt
+            pass
 
         # 3. Cơ chế tự động bảo vệ tài nguyên (Safety Guard) trên Windows và GPU
         if os.name == "nt":

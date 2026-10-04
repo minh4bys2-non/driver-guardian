@@ -82,9 +82,12 @@ logging:
   log_dir: "logs"
   experiment_name: "deepgru_h5train_rawval"
   checkpoint_dir: "checkpoints/experiments"
-  save_ckpt_interval_epochs: 5
+  save_all_epochs: true
+  save_ckpt_interval_epochs: 1
   save_best_only: false
-  ckpt_keep_last: 3
+  ckpt_keep_last: null
+  enable_resume: true
+  resume_epoch: 2
   resume: ""
 
   # Early Stopping

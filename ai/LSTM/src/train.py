@@ -368,6 +368,7 @@ class TrainingVisualizer:
     def __init__(self, config: TrainConfig) -> None:
         self.config = config
         self.history: List[Dict[str, Any]] = []
+        self._ema_loss: Optional[float] = None
 
         # Khởi tạo TensorBoard SummaryWriter
         self.tb_writer = None
@@ -379,6 +380,35 @@ class TrainingVisualizer:
         # Đảm bảo các thư mục đích tồn tại
         Path(config.log_dir).mkdir(parents=True, exist_ok=True)
         Path(config.checkpoint_dir).mkdir(parents=True, exist_ok=True)
+
+    def update_ema_loss(self, current_loss: float, beta: float = 0.95) -> float:
+        """Cập nhật giá trị hàm mất mát làm mượt theo cấp số nhân (Exponential Moving Average)."""
+        if self._ema_loss is None:
+            self._ema_loss = float(current_loss)
+        else:
+            self._ema_loss = float(beta * self._ema_loss + (1.0 - beta) * current_loss)
+        return self._ema_loss
+
+    def log_step(self, global_step: int, metrics: Dict[str, float]) -> None:
+        """
+        Ghi nhận các số đo chi tiết tại mốc global_step vào TensorBoard.
+        Bảo đảm phân cấp namespace rõ ràng trong nhóm 'Step/...'.
+        """
+        if self.tb_writer is None or not metrics:
+            return
+
+        for tag, val in metrics.items():
+            if val is not None and not (isinstance(val, float) and (np.isnan(val) or np.isinf(val))):
+                clean_tag = tag if tag.startswith("Step/") else f"Step/{tag}"
+                self.tb_writer.add_scalar(clean_tag, float(val), global_step)
+
+    def flush(self) -> None:
+        """Xả bộ đệm ghi sự kiện TensorBoard xuống đĩa cứng an toàn."""
+        if self.tb_writer is not None:
+            try:
+                self.tb_writer.flush()
+            except Exception:
+                pass
 
     def log_epoch(
         self,
@@ -424,24 +454,33 @@ class TrainingVisualizer:
 
         self.history.append(entry)
 
-        # Ghi sang TensorBoard
+        # Ghi sang TensorBoard (bảo toàn 100% các tag gốc và bổ sung tag chuẩn hóa Epoch/)
         if self.tb_writer is not None:
             self.tb_writer.add_scalar("Loss/Train", entry["train_loss"], epoch)
             self.tb_writer.add_scalar("Accuracy/Train", entry["train_acc"], epoch)
             self.tb_writer.add_scalar("F1_Drowsy/Train", entry["train_f1"], epoch)
+            self.tb_writer.add_scalar("Epoch/Loss/Train", entry["train_loss"], epoch)
+            self.tb_writer.add_scalar("Epoch/Accuracy/Train", entry["train_acc"], epoch)
+            self.tb_writer.add_scalar("Epoch/F1_Drowsy/Train", entry["train_f1"], epoch)
             self.tb_writer.add_scalar("LearningRate", lr, epoch)
             self.tb_writer.add_scalar("GradNorm", grad_norm, epoch)
+            self.tb_writer.add_scalar("Epoch/LearningRate", lr, epoch)
+            self.tb_writer.add_scalar("Epoch/GradNorm", grad_norm, epoch)
 
             if val_metrics is not None:
                 self.tb_writer.add_scalar("Loss/Val", entry["val_loss"], epoch)
                 self.tb_writer.add_scalar("Accuracy/Val", entry["val_acc"], epoch)
                 self.tb_writer.add_scalar("F1_Drowsy/Val", entry["val_f1"], epoch)
+                self.tb_writer.add_scalar("Epoch/Loss/Val", entry["val_loss"], epoch)
+                self.tb_writer.add_scalar("Epoch/Accuracy/Val", entry["val_acc"], epoch)
+                self.tb_writer.add_scalar("Epoch/F1_Drowsy/Val", entry["val_f1"], epoch)
                 self.tb_writer.add_scalar("Precision_Drowsy/Val", entry["val_precision"], epoch)
                 self.tb_writer.add_scalar("Recall_Drowsy/Val", entry["val_recall"], epoch)
                 self.tb_writer.add_scalar("Specificity_Alert/Val", entry["val_specificity"], epoch)
                 self.tb_writer.add_scalar("AUC_ROC/Val", entry["val_auc_roc"], epoch)
                 self.tb_writer.add_scalar("AUC_PR/Val", entry["val_auc_pr"], epoch)
                 self.tb_writer.add_scalar("Diagnostics/Generalization_Gap_Loss", entry["gap_loss"], epoch)
+                self.tb_writer.add_scalar("Epoch/Diagnostics/Generalization_Gap_Loss", entry["gap_loss"], epoch)
 
             self.tb_writer.flush()
 
@@ -675,6 +714,7 @@ class CheckpointManager:
         self.patience_counter = 0
         self.best_epoch = 0
         self.periodic_ckpts: List[Path] = []
+        self.last_resumed_global_step: Optional[int] = None
 
         if self.mode == "min":
             self.best_score = float("inf")
@@ -808,6 +848,7 @@ class CheckpointManager:
         self,
         current_metrics: Optional[Dict[str, float]] = None,
         epoch: int = 1,
+        global_step: int = 0,
         model: Optional[nn.Module] = None,
         optimizer: Optional[torch.optim.Optimizer] = None,
         scheduler: Optional[Any] = None,
@@ -827,6 +868,7 @@ class CheckpointManager:
         # 1. Đóng gói checkpoint data
         checkpoint_data: Dict[str, Any] = {
             "epoch": epoch,
+            "global_step": int(global_step),
             "best_epoch": self.best_epoch,
             "best_score": self.best_score,
             "patience_counter": self.patience_counter,
@@ -954,12 +996,15 @@ class CheckpointManager:
 
         resumed_epoch = int(checkpoint.get("epoch", 0))
         start_epoch = resumed_epoch + 1
+        resumed_global_step = checkpoint.get("global_step", None)
+        self.last_resumed_global_step = int(resumed_global_step) if resumed_global_step is not None else None
         self.best_score = float(checkpoint.get("best_score", self.best_score))
         self.best_epoch = int(checkpoint.get("best_epoch", resumed_epoch))
         self.patience_counter = int(checkpoint.get("patience_counter", 0))
 
+        step_info = f", Global Step: {self.last_resumed_global_step}" if self.last_resumed_global_step is not None else ""
         self.logger.info(
-            f"[✓] Đã khôi phục trạng thái thành công từ Epoch {resumed_epoch}! "
+            f"[✓] Đã khôi phục trạng thái thành công từ Epoch {resumed_epoch}{step_info}! "
             f"Sẽ bắt đầu huấn luyện từ Epoch {start_epoch} "
             f"(Kỷ lục '{self.monitor}': {self.best_score:.4f} tại Epoch {self.best_epoch}, Patience: {self.patience_counter})."
         )
@@ -1028,6 +1073,7 @@ class DrowsinessTrainer1:
 
         # Biến theo dõi trạng thái và xử lý Resume
         self.start_epoch = 1
+        self.global_step = 0
         enable_resume = getattr(self.config, "enable_resume", False)
         resume_epoch = getattr(self.config, "resume_epoch", None)
         resume_target = getattr(self.config, "resume", "")
@@ -1042,6 +1088,15 @@ class DrowsinessTrainer1:
                 scheduler=self.scheduler,
                 scaler=self.scaler
             )
+            # Khôi phục biến đếm global_step
+            if self.checkpoint_manager.last_resumed_global_step is not None:
+                self.global_step = self.checkpoint_manager.last_resumed_global_step
+                self.logger.info(f"    [+] Đã khôi phục biến global_step = {self.global_step} từ checkpoint.")
+            else:
+                num_batches = len(self.train_loader) if hasattr(self, "train_loader") else 0
+                self.global_step = max(0, (self.start_epoch - 1) * num_batches)
+                self.logger.info(f"    [*] Checkpoint chưa có global_step, tự động suy luận: global_step = {self.global_step}.")
+
             # Đồng bộ lịch sử visualizer từ file CSV cũ
             synced_count = self.visualizer.sync_history_from_csv(resumed_epoch=self.start_epoch - 1)
             if synced_count > 0:
@@ -1285,6 +1340,8 @@ class DrowsinessTrainer1:
         )
 
         for batch_idx, (features, targets, seq_lens, metas) in enumerate(pbar, start=1):
+            step_start_time = time.perf_counter()
+            self.global_step += 1
             try:
                 p3, p4, p5 = features
                 p3 = p3.to(self.device, non_blocking=True)
@@ -1324,6 +1381,63 @@ class DrowsinessTrainer1:
                     self.metrics_tracker.update(preds, targets, probs, float(loss.item()), p3.size(0))
 
                 temp_acc = (preds == targets).float().mean().item()
+
+                # Ghi nhận TensorBoard Per-Step Metrics định kỳ
+                should_log_step = (
+                    getattr(self.config, "enable_step_logging", True)
+                    and (
+                        (batch_idx % getattr(self.config, "log_step_interval", 5) == 0)
+                        or (batch_idx == total_batches)
+                    )
+                )
+                if should_log_step:
+                    step_duration_s = max(1e-5, time.perf_counter() - step_start_time)
+                    step_time_ms = step_duration_s * 1000.0
+                    loss_val = float(loss.item())
+                    smooth_loss = self.visualizer.update_ema_loss(loss_val, beta=getattr(self.config, "ema_beta", 0.95))
+
+                    seq_lens_arr = seq_lens.detach().cpu().numpy() if hasattr(seq_lens, "detach") else np.array(seq_lens)
+                    seq_len_mean = float(np.mean(seq_lens_arr)) if len(seq_lens_arr) > 0 else 0.0
+                    seq_len_max = float(np.max(seq_lens_arr)) if len(seq_lens_arr) > 0 else 0.0
+                    batch_total_frames = int(np.sum(seq_lens_arr)) if len(seq_lens_arr) > 0 else int(p3.size(0))
+                    drowsy_ratio = float((targets == 1).sum().item()) / float(max(1, targets.numel()))
+
+                    grad_scale = float(self.scaler.get_scale()) if hasattr(self.scaler, "get_scale") else 1.0
+                    throughput_samples = float(p3.size(0)) / step_duration_s
+                    throughput_frames = float(batch_total_frames) / step_duration_s
+
+                    step_metrics: Dict[str, float] = {
+                        "Loss/train_step": loss_val,
+                        "Loss/train_smooth_ema": smooth_loss,
+                        "Loss/train_running": float(self.metrics_tracker.running_loss),
+                        "Accuracy/train_step": float(temp_acc) * 100.0,
+                        "Accuracy/train_running": float(self.metrics_tracker.running_acc),
+                        "Optimizer/lr_step": float(current_lr),
+                        "Optimizer/grad_norm_preclip": float(cur_gnorm),
+                        "Optimizer/grad_scale": grad_scale,
+                        "Data/seq_len_mean": seq_len_mean,
+                        "Data/seq_len_max": seq_len_max,
+                        "Data/batch_total_frames": float(batch_total_frames),
+                        "Data/drowsy_ratio": drowsy_ratio,
+                        "Perf/step_time_ms": step_time_ms,
+                        "Perf/throughput_samples_per_sec": throughput_samples,
+                        "Perf/throughput_frames_per_sec": throughput_frames,
+                    }
+
+                    if self.device.type == "cuda":
+                        v_info_curr = get_vram_info(self.device)
+                        step_metrics.update({
+                            "System/vram_allocated_gb": float(v_info_curr["allocated_gb"]),
+                            "System/vram_reserved_gb": float(v_info_curr["reserved_gb"]),
+                            "System/vram_peak_gb": float(v_info_curr["peak_gb"]),
+                            "System/vram_percent": float(v_info_curr["percent_used"]),
+                        })
+
+                    self.visualizer.log_step(self.global_step, step_metrics)
+
+                flush_interval = getattr(self.config, "flush_step_interval", 50)
+                if flush_interval > 0 and (batch_idx % flush_interval == 0 or batch_idx == total_batches):
+                    self.visualizer.flush()
 
                 # Truy vấn thông tin VRAM real-time
                 vram_postfix = ""
@@ -1376,6 +1490,7 @@ class DrowsinessTrainer1:
                     cleanup_cuda_memory(force_gc=False)
 
         pbar.close()
+        self.visualizer.flush()
         train_metrics = self.metrics_tracker.compute()
         avg_grad_norm = float(np.mean(grad_norms)) if grad_norms else 0.0
         return train_metrics, avg_grad_norm
@@ -1571,6 +1686,7 @@ class DrowsinessTrainer1:
             should_stop = self.checkpoint_manager.step(
                 current_metrics=val_metrics,
                 epoch=epoch,
+                global_step=self.global_step,
                 model=self.model,
                 optimizer=self.optimizer,
                 scheduler=self.scheduler,
@@ -1782,6 +1898,10 @@ def run_dry_run_test() -> None:
             num_workers=0,
             val_num_workers=0,
             gradient_accumulation_steps=2,
+            enable_step_logging=True,
+            log_step_interval=1,
+            flush_step_interval=1,
+            ema_beta=0.95,
             device="cuda" if torch.cuda.is_available() else "cpu",
             amp=False,
             use_tqdm=False,
@@ -1816,12 +1936,26 @@ def run_dry_run_test() -> None:
         print(f"    [✓] Đã tạo thành công: {ckpt_last.name}")
         print(f"    [✓] Đã tạo thành công: {ckpt_best.name}")
 
-        # Kiểm tra nội dung checkpoint
+        # Kiểm tra nội dung checkpoint và biến global_step
         ckpt_data = torch.load(str(ckpt_ep1), map_location="cpu")
         assert ckpt_data["epoch"] == 1, "Checkpoint epoch 1 không đúng epoch!"
+        assert "global_step" in ckpt_data, "Thiếu trường 'global_step' trong checkpoint!"
+        assert ckpt_data["global_step"] > 0, f"global_step phải > 0 (thực tế: {ckpt_data['global_step']})!"
         assert "best_epoch" in ckpt_data, "Thiếu trường 'best_epoch' trong checkpoint!"
         assert "patience_counter" in ckpt_data, "Thiếu trường 'patience_counter' trong checkpoint!"
-        print("    [✓] Cấu trúc checkpoint hợp lệ và đầy đủ metadata trạng thái.")
+        print(f"    [✓] Cấu trúc checkpoint hợp lệ và đầy đủ metadata trạng thái (epoch={ckpt_data['epoch']}, global_step={ckpt_data['global_step']}).")
+
+        # Kiểm tra tệp sự kiện TensorBoard chứa dữ liệu hợp lệ
+        print("\n[*] [Bước 5b] Xác thực tệp sự kiện TensorBoard chứa Per-Step & Epoch Metrics:")
+        tb_run_dir = temp_path / "runs" / "dryrun_test1"
+        assert tb_run_dir.exists(), f"LỖI: Thư mục TensorBoard không tồn tại: {tb_run_dir}"
+        tfevent_files = list(tb_run_dir.glob("events.out.tfevents.*"))
+        assert len(tfevent_files) > 0, "LỖI: Không tìm thấy tệp events.out.tfevents.* trong thư mục TensorBoard!"
+        valid_tfevents = [f for f in tfevent_files if f.stat().st_size > 88]
+        assert len(valid_tfevents) > 0, (
+            f"LỖI: Tệp TensorBoard chỉ chứa header (size <= 88 bytes)! Kích thước: {[f.stat().st_size for f in tfevent_files]}"
+        )
+        print(f"    [✓] Đã tạo thành công tệp sự kiện TensorBoard hợp lệ: {valid_tfevents[0].name} ({valid_tfevents[0].stat().st_size} bytes).")
 
         assert Path(cfg.history_csv_path).exists(), "Thiếu file training_history.csv!"
         assert Path(cfg.summary_json_path).exists(), "Thiếu file training_summary.json!"
@@ -1852,11 +1986,14 @@ def run_dry_run_test() -> None:
         assert trainer_resume_ep1.start_epoch == 2, (
             f"LỖI: Khi nạp lại từ Epoch 1, start_epoch phải là 2 nhưng lại là {trainer_resume_ep1.start_epoch}!"
         )
+        assert trainer_resume_ep1.global_step > 0, (
+            f"LỖI: global_step sau khi resume phải > 0 nhưng lại là {trainer_resume_ep1.global_step}!"
+        )
         assert len(trainer_resume_ep1.visualizer.history) == 1, (
             f"LỖI: Lịch sử visualizer chưa được đồng bộ chính xác (kỳ vọng 1 dòng, thực tế {len(trainer_resume_ep1.visualizer.history)})!"
         )
         trainer_resume_ep1.close()
-        print("    [✓] [enable_resume=True, resume_epoch=1]: Khôi phục thành công, tiếp tục từ Epoch 2.")
+        print(f"    [✓] [enable_resume=True, resume_epoch=1]: Khôi phục thành công, tiếp tục từ Epoch 2 với global_step = {trainer_resume_ep1.global_step}.")
 
         # 6c. Thử nghiệm nạp epoch không tồn tại (vd: epoch 99)
         print("\n[*] [Bước 8] Kiểm tra xử lý ngoại lệ khi nạp Epoch không tồn tại:")

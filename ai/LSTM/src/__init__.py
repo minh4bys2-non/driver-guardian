@@ -13,8 +13,8 @@ from .dataset1 import (
     build_raw_video_dataloaders,
 )
 from .dataset2 import (
-    PyTorchBackboneNeckExtractor,
-    RawVideoBackboneNeckDataset,
+    ChunkedBackboneNeckExtractor,
+    RawVideoFramesDataset,
     build_raw_video_dataloaders as build_raw_video_pytorch_dataloaders,
 )
 from .img_preprocess import (
@@ -34,10 +34,6 @@ from .train import (
     DrowsinessTrainer,
     train_pipeline,
 )
-from .train1 import (
-    DrowsinessTrainer1,
-    train_pipeline as train1_pipeline,
-)
 
 __all__ = [
     "CNNAdapter",
@@ -54,8 +50,8 @@ __all__ = [
     "RawVideoONNXDataset",
     "collate_raw_video_features",
     "build_raw_video_dataloaders",
-    "PyTorchBackboneNeckExtractor",
-    "RawVideoBackboneNeckDataset",
+    "ChunkedBackboneNeckExtractor",
+    "RawVideoFramesDataset",
     "build_raw_video_pytorch_dataloaders",
     "BaseImageTransform",
     "AdaptiveGammaCorrection",
@@ -70,8 +66,6 @@ __all__ = [
     "CheckpointManager",
     "DrowsinessTrainer",
     "train_pipeline",
-    "DrowsinessTrainer1",
-    "train1_pipeline",
 ]
 
 

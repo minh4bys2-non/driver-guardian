@@ -135,6 +135,37 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(result['blink_rate_per_min'], 15)
         self.assertEqual(result['yawning_frequency_per_min'], 30)
         self.assertAlmostEqual(result['perclos_pct'], 30)
+        monitor.set_windows(blink=2)
+        with patch.object(HeadPoseEstimator, 'estimate', return_value=(0, 0, 0)):
+            result = monitor.process_landmarks(points, (640, 480), 1.6)
+        self.assertTrue(result['eye_ready'])
+        self.assertEqual(result['blink_count'], 0)
+        self.assertEqual(result['yawn_count'], 1)
+        self.assertEqual(result['windows_sec']['blink'], 2)
+
+    def test_run_callback_can_change_windows_and_resources_close(self):
+        from unittest.mock import Mock
+
+        capture, tracker = Mock(), Mock()
+        capture.isOpened.return_value = True
+        capture.get.return_value = 30
+        capture.read.return_value = (True, np.zeros((480, 640, 3), dtype=np.uint8))
+        tracker.process.return_value = None
+        monitor = CameraMetrics()
+        monitor.tracker = tracker
+        received = []
+
+        def callback(metrics):
+            received.append(metrics)
+            monitor.set_windows(perclos=15)
+
+        with patch('cv2.VideoCapture', return_value=capture), patch('builtins.print'):
+            count = monitor.run(display=False, use_video_time=True, max_frames=3, on_metrics=callback)
+        self.assertEqual(count, 3)
+        self.assertEqual([m['timestamp_sec'] for m in received], [0, 1 / 30, 2 / 30])
+        self.assertEqual([m['windows_sec']['perclos'] for m in received], [60, 15, 15])
+        capture.release.assert_called_once()
+        tracker.close.assert_called_once()
 
     def test_window_changes_preserve_calibration_and_models(self):
         monitor = CameraMetrics(window_sec=30, windows={'perclos': 60, 'head_motion': 20})

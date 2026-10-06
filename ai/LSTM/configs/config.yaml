@@ -23,13 +23,14 @@ dataset:
   train_ratio: 0.8
   split_by_subject: true
   min_frames: 10
-  use_augmentation: true
+  use_augmentation: fasle
 
 # ---- 2. DATALOADER CONFIGURATION ----
 dataloader:
-  batch_size: 4
-  val_batch_size: 4
-  num_workers: 2
+
+  batch_size: 16
+  val_batch_size: 16
+  num_workers: 0
   val_num_workers: 0
   pin_memory: false
   shuffle: true
@@ -89,13 +90,13 @@ logging:
   save_ckpt_interval_epochs: 1
   save_best_only: false
   ckpt_keep_last: null
-  enable_resume: false
-  resume_epoch: null
+  enable_resume: true 
+  resume_epoch: 8
   resume: ""
 
   # Cấu hình Giám sát Phân giải cao theo từng Step (Per-Step Metrics)
   enable_step_logging: true
-  log_step_interval: 5
+  log_step_interval: 1
   flush_step_interval: 50
   ema_beta: 0.95
 

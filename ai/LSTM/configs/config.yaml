@@ -29,7 +29,7 @@ dataset:
 dataloader:
   batch_size: 4
   val_batch_size: 4
-  num_workers: 0
+  num_workers: 2
   val_num_workers: 0
   pin_memory: false
   shuffle: true
@@ -49,8 +49,8 @@ model:
   spatial_fusion: "concat"
   adapter_dropout: 0.25
   use_norm: true
-  input_dim: 256
-  hidden_dim: 192
+  input_dim: 128
+  hidden_dim: 128
   num_layers: 2
   num_classes: 2
   dropout: 0.35
@@ -65,7 +65,7 @@ loss:
 
 # ---- 5. OPTIMIZER & SCHEDULER CONFIGURATION ----
 optimizer:
-  epochs: 30
+  epochs: 20
   lr0: 0.001
   lr_min_factor: 0.01
   weight_decay: 0.0001
@@ -74,8 +74,8 @@ optimizer:
   betas: [0.9, 0.999]
   momentum: 0.9
   grad_clip_norm: 1.0
-  gradient_accumulation_steps: 1
-  empty_cache_interval: 2
+  gradient_accumulation_steps: 4
+  empty_cache_interval: 4
   use_scheduler: true
   scheduler_type: "cosine"
 

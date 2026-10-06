@@ -477,6 +477,11 @@ def _seed_worker(worker_id: int) -> None:
     worker_seed = torch.initial_seed() % 2**32
     np.random.seed(worker_seed)
     random.seed(worker_seed)
+    try:
+        import cv2
+        cv2.setNumThreads(0)
+    except Exception:
+        pass
 
 
 def build_raw_video_dataloaders(
@@ -485,13 +490,20 @@ def build_raw_video_dataloaders(
     sample_interval: float = 0.1,
     seq_len: Optional[int] = None,
     batch_size: int = 4,
+    val_batch_size: Optional[int] = None,
     num_workers: int = 2,
+    val_num_workers: Optional[int] = None,
     pin_memory: bool = True,
     shuffle_train: bool = True,
     augmenter: Optional[Any] = None,
-    use_augmentation: bool = True
+    use_augmentation: bool = True,
+    min_frames: int = 1,
+    img_size: int = 640
 ) -> Tuple[DataLoader, DataLoader]:
     
+    val_b_size = val_batch_size if val_batch_size is not None else batch_size
+    val_n_workers = val_num_workers if val_num_workers is not None else num_workers
+
     effective_augmenter = None
     if use_augmentation:
         if augmenter is not None:
@@ -510,6 +522,8 @@ def build_raw_video_dataloaders(
         split="train",
         sample_interval=sample_interval,
         seq_len=seq_len,
+        img_size=img_size,
+        min_frames=min_frames,
         augmenter=effective_augmenter,
         window_sampling="random"
     )
@@ -520,6 +534,8 @@ def build_raw_video_dataloaders(
         split="val",
         sample_interval=sample_interval,
         seq_len=seq_len,
+        img_size=img_size,
+        min_frames=min_frames,
         augmenter=None,
         window_sampling="center"
     )
@@ -536,9 +552,9 @@ def build_raw_video_dataloaders(
 
     val_loader = DataLoader(
         val_dataset,
-        batch_size=batch_size,
+        batch_size=val_b_size,
         shuffle=False,
-        num_workers=num_workers,
+        num_workers=val_n_workers,
         pin_memory=pin_memory,
         collate_fn=collate_video_frames,
         worker_init_fn=_seed_worker

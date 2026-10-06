@@ -6,7 +6,7 @@
 # ---- 1. DATASET CONFIGURATION (RAW VIDEO & NMSFreeDetector) ----
 dataset:
   # Thư mục gốc chứa video thô (đã quét nhãn hoặc chia train/val)
-  dataset_dir: "/home/riftuser/.cache/kagglehub/datasets/nyvantran6634/dataset-datn4ni/versions/1/data_processed"
+  dataset_dir: "E:/LSTM/data_processed"
   # Tệp manifest CSV/JSON (None hoặc rỗng để tự tìm dataset_merged_split.csv)
   manifest_file: "dataset_merged_split.csv"
   # Thư mục tập kiểm định (null: dùng chung dataset_dir/val hoặc tự chia)
@@ -14,7 +14,7 @@ dataset:
   # Tệp manifest cho tập kiểm định (null: tự động theo trường split trong manifest)
   val_manifest: null
   # Trọng số tối ưu PyTorch .pt của mô hình NMSFreeDetector
-  backbone_neck_checkpoint: "/home/riftuser/workspace/driver-guardian/ai/ObjectDetection_2p6M/checkpoints/2bfb6cc36ef5ab822a944006c746e5d348d67e387501c9027df5b957cf124031/de0c5b23e1ae749b972f10cb5f3e21e2ccf37bd334eb7a7c3091c460073ff310/finetune/best.pt"
+  backbone_neck_checkpoint: "D:/Project/DATN/driver-guardian/ai/ObjectDetection_2p6M/checkpoints/231e35bb4061257f9bcb7cc5e3a0d0064e5e1beb6351a5e0adfc8d0c91ba4e11/da92589d1b67339be4491beaf147575e81a2699bbde06d654c05f852d7f0e9c9/landmark_train/best.pt"
   # Tham số khung hình
   sample_interval: 0.2
   seq_len: Null 
@@ -27,8 +27,9 @@ dataset:
 
 # ---- 2. DATALOADER CONFIGURATION ----
 dataloader:
+
   batch_size: 16
-  val_batch_size: 32
+  val_batch_size: 16
   num_workers: 0
   val_num_workers: 0
   pin_memory: false
@@ -49,8 +50,8 @@ model:
   spatial_fusion: "concat"
   adapter_dropout: 0.25
   use_norm: true
-  input_dim: 256
-  hidden_dim: 192
+  input_dim: 128
+  hidden_dim: 128
   num_layers: 2
   num_classes: 2
   dropout: 0.35
@@ -65,7 +66,7 @@ loss:
 
 # ---- 5. OPTIMIZER & SCHEDULER CONFIGURATION ----
 optimizer:
-  epochs: 30
+  epochs: 20
   lr0: 0.001
   lr_min_factor: 0.01
   weight_decay: 0.0001
@@ -74,8 +75,8 @@ optimizer:
   betas: [0.9, 0.999]
   momentum: 0.9
   grad_clip_norm: 1.0
-  gradient_accumulation_steps: 1
-  empty_cache_interval: 1
+  gradient_accumulation_steps: 4
+  empty_cache_interval: 4
   use_scheduler: true
   scheduler_type: "cosine"
 

@@ -96,11 +96,7 @@ except ImportError:
 
 # Import các module nội bộ của dự án
 from configs.config import TrainConfig, load_config
-from src.dataset2 import (
-    RawVideoBackboneNeckDataset,
-    collate_raw_video_features,
-    DEFAULT_CHECKPOINT_PATH
-)
+from src.dataset2 import DEFAULT_CHECKPOINT_PATH
 from src.models import DeepGRUClassifier
 from src.loss import DrowsinessLoss, build_loss
 

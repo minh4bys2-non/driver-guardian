@@ -2,6 +2,8 @@ from collections import deque
 
 import numpy as np
 
+from ai.PhysicalBranch.temporal_metrics import StateMachine, WindowRatio
+
 
 class AdaptiveHMM:
 
@@ -196,97 +198,11 @@ class AdaptiveHMM:
         return float(np.squeeze(out)) if axis is None else np.squeeze(out, axis=axis)
 
 
-class StateMachine:
-
-    def __init__(self, mode="eye", fps=30, window_size_sec=60,
-                 min_duration_ms=None, max_duration_ms=None, max_gap_sec=0.25):
-        limits = {"eye": (100, 2000), "mouth": (3500, 7500), "pitch": (800, 3500)}
-        if mode not in limits or fps <= 0 or window_size_sec <= 0 or max_gap_sec <= 0:
-            raise ValueError("Invalid FSM configuration")
-        self.mode, self.fps, self.window = mode, fps, window_size_sec
-        lo, hi = limits[mode]
-        self.minimum = lo if min_duration_ms is None else min_duration_ms
-        self.maximum = hi if max_duration_ms is None else max_duration_ms
-        if not 0 <= self.minimum < self.maximum:
-            raise ValueError("Invalid event duration limits")
-        self.max_gap = max_gap_sec
-        self.reset()
-
-    def reset(self):
-        self.time = None
-        self.start = None
-        self.last_duration = 0.0
-        self.events = deque()
-
-    def process(self, state, timestamp=None):
-        now = (0 if self.time is None else self.time + 1 / self.fps) if timestamp is None else float(timestamp)
-        if not np.isfinite(now) or (self.time is not None and now <= self.time):
-            raise ValueError("Timestamps must be finite and strictly increasing")
-        if state not in (0, 1, None):
-            raise ValueError("State must be 0, 1 or None")
-        if self.time is not None and now - self.time > self.max_gap:
-            self.start = None
-        self.time = now
-        done = False
-        if state is None:
-            self.start = None
-        elif state == 1 and self.start is None:
-            self.start = now
-        elif state == 0 and self.start is not None:
-            self.last_duration = (now - self.start) * 1000
-            done = self.minimum <= self.last_duration <= self.maximum
-            if done:
-                self.events.append(now)
-            self.start = None
-        while self.events and self.events[0] <= now - self.window:
-            self.events.popleft()
-        duration = 0 if self.start is None else (now - self.start) * 1000
-        rate = len(self.events) * 60 / self.window
-        return {
-            "state": state, "signal_missing": state is None,
-            "event_done": done, "current_duration_ms": duration,
-            "last_event_duration_ms": self.last_duration,
-            "rate_per_minute": rate, "prolonged": duration > self.maximum,
-        }
-
-
-class WindowRatio:
-    def __init__(self, window_sec=60, max_gap_sec=0.25):
-        if window_sec <= 0 or max_gap_sec <= 0:
-            raise ValueError("Window and gap must be positive")
-        self.window, self.max_gap = window_sec, max_gap_sec
-        self.reset()
-
-    def reset(self):
-        self.intervals = deque()
-        self.previous = None
-        self.time = None
-
-    def process(self, active, timestamp):
-        if not np.isfinite(timestamp) or (self.time is not None and timestamp <= self.time):
-            raise ValueError("Timestamps must be finite and strictly increasing")
-        self.time = timestamp
-        if self.previous is not None and active is not None:
-            start, previous_active = self.previous
-            if timestamp - start <= self.max_gap:
-                self.intervals.append((start, timestamp, previous_active))
-        self.previous = None if active is None else (timestamp, bool(active))
-        cutoff = timestamp - self.window
-        while self.intervals and self.intervals[0][1] <= cutoff:
-            self.intervals.popleft()
-        valid = total = 0.0
-        for start, end, state in self.intervals:
-            duration = end - max(start, cutoff)
-            valid += duration
-            total += duration * state
-        return (100 * total / valid if valid else None), valid
-
-
 class AdaptiveHMM_FSM:
 
     def __init__(self, mode="eye", fps=30, init_duration_sec=5, window_size_sec=60,
                  min_duration_ms=None, max_duration_ms=None, max_gap_sec=0.25,
-                 learning_rate=0.01, adapt_interval=300):
+                 learning_rate=0.01, adapt_interval=300, ratio_window_sec=None):
         if mode not in ("eye", "mouth", "pitch") or fps <= 0 or init_duration_sec <= 0:
             raise ValueError("Invalid detector configuration")
         self.mode, self.fps = mode, fps
@@ -295,7 +211,7 @@ class AdaptiveHMM_FSM:
                                learning_rate=learning_rate, adapt_interval=adapt_interval)
         self.fsm = StateMachine(mode, fps, window_size_sec, min_duration_ms,
                                 max_duration_ms, max_gap_sec)
-        self.ratio = WindowRatio(window_size_sec, max_gap_sec)
+        self.ratio = WindowRatio(window_size_sec if ratio_window_sec is None else ratio_window_sec, max_gap_sec)
         self.reset()
 
     def reset(self):
@@ -363,7 +279,7 @@ class AdaptiveHMM_FSM:
             opened, closed = self.normal, self.event_reference
             threshold = float(opened - 0.8 * (opened - closed))
         if self.mode == "eye":
-            active = None if value is None or threshold is None else value < threshold
+            active = None if value is None or threshold is None else value <= threshold
         else:
             active = None if state is None else bool(state)
         percentage, valid = self.ratio.process(active, now)

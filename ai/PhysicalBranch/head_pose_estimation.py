@@ -19,12 +19,12 @@ class HeadPoseEstimator:
         self.rotation = self.translation = None
 
     def estimate(self, landmarks_2d):
+        self.rotation = self.translation = None
         points = np.asarray(landmarks_2d, dtype=float)
         if points.shape != (6, 2) or not np.isfinite(points).all():
             raise ValueError("Expected six finite 2D landmarks")
         if np.linalg.matrix_rank(points - points.mean(axis=0)) < 2:
             raise ValueError("Degenerate landmarks")
-        self.rotation = self.translation = None
         ok, rotation, translation = cv2.solvePnP(
             self.MODEL, points, self.camera_matrix, self.distortion, flags=cv2.SOLVEPNP_SQPNP)
         if not ok:

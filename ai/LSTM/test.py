@@ -1,6 +1,9 @@
-import kagglehub
+from src.models import ConvGRUClassifier
+from configs.config import TrainConfig, load_config
 
-# Download latest version
-path = kagglehub.dataset_download("nyvantran6634/dataset-datn4ni")
+cfg = load_config(config_path=r"D:\Project\DATN\driver-guardian\ai\LSTM\configs\config.yaml")
 
-print("Path to dataset files:", path)   
+
+model = ConvGRUClassifier.from_config(cfg)
+total_params = sum(p.numel() for p in model.parameters())
+

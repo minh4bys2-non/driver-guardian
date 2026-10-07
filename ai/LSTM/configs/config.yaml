@@ -1,124 +1,144 @@
 # ==============================================================================
-# DRIVER GUARDIAN - DEEP GRU CONFIGURATION FILE
-# Huấn luyện mô hình trực tiếp từ video thô qua NMSFreeDetector BackboneNeck
+# DRIVER GUARDIAN - CONVGRU CONFIGURATION FILE
+# Cấu hình huấn luyện mô hình SpatioTemporal ConvGRU từ video thô qua BackboneNeck
+# Toàn bộ tham số và giá trị mặc định được chuẩn hóa đồng bộ từ checkpoint:
+# checkpoints/experiments/deepgru_raw_nmsfree/best.pt
 # ==============================================================================
 
 # ---- 1. DATASET CONFIGURATION (RAW VIDEO & NMSFreeDetector) ----
 dataset:
-  # Thư mục gốc chứa video thô (đã quét nhãn hoặc chia train/val)
-  dataset_dir: "/home/riftuser/workspace/dataset1"
-  # Tệp manifest CSV/JSON (None hoặc rỗng để tự tìm dataset_merged_split.csv)
+  # Thư mục gốc chứa video thô (đã quét nhãn hoặc có cấu trúc train/val)
+  dataset_dir: "E:/LSTM/UL-DD_Processed"
+  # Tệp manifest CSV chứa danh sách video clip, nhãn và trường phân chia split
   manifest_file: "dataset_merged_split.csv"
-  # Thư mục tập kiểm định (null: dùng chung dataset_dir/val hoặc tự chia)
-  val_dataset_dir: null
-  # Tệp manifest cho tập kiểm định (null: tự động theo trường split trong manifest)
-  val_manifest: null
-  # Trọng số tối ưu PyTorch .pt của mô hình NMSFreeDetector
-  backbone_neck_checkpoint: "/home/riftuser/workspace/driver-guardian/ai/ObjectDetection_2p6M/checkpoints/231e35bb4061257f9bcb7cc5e3a0d0064e5e1beb6351a5e0adfc8d0c91ba4e11/da92589d1b67339be4491beaf147575e81a2699bbde06d654c05f852d7f0e9c9/landmark_train/best.pt"
-  # Tham số khung hình
+  # Trọng số PyTorch .pt tối ưu của mô hình BackboneNeck NMSFreeDetector
+  backbone_neck_checkpoint: "D:/Project/DATN/driver-guardian/ai/ObjectDetection_2p6M/checkpoints/231e35bb4061257f9bcb7cc5e3a0d0064e5e1beb6351a5e0adfc8d0c91ba4e11/da92589d1b67339be4491beaf147575e81a2699bbde06d654c05f852d7f0e9c9/landmark_train/best.pt"
+  # Khoảng thời gian (giây) giữa các khung hình lấy mẫu (FPS hiệu dụng = 5.0)
   sample_interval: 0.2
-  seq_len: Null 
+  # Số lượng khung hình cố định (null = dynamic padding theo độ dài clip)
+  seq_len: null
+  # Kích thước khung hình (Height, Width) đưa vào Backbone
   image_size: [640, 640]
+  # Các định dạng video hợp lệ được hỗ trợ
   video_exts: [".avi", ".mp4", ".mkv", ".mov"]
-  train_ratio: 0.8
-  split_by_subject: true
+  # Số khung hình tối thiểu để coi là một video hợp lệ
   min_frames: 10
+  # Bật/tắt tăng cường dữ liệu thời gian cho tập huấn luyện
   use_augmentation: true
 
 # ---- 2. DATALOADER CONFIGURATION ----
 dataloader:
-
-  batch_size: 16
-  val_batch_size: 16
+  # Kích thước batch size cho tập train và val
+  batch_size: 2
+  val_batch_size: 2
+  # Số tiến trình worker tải dữ liệu (0: an toàn nhất trên Windows tránh deadlock)
   num_workers: 0
   val_num_workers: 0
+  # Khóa vùng nhớ GPU (False để tránh tràn pinned memory khi xử lý video lớn)
   pin_memory: false
+  # Trộn ngẫu nhiên tập huấn luyện
   shuffle: true
-  drop_last: false
-  persistent_workers: false
-  prefetch_factor: null
+  # Hạt giống ngẫu nhiên để tái lập kết quả
   seed: 42
+  # Kích thước mini-chunk chia nhỏ khung hình khi forward qua Backbone tránh tràn VRAM
   chunk_size: 32
 
-# ---- 3. MODEL ARCHITECTURE CONFIGURATION (NMSFreeDetector PAFPN + Deep GRU) ----
+# ---- 3. MODEL ARCHITECTURE CONFIGURATION (NMSFreeDetector PAFPN + ConvGRU) ----
 model:
+  # Kênh đặc trưng của các tầng (p3, p4, p5) từ NMSFreeDetector PAFPN
   cnn_neck_channels: [64, 128, 256]
-  cnn_strides: [8, 16, 32]
-  cnn_num_features: 3
-  cnn_out_channels: 448
-  cnn_spatial_size: [20, 20]
-  spatial_fusion: "concat"
+  # Tỷ lệ Dropout sau cổ giảm kênh SpatialReductionNeck
   adapter_dropout: 0.25
-  use_norm: true
+  # Số kênh đặc trưng sau cổ giảm kênh SpatialReductionNeck (nén 448 -> 128)
   input_dim: 128
-  hidden_dim: 128
+  # Số kênh ẩn của từng tầng ConvGRU (chuẩn hóa chính xác theo checkpoint best.pt)
+  hidden_dim: 64
+  convgru_hidden_dim: 64
+  # Số tầng ConvGRU xếp chồng
   num_layers: 2
+  # Số lượng lớp phân loại đầu ra (2: Tỉnh táo / Buồn ngủ)
   num_classes: 2
+  # Tỷ lệ Dropout cho đầu phân loại FC Head
   dropout: 0.35
+  # Cơ chế giám sát chuỗi thời gian
   supervision_mode: "attention_pooling"
 
 # ---- 4. LOSS CONFIGURATION ----
 loss:
+  # Loại hàm mất mát: "ce" (CrossEntropyLoss) hoặc "bce" (BCEWithLogitsLoss)
   loss_type: "ce"
+  # Hằng số epsilon kẹp giá trị số học khi dùng BCE
   bce_eps: 1.0e-7
+  # Cách gom nhóm loss ('mean' | 'sum')
   bce_reduction: "mean"
+  # Trọng số cho lớp dương (1: Buồn ngủ) khi dữ liệu mất cân bằng
   pos_weight: null
 
 # ---- 5. OPTIMIZER & SCHEDULER CONFIGURATION ----
 optimizer:
+  # Tổng số epoch huấn luyện
   epochs: 20
-  lr0: 0.001
+  # Learning rate khởi tạo
+  lr0: 0.00001
+  # Tỷ lệ lr tối thiểu: lr_min = lr0 * lr_min_factor (1e-5)
   lr_min_factor: 0.01
+  # Hệ số phạt L2 Regularization (Weight Decay)
   weight_decay: 0.0001
-  warmup_epochs: 1.0
+  # Bộ tối ưu hóa: "adamw" | "adam" | "sgd"
   optimizer: "adamw"
+  # Tham số betas cho Adam/AdamW
   betas: [0.9, 0.999]
+  # Động lượng Momentum khi optimizer="sgd"
   momentum: 0.9
+  # Ngưỡng cắt gradient (Gradient Clipping)
   grad_clip_norm: 1.0
-  gradient_accumulation_steps: 1
+  # Số bước tích lũy gradient trước khi cập nhật trọng số
+  gradient_accumulation_steps: 4
+  # Khoảng cách epoch giữa các lần dọn rác GPU bộ nhớ đệm
   empty_cache_interval: 2
+  # Bật/tắt bộ điều chỉnh Learning Rate Scheduler (CosineAnnealingLR)
   use_scheduler: true
-  scheduler_type: "cosine"
 
-# ---- 6. CHECKPOINTS, EARLY STOPPING & DIAGNOSTICS CONFIGURATION ----
+# ---- 6. CHECKPOINTS, EARLY STOPPING & LOGGING CONFIGURATION ----
 logging:
+  # Thư mục lưu log TensorBoard
   tb_log_dir: "logs/tensorboard"
-  log_dir: "logs"
+  # Tên bài thử nghiệm huấn luyện
   experiment_name: "deepgru_raw_nmsfree"
+  # Thư mục lưu checkpoint mô hình (.pt)
   checkpoint_dir: "checkpoints/experiments"
+  # Lưu checkpoint cho tất cả các epoch
   save_all_epochs: true
+  # Khoảng epoch giữa 2 lần lưu định kỳ
   save_ckpt_interval_epochs: 1
-  save_best_only: false
+  # Số lượng checkpoint định kỳ tối đa giữ lại (null = giữ toàn bộ)
   ckpt_keep_last: null
-  enable_resume: true 
-  resume_epoch: 2
-  resume: "/home/riftuser/workspace/driver-guardian/ai/LSTM/checkpoints/experiments/deepgru_raw_nmsfree/last.pt"
+  # Bật/tắt tiếp tục huấn luyện từ checkpoint
+  enable_resume: true
+  # Đường dẫn file checkpoint hoặc bí danh ('last', 'best') để resume
+  resume: "D:/Project/DATN/driver-guardian/ai/LSTM/checkpoints/experiments/deepgru_raw_nmsfree/epoch_6.pt"
 
   # Cấu hình Giám sát Phân giải cao theo từng Step (Per-Step Metrics)
   enable_step_logging: true
   log_step_interval: 1
-  flush_step_interval: 50
-  ema_beta: 0.95
 
-  # Early Stopping
+  # Cơ chế Dừng sớm (Early Stopping)
   early_stopping: true
   patience: 10
   monitor_metric: "val_f1"
   monitor_mode: "max"
   min_delta: 0.0001
 
-  # File kết quả và biểu đồ chẩn đoán
+  # File lưu bảng lịch sử các epoch huấn luyện
   history_csv_path: "logs/training_history.csv"
-  summary_json_path: "logs/training_summary.json"
-  plot_curves_path: "logs/loss_accuracy_curves.png"
-  plot_cm_path: "logs/confusion_matrix_best.png"
-  plot_roc_path: "logs/roc_pr_curves.png"
-  dry_run: false
 
 # ---- 7. RUNTIME & HARDWARE CONFIGURATION ----
 runtime:
+  # Thiết bị tính toán ("cuda" | "cpu")
   device: "cuda"
+  # Bật Tự động ép kiểu hỗn hợp FP16 (Automatic Mixed Precision)
   amp: true
-  log_interval: 10
+  # Số epoch giữa 2 lần đánh giá tập Validation
   val_interval_epochs: 1
+  # Bật thanh tiến trình giám sát trực quan tqdm
   use_tqdm: true

@@ -83,6 +83,18 @@ class TemporalTests(unittest.TestCase):
 
 
 class MotionTests(unittest.TestCase):
+    def test_mean_amplitude_integrates_zero_crossing(self):
+        motion = HeadMotionWindow(.1)
+        motion.process(-10, 0)
+        result = motion.process(10, .2)
+        self.assertAlmostEqual(result['pitch_mean_deg'], 5)
+        self.assertAlmostEqual(result['pitch_mean_amplitude_deg'], 5)
+        motion = HeadMotionWindow(1)
+        motion.process(-10, 0)
+        result = motion.process(10, .2)
+        self.assertAlmostEqual(result['pitch_mean_deg'], 0)
+        self.assertAlmostEqual(result['pitch_mean_amplitude_deg'], 5)
+
     def test_fft_with_irregular_timestamps(self):
         motion = HeadMotionWindow(20)
         rng = np.random.default_rng(17)
@@ -166,6 +178,39 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual([m['windows_sec']['perclos'] for m in received], [60, 15, 15])
         capture.release.assert_called_once()
         tracker.close.assert_called_once()
+
+    def test_quit_counts_processed_frame_and_closes_resources(self):
+        from unittest.mock import Mock
+
+        capture, tracker = Mock(), Mock()
+        capture.isOpened.return_value = True
+        capture.get.return_value = 30
+        capture.read.return_value = (True, np.zeros((480, 640, 3), dtype=np.uint8))
+        tracker.process.return_value = None
+        monitor = CameraMetrics()
+        monitor.tracker = tracker
+        with patch('cv2.VideoCapture', return_value=capture), patch('builtins.print'), \
+                patch('cv2.imshow'), patch('cv2.waitKey', return_value=ord('q')), \
+                patch('cv2.destroyAllWindows') as destroy:
+            self.assertEqual(monitor.run(use_video_time=True), 1)
+        capture.release.assert_called_once()
+        tracker.close.assert_called_once()
+        destroy.assert_called_once()
+
+    def test_calibration_wraps_angles_and_restarts_after_gap(self):
+        monitor = CameraMetrics(calibration_frames=2)
+        points = np.zeros((468, 2))
+        with patch.object(HeadPoseEstimator, 'estimate') as estimate:
+            estimate.return_value = (30, 0, 0)
+            monitor.process_landmarks(points, (640, 480), 0)
+            estimate.return_value = (179, 0, 0)
+            result = monitor.process_landmarks(points, (640, 480), 1)
+            self.assertFalse(result['head_calibrated'])
+            estimate.return_value = (-179, 0, 0)
+            result = monitor.process_landmarks(points, (640, 480), 1.1)
+        self.assertTrue(result['head_calibrated'])
+        self.assertAlmostEqual(result['pitch_deg'], 1)
+        self.assertFalse(result['nodding'])
 
     def test_window_changes_preserve_calibration_and_models(self):
         monitor = CameraMetrics(window_sec=30, windows={'perclos': 60, 'head_motion': 20})

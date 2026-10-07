@@ -143,9 +143,16 @@ class HeadMotionWindow:
         observed = timestamp - start
         clipped_times = np.r_[start, times[times > start]]
         clipped_values = np.interp(clipped_times, times, values)
+        durations = np.diff(clipped_times)
+        left, right = clipped_values[:-1], clipped_values[1:]
+        amplitudes = (np.abs(left) + np.abs(right)) / 2
+        crossing = (left < 0) & (right > 0) | (left > 0) & (right < 0)
+        # Tích phân |pitch| phải tách hai tam giác khi đoạn nội suy đi qua 0.
+        amplitudes[crossing] = (left[crossing] ** 2 + right[crossing] ** 2) / (
+            2 * (np.abs(left[crossing]) + np.abs(right[crossing])))
         result.update(
-            pitch_mean_deg=float(np.trapz(clipped_values, clipped_times) / observed),
-            pitch_mean_amplitude_deg=float(np.trapz(np.abs(clipped_values), clipped_times) / observed),
+            pitch_mean_deg=float(np.sum((left + right) * durations / 2) / observed),
+            pitch_mean_amplitude_deg=float(np.sum(amplitudes * durations) / observed),
             head_motion_observed_sec=float(observed),
         )
         if observed < self.window - 1e-9 or len(times) < 4:

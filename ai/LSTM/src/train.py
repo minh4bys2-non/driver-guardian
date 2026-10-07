@@ -70,12 +70,13 @@ def calculate_metrics(preds: np.ndarray, targets: np.ndarray) -> Dict[str, float
 
 class EarlyStopping:
     """Bộ giám sát dừng sớm Early Stopping dựa trên metric chỉ định."""
+
     def __init__(
-        self,
-        patience: int = 10,
-        min_delta: float = 1e-4,
-        mode: str = "max",
-        monitor: str = "val_f1"
+            self,
+            patience: int = 10,
+            min_delta: float = 1e-4,
+            mode: str = "max",
+            monitor: str = "val_f1"
     ) -> None:
         self.patience = max(1, patience)
         self.min_delta = float(min_delta)
@@ -105,6 +106,7 @@ class EarlyStopping:
 
 class Trainer:
     """Pipeline Huấn luyện và Kiểm định Chuyên nghiệp cho ConvGRUClassifier."""
+
     def __init__(self, config: TrainConfig):
         self.cfg = config
         self.device = torch.device(self.cfg.device if torch.cuda.is_available() else "cpu")
@@ -145,7 +147,8 @@ class Trainer:
         val_samples_count = len(self.val_loader.dataset)
         print(f"[*] Tập Train: {train_samples_count} video | Tập Val: {val_samples_count} video")
         if train_samples_count == 0:
-            raise RuntimeError(f"Tập huấn luyện (train) không có mẫu video nào trong '{self.cfg.dataset_dir}'. Kiểm tra cấu hình dataset!")
+            raise RuntimeError(
+                f"Tập huấn luyện (train) không có mẫu video nào trong '{self.cfg.dataset_dir}'. Kiểm tra cấu hình dataset!")
         if val_samples_count == 0:
             print("[CẢNH BÁO] Tập kiểm định (val) không có mẫu nào! Quá trình validation sẽ bị bỏ qua.")
 
@@ -165,6 +168,8 @@ class Trainer:
         # Khởi tạo mô hình ConvGRUClassifier chính
         print("[*] Đang nạp ConvGRUClassifier...")
         self.model = ConvGRUClassifier.from_config(self.cfg).to(self.device)
+        total_params = sum(p.numel() for p in self.model.parameters())
+        print(f"[*] Tổng số tham số ConvGRUClassifier: {total_params:,}")
 
         # Cấu hình hàm mất mát (Loss) và cơ chế tính nhãn dự đoán
         loss_type = self.cfg.loss_type.lower()
@@ -257,11 +262,11 @@ class Trainer:
                 ])
 
     def _log_history_csv(
-        self,
-        epoch: int,
-        train_m: Dict[str, float],
-        val_m: Optional[Dict[str, float]],
-        elapsed_sec: float
+            self,
+            epoch: int,
+            train_m: Dict[str, float],
+            val_m: Optional[Dict[str, float]],
+            elapsed_sec: float
     ) -> None:
         """Ghi nhận thông số sau mỗi epoch vào tệp CSV."""
         lr = self.optimizer.param_groups[0]['lr']
@@ -310,7 +315,7 @@ class Trainer:
 
         num_batches = len(self.train_loader)
         pbar = tqdm(self.train_loader, desc=f"Train Epoch {epoch}/{self.cfg.epochs}", disable=not self.cfg.use_tqdm)
-        
+
         for batch_idx, batch in enumerate(pbar):
             frames_t, labels, seq_lens, metas = batch
 
@@ -380,7 +385,8 @@ class Trainer:
 
             except RuntimeError as e:
                 if "out of memory" in str(e).lower():
-                    print(f"\n[CẢNH BÁO] CUDA Out of Memory tại batch {batch_idx}. Đang dọn dẹp bộ nhớ và bỏ qua batch...")
+                    print(
+                        f"\n[CẢNH BÁO] CUDA Out of Memory tại batch {batch_idx}. Đang dọn dẹp bộ nhớ và bỏ qua batch...")
                     self.optimizer.zero_grad()
                     accum_count = 0
                     try:
@@ -488,7 +494,8 @@ class Trainer:
             self.scaler.load_state_dict(ckpt["scaler_state_dict"])
             print("[*] Đã khôi phục thành công trạng thái GradScaler (AMP).")
 
-        print(f"[*] Đã khôi phục thành công. Sẽ tiếp tục từ epoch {self.start_epoch} (Best F1 trước đó: {self.best_val_f1:.4f})")
+        print(
+            f"[*] Đã khôi phục thành công. Sẽ tiếp tục từ epoch {self.start_epoch} (Best F1 trước đó: {self.best_val_f1:.4f})")
 
     def _atomic_save(self, state: Dict[str, Any], target_path: Path) -> None:
         """Lưu file checkpoint theo cơ chế Atomic Rename để chống hỏng file khi bị ngắt đột ngột."""
@@ -559,7 +566,7 @@ class Trainer:
 
             # Đánh giá tập Validation
             run_val = (len(self.val_loader.dataset) > 0) and (
-                (epoch % self.cfg.val_interval_epochs == 0) or (epoch == self.cfg.epochs)
+                    (epoch % self.cfg.val_interval_epochs == 0) or (epoch == self.cfg.epochs)
             )
 
             is_best = False
@@ -596,9 +603,11 @@ class Trainer:
             # Kiểm tra Early Stopping
             if run_val and self.early_stopper is not None and val_metrics is not None:
                 monitor_key = self.early_stopper.monitor.replace("val_", "")
-                target_score = val_metrics.get(monitor_key, val_metrics.get(self.early_stopper.monitor, val_metrics["f1"]))
+                target_score = val_metrics.get(monitor_key,
+                                               val_metrics.get(self.early_stopper.monitor, val_metrics["f1"]))
                 if self.early_stopper.step(target_score, epoch):
-                    print(f"[*] Early Stopping được kích hoạt tại epoch {epoch}! (Kỷ nguyên tối ưu nhất: {self.early_stopper.best_epoch})")
+                    print(
+                        f"[*] Early Stopping được kích hoạt tại epoch {epoch}! (Kỷ nguyên tối ưu nhất: {self.early_stopper.best_epoch})")
                     break
 
             if self.scheduler is not None:
@@ -616,7 +625,8 @@ class Trainer:
 def main():
     parser = argparse.ArgumentParser(description="Script Huấn luyện Driver Guardian ConvGRUClassifier (v2.0)")
     parser.add_argument("--config", type=str, default=None, help="Đường dẫn đến file cấu hình yaml/json")
-    parser.add_argument("--resume", type=str, default=None, help="Đường dẫn file .pt hoặc bí danh ('last', 'best') để resume")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Đường dẫn file .pt hoặc bí danh ('last', 'best') để resume")
     args = parser.parse_args()
 
     # Tải cấu hình

@@ -1,6 +1,12 @@
-from src.models1 import ConvGRUClassifier
+from src.models import ConvGRUClassifier
+from configs.config import TrainConfig, load_config
 
-model = ConvGRUClassifier()
+cfg = load_config(config_path=r"D:\Project\DATN\driver-guardian\ai\LSTM\configs\config.yaml")
+
+print(cfg.hidden_dim)
+
+model = ConvGRUClassifier.from_config(cfg)
+
 total_params = sum(p.numel() for p in model.parameters())
 
 # Tổng số tham số cần train (requires_grad = True)

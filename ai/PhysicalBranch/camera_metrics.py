@@ -9,7 +9,6 @@ from ai.PhysicalBranch.adaptive_hmm_fsm import AdaptiveHMM_FSM
 from ai.PhysicalBranch.head_pose_estimation import HeadPoseEstimator
 from ai.PhysicalBranch.temporal_metrics import HeadMotionWindow, StateMachine, WindowRatio, positive_seconds
 
-
 class FaceTracker:
     def __init__(self, detection_confidence=0.6, tracking_confidence=0.6):
         import mediapipe as mp
@@ -138,6 +137,7 @@ class CameraMetrics:
             raise ValueError("Timestamps must be finite and strictly increasing")
         if self.timestamp is not None and timestamp - self.timestamp > self.nod.max_gap:
             self.nodding = False
+            self.neutral_samples.clear()
         self.timestamp = timestamp
         if self.shape != tuple(image_size):
             self.estimator = HeadPoseEstimator(*image_size)
@@ -159,7 +159,8 @@ class CameraMetrics:
                 if self.neutral is None:
                     self.neutral_samples.append(raw)
                     if len(self.neutral_samples) >= self.calibration_frames:
-                        self.neutral = np.median(self.neutral_samples, axis=0)
+                        unwrapped = np.unwrap(self.neutral_samples, period=360, axis=0)
+                        self.neutral = (np.median(unwrapped, axis=0) + 180) % 360 - 180
                         self.neutral_samples.clear()
                 if self.neutral is not None:
                     angles = (raw - self.neutral + 180) % 360 - 180
@@ -340,6 +341,7 @@ class CameraMetrics:
                 if timestamp >= next_output:
                     print(json.dumps(metrics, allow_nan=False), flush=True)
                     next_output = timestamp + output_interval_sec
+                step += 1
                 if display:
                     if metrics['pose_valid']:
                         self.estimator.draw_axes(frame)
@@ -350,7 +352,6 @@ class CameraMetrics:
                     if key == ord('r'):
                         self.reset()
                 previous = tick
-                step += 1
         return step
 
 

@@ -200,7 +200,7 @@ class AdaptiveHMM:
 
 class AdaptiveHMM_FSM:
 
-    def __init__(self, mode="eye", fps=30, init_duration_sec=5, window_size_sec=60,
+    def __init__(self, mode="eye", fps=30, init_duration_sec=15, window_size_sec=60,
                  min_duration_ms=None, max_duration_ms=None, max_gap_sec=0.25,
                  learning_rate=0.01, adapt_interval=300, ratio_window_sec=None):
         if mode not in ("eye", "mouth", "pitch") or fps <= 0 or init_duration_sec <= 0:

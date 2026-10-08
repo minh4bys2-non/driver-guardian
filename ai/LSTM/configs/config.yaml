@@ -30,7 +30,7 @@ dataset:
 dataloader:
   # Kích thước batch size cho tập train và val
   batch_size: 2
-  val_batch_size: 16
+  val_batch_size: 2
   # Số tiến trình worker tải dữ liệu (0: an toàn nhất trên Windows tránh deadlock)
   num_workers: 0
   val_num_workers: 0

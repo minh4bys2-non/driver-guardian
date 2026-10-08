@@ -1,0 +1,35 @@
+{
+  "algorithm": "MOHHO-style continuous multi-objective Harris hawks optimization",
+  "reference": "https://bseujert.bilecik.edu.tr/index.php/bseujert/article/view/14",
+  "leader_selection": "archive crowding-distance roulette",
+  "archive_truncation": "remove minimum crowding distance",
+  "dive_selection": "uniform among nondominated parent, Y and Z",
+  "data_path": "/home/tranmanhduy/Workspace/ptithcm/driver-guardian/ai/OptimalAlgorithsm/drowsiness_hard_200.jsonl",
+  "fitness_method": "noisy_or",
+  "n_samples": 200,
+  "features": [
+    "blink_frequency",
+    "blink_duration",
+    "perclos",
+    "yawn_frequency",
+    "nod_duration",
+    "nod_frequency",
+    "dominant_head_motion_frequency",
+    "cnn_lstm_score"
+  ],
+  "feature_selection_threshold": 0.5,
+  "objectives": [
+    "1 - recall",
+    "1 - precision",
+    "num_feature / 8"
+  ],
+  "config": {
+    "population_size": 50,
+    "generations": 100,
+    "dimensions": 9,
+    "archive_size": 100,
+    "levy_beta": 1.5,
+    "levy_scale": 0.01,
+    "seed": 42
+  }
+}

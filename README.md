@@ -82,7 +82,7 @@ flowchart LR
      * Kiến trúc NMS-Free Detector (~2.6M tham số), sử dụng Dual Assignment Head (o2o & o2m) và hàm mất mát Distribution Focal Loss (DFL).
      * Hỗ trợ tách mô hình thành 2 phần độc lập (`backbone_neck.onnx` và `head.onnx`) để chạy đa luồng trên NPU/DSP.
    * **Nhánh chuỗi thời gian Deep LSTM (`ai/LSTM`):**
-     * Mô hình `DeepLSTMClassifier` gồm 3 lớp LSTM xếp chồng (256 chiều ẩn) kết hợp bộ chuyển đổi đặc trưng không gian `SpatialFeatureAdapter` (nén P3, P4, P5 1312 kênh về 256 chiều) để phân loại 2 trạng thái Tỉnh táo / Buồn ngủ trên các chuỗi 60–120 khung hình.
+     * Mô hình `DeepLSTMClassifier` gồm 3 lớp LSTM xếp chồng (256 chiều ẩn) kết hợp bộ chuyển đổi đặc trưng không gian `CNNAdapter` (nén P3, P4, P5 1312 kênh về 256 chiều) để phân loại 2 trạng thái Tỉnh táo / Buồn ngủ trên các chuỗi 60–120 khung hình.
 3. **Phát triển chức năng cảnh báo đa phương thức:**
    * Phân cấp cảnh báo: Mức độ 1 (Nhắc nhở nhẹ bằng âm thanh/visual), Mức độ 2 (Cảnh báo nguy cấp bằng âm thanh tần số cao + rung vô lăng/thiết bị).
 4. **Tối ưu hóa và triển khai thời gian thực:**

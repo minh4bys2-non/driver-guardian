@@ -184,6 +184,29 @@ class DetectionAugmenter:
 
         return aug_frames, aug_boxes_list, aug_labels_list, seed
 
+    def apply_sequence(self, frames: List[np.ndarray], seed: Optional[int] = None) -> List[np.ndarray]:
+        """
+        Áp dụng tăng cường dữ liệu cho một chuỗi video frames (List[np.ndarray])
+        sử dụng CHUNG 1 RANDOM SEED để bảo toàn tính nhất quán thời gian (Temporal Consistency).
+
+        Phương thức này chuyên dụng cho bài toán phân loại chuỗi video (Video Classification),
+        tự động xử lý biến đổi khung hình đồng bộ và trả về danh sách các mảng numpy [H, W, 3].
+
+        Args:
+            frames: Danh sách các ảnh frame (RGB np.ndarray uint8).
+            seed: Seed dùng chung (nếu None sẽ tự động sinh ngẫu nhiên).
+
+        Returns:
+            aug_frames: Danh sách các ảnh frame sau khi tăng cường.
+        """
+        aug_frames, _, _, _ = self.augment_video(frames, boxes_list=None, labels_list=None, seed=seed)
+        return aug_frames
+
+    def augment_frame_only(self, image: np.ndarray, seed: Optional[int] = None) -> np.ndarray:
+        """Áp dụng tăng cường cho 1 ảnh duy nhất và chỉ trả về ảnh (không kèm bboxes/labels)."""
+        aug_img, _, _ = self(image, boxes=None, labels=None, seed=seed)
+        return aug_img
+
 
 # ---- Cấu hình mặc định ----
 config = {
@@ -195,6 +218,13 @@ config = {
     "blur": (5, 0.15),
     "p": 0.5
 }
+augmenter = DetectionAugmenter(config)
+
+
+def get_video_augmenter(cfg: Optional[dict] = None) -> DetectionAugmenter:
+    """Hàm Factory khởi tạo đối tượng DetectionAugmenter với cấu hình tùy chọn."""
+    return DetectionAugmenter(cfg or config)
+
 
 # ==============================================================================
 # DEMO CHẠY THỬ VỚI 1 VIDEO TRONG TẬP DATASET SUST

@@ -1,0 +1,38 @@
+{
+  "algorithm": "NSPSOFS-style continuous multi-objective PSO",
+  "selection": "parent + offspring; Pareto rank and crowding distance",
+  "leader_selection": "uniform among top leader_fraction of swarm's first front by crowding distance",
+  "pbest_update": "strict Pareto dominance only",
+  "archive_role": "historical reporting only; not used for leader selection",
+  "data_path": "/home/tranmanhduy/Workspace/ptithcm/driver-guardian/ai/OptimalAlgorithsm/drowsiness_hard_200.jsonl",
+  "fitness_method": "noisy_or",
+  "n_samples": 200,
+  "features": [
+    "blink_frequency",
+    "blink_duration",
+    "perclos",
+    "yawn_frequency",
+    "nod_duration",
+    "nod_frequency",
+    "dominant_head_motion_frequency",
+    "cnn_lstm_score"
+  ],
+  "feature_selection_threshold": 0.5,
+  "objectives": [
+    "1 - recall",
+    "1 - precision",
+    "num_feature / 8"
+  ],
+  "config": {
+    "population_size": 50,
+    "generations": 100,
+    "dimensions": 9,
+    "inertia": 0.729,
+    "cognitive": 1.49445,
+    "social": 1.49445,
+    "velocity_limit": 0.2,
+    "archive_size": 100,
+    "leader_fraction": 0.2,
+    "seed": 42
+  }
+}

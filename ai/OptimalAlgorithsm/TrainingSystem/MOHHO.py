@@ -21,7 +21,7 @@ from ai.OptimalAlgorithsm.TrainingSystem.cmdpsofs import (
     crowding_distance,
     dominates,
 )
-from ai.OptimalAlgorithsm.TrainingSystem.fitnessFunction import FEATURES, Fitness, load_jsonl
+from ai.OptimalAlgorithsm.TrainingSystem.fitnessFunction import FEATURES, Fitness, load_jsonl, validate_labels
 
 
 @dataclass
@@ -35,9 +35,11 @@ class MOHHOConfig:
     seed: int = 42
 
     def __post_init__(self):
+        if any(type(v) is not int for v in (self.population_size, self.generations, self.archive_size)):
+            raise ValueError("population_size, generations and archive_size must be integers")
         if self.population_size < 1 or self.generations < 1 or self.archive_size < 1:
             raise ValueError("population_size, generations and archive_size must be positive")
-        if self.dimensions != 9:
+        if type(self.dimensions) is not int or self.dimensions != 9:
             raise ValueError("Fitness requires 8 weights and 1 classification threshold")
         if not 1 < self.levy_beta < 2:
             raise ValueError("levy_beta must be in (1, 2)")
@@ -72,6 +74,7 @@ class MOHHOLogger(RunLogger):
             "archive_truncation": "remove minimum crowding distance",
             "dive_selection": "uniform among nondominated parent, Y and Z",
             "data_path": str(data_path),
+            "evaluation_scope": "optimization data; no held-out evaluation",
             "fitness_method": fitness_method,
             "n_samples": n_samples,
             "features": FEATURES,
@@ -86,7 +89,9 @@ class MOHHOLogger(RunLogger):
 class MOHHO:
     def __init__(self, fitness, y_true, method, config, logger):
         self.fitness = fitness
-        self.y_true = np.asarray(y_true, dtype=np.int8)
+        self.y_true = validate_labels(y_true, len(fitness.X))
+        if method not in ("weighted_mean", "noisy_or"):
+            raise ValueError(f"Unknown fitness method: {method}")
         self.method = method
         self.cfg = config
         self.logger = logger
@@ -200,7 +205,7 @@ class MOHHO:
 
 if __name__ == "__main__":
     BASE_DIR = Path(__file__).resolve().parent
-    DATA_PATH = BASE_DIR.parent / "drowsiness_hard_200.jsonl"
+    DATA_PATH = BASE_DIR.parent / "drowsiness_risk.jsonl"
     OUTPUT_DIR = BASE_DIR / "output" / "mohho"
     FITNESS_METHOD = "noisy_or"
     CONFIG = MOHHOConfig(

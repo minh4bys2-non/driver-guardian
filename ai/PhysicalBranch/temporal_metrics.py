@@ -53,7 +53,7 @@ class StateMachine:
             self.start = now
         elif state == 0 and self.start is not None:
             self.last_duration = (now - self.start) * 1000
-            done = self.armed and self.minimum <= self.last_duration <= self.maximum
+            done = self.armed and self.minimum - 1e-6 <= self.last_duration <= self.maximum + 1e-6
             if done:
                 self.events.append(now)
                 self.last_valid_duration = self.last_duration

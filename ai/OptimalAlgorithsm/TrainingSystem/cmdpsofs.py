@@ -8,7 +8,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
-from ai.OptimalAlgorithsm.TrainingSystem.fitnessFunction import FEATURES, Fitness, load_jsonl
+from ai.OptimalAlgorithsm.TrainingSystem.fitnessFunction import FEATURES, Fitness, load_jsonl, validate_labels
 
 
 def dominates(a: np.ndarray, b: np.ndarray) -> bool:
@@ -29,10 +29,11 @@ def crowding_distance(objectives: np.ndarray) -> np.ndarray:
         order = np.argsort(objectives[:, j])
         values = objectives[order, j]
         span = values[-1] - values[0]
+        if span <= 1e-12:
+            continue
         distance[order[0]] = np.inf
         distance[order[-1]] = np.inf
-        if span > 1e-12:
-            distance[order[1:-1]] += (values[2:] - values[:-2]) / span
+        distance[order[1:-1]] += (values[2:] - values[:-2]) / span
     return distance.astype(np.float32)
 
 
@@ -49,6 +50,18 @@ class CMDPSOFSConfig:
     nonuniform_b: float = 5.0
     seed: int = 42
 
+    def __post_init__(self):
+        sizes = (self.population_size, self.generations, self.archive_size)
+        if any(type(v) is not int or v < 1 for v in sizes):
+            raise ValueError("population_size, generations and archive_size must be positive integers")
+        if type(self.dimensions) is not int or self.dimensions != 9:
+            raise ValueError("Fitness requires 8 weights and 1 classification threshold")
+        coefficients = (self.inertia, self.cognitive, self.social, self.velocity_limit)
+        if not np.isfinite(coefficients).all() or min(coefficients) < 0:
+            raise ValueError("PSO coefficients and velocity_limit must be finite and nonnegative")
+        if not np.isfinite(self.nonuniform_b) or self.nonuniform_b <= 0:
+            raise ValueError("nonuniform_b must be finite and positive")
+
 
 @dataclass
 class Particle:
@@ -61,6 +74,8 @@ class Particle:
 
 class ParetoArchive:
     def __init__(self, max_size: int):
+        if type(max_size) is not int or max_size < 1:
+            raise ValueError("Archive size must be a positive integer")
         self.max_size = max_size
         self.positions = np.empty((0, 9), dtype=np.float32)
         self.objectives = np.empty((0, 3), dtype=np.float32)
@@ -69,9 +84,15 @@ class ParetoArchive:
         return len(self.positions)
 
     def update(self, positions: np.ndarray, objectives: np.ndarray):
+        positions = np.asarray(positions, dtype=np.float32)
+        objectives = np.asarray(objectives, dtype=np.float32)
+        if (positions.ndim != 2 or positions.shape[1] != 9
+                or objectives.shape != (len(positions), 3)
+                or not np.isfinite(positions).all() or not np.isfinite(objectives).all()):
+            raise ValueError("Archive requires finite positions [N,9] and objectives [N,3]")
         if len(self) == 0:
-            all_positions = np.asarray(positions, dtype=np.float32)
-            all_objectives = np.asarray(objectives, dtype=np.float32)
+            all_positions = positions
+            all_objectives = objectives
         else:
             all_positions = np.vstack((self.positions, positions))
             all_objectives = np.vstack((self.objectives, objectives))
@@ -132,7 +153,8 @@ class RunLogger:
     def save_config(self, config, data_path, fitness_method, n_samples):
         payload = {
             "algorithm": "CMDPSOFS-style continuous multi-objective PSO",
-            "data_path": data_path,
+            "data_path": str(data_path),
+            "evaluation_scope": "optimization data; no held-out evaluation",
             "fitness_method": fitness_method,
             "n_samples": n_samples,
             "features": FEATURES,
@@ -164,7 +186,7 @@ class RunLogger:
         pop_obj = np.vstack([p.objectives for p in particles])
         recall = 1.0 - archive.objectives[:, 0]
         precision = 1.0 - archive.objectives[:, 1]
-        num_features = archive.objectives[:, 2] * 8.0
+        num_features = (archive.positions[:, :8] >= 0.5).sum(axis=1)
         ideal_distance = np.linalg.norm(archive.objectives, axis=1)
 
         row = {
@@ -231,7 +253,7 @@ class RunLogger:
     def _pareto_plot(self, archive):
         recall = 1.0 - archive.objectives[:, 0]
         precision = 1.0 - archive.objectives[:, 1]
-        num_features = archive.objectives[:, 2] * 8.0
+        num_features = (archive.positions[:, :8] >= 0.5).sum(axis=1)
         fig = plt.figure(figsize=(8, 6))
         ax = fig.add_subplot(111, projection="3d")
         ax.scatter(recall, precision, num_features)
@@ -272,7 +294,9 @@ class CMDPSOFS:
 
     def __init__(self, fitness, y_true, method, config, logger):
         self.fitness = fitness
-        self.y_true = np.asarray(y_true, dtype=np.int8)
+        self.y_true = validate_labels(y_true, len(fitness.X))
+        if method not in ("weighted_mean", "noisy_or"):
+            raise ValueError(f"Unknown fitness method: {method}")
         self.method = method
         self.cfg = config
         self.logger = logger
@@ -403,7 +427,7 @@ if __name__ == "__main__":
     # ============================================================
     # Change experiment parameters directly here.
     # ============================================================
-    DATA_PATH = ("/home/tranmanhduy/Workspace/ptithcm/driver-guardian/ai/OptimalAlgorithsm/drowsiness_hard_200.jsonl")
+    DATA_PATH = Path(__file__).resolve().parent.parent / "drowsiness_risk.jsonl"
 
     OUTPUT_DIR = ("/home/tranmanhduy/Workspace/ptithcm/driver-guardian/ai/OptimalAlgorithsm/TrainingSystem/output/cmdpsofs")
 

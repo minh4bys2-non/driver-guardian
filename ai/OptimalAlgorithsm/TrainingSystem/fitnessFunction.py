@@ -12,27 +12,55 @@ FEATURES = [
     "cnn_lstm_score",
 ]
 
+
+def validate_labels(values, n_samples=None):
+    values = np.asarray(values)
+    if (values.ndim != 1 or not values.size or not np.isin(values, (0, 1)).all()
+            or (n_samples is not None and len(values) != n_samples)):
+        raise ValueError("Labels must be a nonempty binary vector matching the samples")
+    return values.astype(np.int8)
+
+
 def load_jsonl(path):
     X, y = [], []
+    encoding = None
     with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            row = json.loads(line)
-            X.append([row[name] for name in FEATURES])
+        for line_number, line in enumerate(f, 1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+                if not isinstance(row, dict) or type(row["label"]) is not int or row["label"] not in (0, 1):
+                    raise ValueError("Each record requires an integer label 0 or 1")
+                row_encoding = row.get("feature_encoding", "scale_v1")
+                if row_encoding not in ("scale_v1", "risk_v1", "risk_v2"):
+                    raise ValueError("Unknown feature encoding")
+                if encoding is not None and row_encoding != encoding:
+                    raise ValueError("Cannot mix feature encodings in one dataset")
+                encoding = row_encoding
+                values = np.asarray([row[name] for name in FEATURES], dtype=np.float64)
+                if values.shape != (8,) or not np.isfinite(values).all() or np.any((values < 0) | (values > 1)):
+                    raise ValueError("Features must be eight finite values in [0, 1]")
+            except (ValueError, KeyError, TypeError) as exc:
+                raise ValueError(f"{path}: line {line_number}: {exc}") from exc
+            X.append(values)
             y.append(row["label"])
-    return (
-        np.asarray(X, dtype=np.float32),
-        np.asarray(y, dtype=np.int8),
-    )
+    if not X:
+        raise ValueError(f"Dataset is empty: {path}")
+    return np.asarray(X, dtype=np.float32), np.asarray(y, dtype=np.int8)
 
 class Fitness:
     def __init__(self, X):
         self.X = np.asarray(X, dtype=np.float32)
+        if (self.X.ndim != 2 or self.X.shape[1] != 8 or len(self.X) == 0
+                or not np.isfinite(self.X).all() or np.any((self.X < 0) | (self.X > 1))):
+            raise ValueError("X must be a nonempty [N,8] array of finite values in [0,1]")
     @staticmethod
     def _candidate(candidate):
         candidate = np.asarray(candidate, dtype=np.float32)
         if candidate.shape != (9,):
             raise ValueError("Candidate must be [w1, ..., w8, T_cls]")
-        if np.any((candidate < 0) | (candidate > 1)):
+        if not np.isfinite(candidate).all() or np.any((candidate < 0) | (candidate > 1)):
             raise ValueError("Candidate values must be in [0, 1]")
         w = candidate[:8]
         threshold = candidate[8]
@@ -57,18 +85,15 @@ class Fitness:
         return (score >= threshold).astype(np.int8)
 
     def predict(self, candidate, method="weighted_mean"):
-        fn = getattr(self, method, None)
-        if fn is None or not callable(fn):
+        if method not in ("weighted_mean", "noisy_or"):
             raise ValueError(f"Unknown fitness method: {method}")
-        return fn(candidate)
+        return getattr(self, method)(candidate)
 
     @staticmethod
     def evaluate(candidate, y_pred, y_true):
-        candidate = np.asarray(candidate, dtype=np.float32)
-        y_pred = np.asarray(y_pred, dtype=np.int8)
-        y_true = np.asarray(y_true, dtype=np.int8)
-        if y_pred.shape != y_true.shape:
-            raise ValueError("y_pred and y_true must have the same shape")
+        _, _, mask = Fitness._candidate(candidate)
+        y_true = validate_labels(y_true)
+        y_pred = validate_labels(y_pred, len(y_true))
 
         tp = np.sum((y_pred == 1) & (y_true == 1))
         fp = np.sum((y_pred == 1) & (y_true == 0))
@@ -77,7 +102,7 @@ class Fitness:
         recall = tp / (tp + fn) if tp + fn else 0.0
         precision = tp / (tp + fp) if tp + fp else 0.0
 
-        num_feature = np.sum(candidate[:8] >= 0.5)
+        num_feature = mask.sum()
 
         return np.asarray([
             1.0 - recall,

@@ -20,7 +20,7 @@ from ai.OptimalAlgorithsm.TrainingSystem.cmdpsofs import (
     crowding_distance,
     dominates,
 )
-from ai.OptimalAlgorithsm.TrainingSystem.fitnessFunction import FEATURES, Fitness, load_jsonl
+from ai.OptimalAlgorithsm.TrainingSystem.fitnessFunction import FEATURES, Fitness, load_jsonl, validate_labels
 
 
 @dataclass
@@ -36,9 +36,11 @@ class IBGWO4Config:
     seed: int = 42
 
     def __post_init__(self):
+        if any(type(v) is not int for v in (self.population_size, self.generations, self.archive_size)):
+            raise ValueError("population_size, generations and archive_size must be integers")
         if self.population_size < 3 or self.generations < 1 or self.archive_size < 1:
             raise ValueError("Require population_size >= 3, generations >= 1, archive_size >= 1")
-        if self.dimensions != 9:
+        if type(self.dimensions) is not int or self.dimensions != 9:
             raise ValueError("Fitness requires 8 weights and 1 classification threshold")
         coefficients = (self.inertia, self.cognitive, self.social, self.velocity_limit)
         if not np.all(np.isfinite(coefficients)) or min(coefficients) < 0:
@@ -72,6 +74,7 @@ class IBGWO4Logger(RunLogger):
             "selection": "parent + GWO + GWO-then-PSO; Pareto rank and crowding distance",
             "representation": "continuous weights and threshold; no binary transfer function",
             "data_path": str(data_path),
+            "evaluation_scope": "optimization data; no held-out evaluation",
             "fitness_method": fitness_method,
             "n_samples": n_samples,
             "features": FEATURES,
@@ -86,7 +89,9 @@ class IBGWO4Logger(RunLogger):
 class IBGWO4:
     def __init__(self, fitness, y_true, method, config, logger):
         self.fitness = fitness
-        self.y_true = np.asarray(y_true, dtype=np.int8)
+        self.y_true = validate_labels(y_true, len(fitness.X))
+        if method not in ("weighted_mean", "noisy_or"):
+            raise ValueError(f"Unknown fitness method: {method}")
         self.method = method
         self.cfg = config
         self.logger = logger
@@ -192,7 +197,7 @@ class IBGWO4:
 
 if __name__ == "__main__":
     BASE_DIR = Path(__file__).resolve().parent
-    DATA_PATH = BASE_DIR.parent / "drowsiness_hard_200.jsonl"
+    DATA_PATH = BASE_DIR.parent / "drowsiness_risk.jsonl"
     OUTPUT_DIR = BASE_DIR / "output" / "ibgwo4"
     FITNESS_METHOD = "weighted_mean"
     CONFIG = IBGWO4Config(

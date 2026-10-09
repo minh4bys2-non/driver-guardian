@@ -1,5 +1,7 @@
 # DataSystem — Hệ thống tạo dữ liệu đặc trưng buồn ngủ
 
+**Đã áp dụng điểm nguy hiểm `risk_v2` theo `RISK_CONFIG` người dùng cung cấp.** Xem [NORMALIZATION.md](NORMALIZATION.md) để biết công thức, đơn vị, điều kiện mắt và độ tin cậy FFT.
+
 ## 1. Mục đích và phạm vi
 
 DataSystem đọc video và nhãn từ manifest JSONL, trích xuất **7 đặc trưng vật lý + 1 điểm CNN–ConvGRU**, sau đó ghi từng mẫu thành một dòng JSONL cho `TrainingSystem`.
@@ -104,7 +106,7 @@ Thời gian đích:  0.00   0.25   0.50   0.75
 | Tham số | Mặc định | Ý nghĩa |
 | --- | --- | --- |
 | `fps` | 30 | Timeline chung và tốc độ xử lý nhánh vật lý |
-| `window_sec` | 60 | Độ dài cửa sổ vật lý, 1.800 frame |
+| `risk_config["window_sec"]` | 60 | Độ dài cửa sổ vật lý, 1.800 frame; tham số `window_sec` nếu truyền phải khớp |
 | `stride_sec` | 10 | Khoảng dịch giữa hai cửa sổ, 300 frame |
 | `neural_sec` | 10 | Độ dài đoạn đưa vào ConvGRU |
 | `neural_fps` | 5 | 5 ảnh/giây, cách nhau 0,2 giây |
@@ -114,7 +116,7 @@ Thời gian đích:  0.00   0.25   0.50   0.75
 | `cnn_path` | `None` | Đường dẫn checkpoint CNN; `None` dùng cơ chế tìm tự động |
 | `conv_gru_path` | `None` | Đường dẫn checkpoint ConvGRU; `None` dùng cơ chế tìm tự động |
 | `chunk_size` | 32 | Số ảnh mỗi lượt chạy CNN backbone/neck |
-| `scales` | `SCALES` | Ghi đè các thang chuẩn hóa theo tên đặc trưng |
+| `risk_config` | `DEFAULT_RISK_CONFIG` | Ghi đè từng mục ngưỡng điểm, tổng hợp và thời lượng tối thiểu |
 
 Với mặc định, cứ mỗi 6 frame của timeline 30 FPS sẽ giữ 1 frame cho mạng. Buffer mạng chứa tối đa 50 ảnh.
 
@@ -144,7 +146,7 @@ Metadata `[start_second, end_second)` biểu diễn cửa sổ **frame**. Frame 
 
 FSM giữ sự kiện hoàn tất trong `(t - window_sec, t]`. Trên lưới đều, đó là các mốc sự kiện thuộc cửa sổ frame. Tỷ lệ như PERCLOS được tích phân từ các khoảng giữa hai lần quan sát đến `t`, nên biên thống kê liên tục sớm hơn biên metadata tối đa một bước frame, khoảng 33,3 ms ở 30 FPS. Không diễn giải đây là phép đo liên tục chính xác đến mili giây.
 
-Cửa sổ FFT được đặt thành `(window_frames - 1) / fps`, tức khoảng 59,9667 giây: đó là khoảng thời gian từ ảnh đầu đến ảnh cuối của 1.800 ảnh.
+Cửa sổ FFT được đặt đúng 60 giây theo cấu hình riêng. Tại mốc xuất đầu tiên, 1.800 ảnh chỉ trải dài 59,9667 giây nên chưa đủ chuỗi FFT; mẫu đầu tiên có thể bị loại.
 
 ## 7. Nhánh vật lý
 
@@ -167,7 +169,7 @@ Mắt và miệng khởi tạo từ **450 quan sát hợp lệ** ở cấu hình
 | Sự kiện | Điều kiện thời lượng mặc định |
 | --- | --- |
 | Chớp mắt | 100–2.000 ms |
-| Ngáp | 3.500–7.500 ms |
+| Ngáp | 4.000–7.500 ms |
 | Gật đầu | 800–3.500 ms |
 
 Sự kiện chỉ được đếm khi kết thúc và đã quan sát được trạng thái nghỉ để khởi động FSM. Mất tín hiệu hoặc khoảng cách quan sát lớn hơn 0,25 giây hủy sự kiện đang dở. Một lần đóng mắt quá dài không được tính là chớp mắt hợp lệ, nhưng vẫn có thể đóng góp vào PERCLOS.
@@ -180,7 +182,7 @@ rate_per_minute = số sự kiện hoàn tất trong cửa sổ * 60 / window_se
 
 Mẫu số là toàn bộ độ dài cửa sổ, không phải riêng thời gian quan sát hợp lệ. Điều kiện coverage hạn chế tác động của mất tín hiệu, nhưng không bù hoàn toàn số sự kiện có thể đã bị bỏ lỡ.
 
-`blink_duration` và `nod_duration` là trung bình thời lượng của các sự kiện hợp lệ **kết thúc trong cửa sổ**. Một sự kiện có thể bắt đầu trước biên cửa sổ; thời lượng của nó vẫn được giữ nguyên. Không có sự kiện thì thời lượng trung bình bằng 0.
+`blink_duration` là P90 theo ms; `nod_duration` là max theo giây, của các sự kiện hợp lệ **kết thúc trong cửa sổ**. Một sự kiện có thể bắt đầu trước biên cửa sổ; thời lượng của nó vẫn được giữ nguyên. Không có sự kiện thì giá trị tổng hợp bằng 0.
 
 ### 7.3. PERCLOS
 
@@ -200,9 +202,9 @@ Góc đầu được ước lượng từ landmark. Baseline tư thế trung tí
 
 Gật đầu dùng hysteresis theo pitch: vào trạng thái gật khi vượt 14°, giữ trạng thái đến khi không còn vượt 8°. Mặc định `nod_direction=None` dùng trị tuyệt đối pitch, nên không phân biệt cúi và ngửa. Tư thế ban đầu không trung tính có thể làm lệch baseline; cần kiểm chứng trên video thực tế khi đánh giá độ chính xác hành vi.
 
-Tần số chuyển động đầu dùng chuỗi pitch liên tục đủ dài: nội suy theo timestamp, trừ trung bình, áp dụng cửa sổ Hann, tìm đỉnh phổ FFT khác DC. Nếu biên độ peak-to-peak không vượt 0,1°, coi như không có chuyển động đáng kể và xuất tần số 0 sau bước kiểm tra đủ dữ liệu.
+Tần số chuyển động đầu dùng chuỗi pitch liên tục đủ dài: nội suy theo timestamp, trừ trung bình, áp dụng cửa sổ Hann, tìm đỉnh phổ FFT khác DC. Nếu biên độ peak-to-peak không vượt 0,1°, không có tần số đáng tin cậy và mẫu bị loại với cấu hình mặc định.
 
-Mất pitch hoặc khoảng thời gian gián đoạn lớn hơn 0,25 giây làm xóa chuỗi FFT. Sau đó phải tích lũy lại gần 60 giây liên tục. Đây là điều kiện mạnh hơn yêu cầu coverage 80%.
+Mất pitch hoặc khoảng thời gian gián đoạn lớn hơn 0,25 giây làm xóa chuỗi FFT. Sau đó phải tích lũy lại đủ 60 giây liên tục. Đây là điều kiện mạnh hơn yêu cầu coverage 80%.
 
 ## 8. Điều kiện xuất một mẫu
 
@@ -224,7 +226,7 @@ Coverage mặc định yêu cầu từng giá trị `eye_observed_sec`, `mouth_o
 
 Trong điều kiện liên tục, cửa sổ `[0,60)` thường bị loại: HMM cần khoảng 15 giây khởi tạo, còn khoảng 45 giây quan sát mắt/miệng. Cửa sổ `[10,70)` mới có thể đạt điều kiện. Mất tín hiệu có thể làm mốc đầu ra đầu tiên muộn hơn.
 
-`min_observed_ratio=0` chỉ bỏ ngưỡng coverage; **không** bỏ các điều kiện khởi tạo, PERCLOS và FFT. `head_motion_frequency_hz=None` chỉ được chuyển thành 0 khi `head_motion_resolution_hz` đã có giá trị, nghĩa là FFT đủ dữ liệu nhưng chuyển động quá nhỏ. Chưa đủ chuỗi FFT sẽ bị loại, không tạo giá trị 0 giả.
+`min_observed_ratio=0` chỉ bỏ ngưỡng coverage. Các điều kiện khởi tạo và PERCLOS vẫn áp dụng; với `require_reliable_motion=True`, FFT phải có tần số dương hữu hạn và đủ 60 giây quan sát liên tục. Thiếu chuyển động đáng tin cậy làm loại mẫu.
 
 Hiện bộ lọc bỏ cửa sổ không đạt mà không ghi một dòng lý do riêng vào JSONL. Vì vậy cần theo dõi số dòng đầu ra; file rỗng không tự động đồng nghĩa với video không buồn ngủ.
 
@@ -278,24 +280,9 @@ Kiểm tra trọng số bằng `strict=True` đã xác nhận toàn bộ CNN **b
 
 ## 10. Đặc trưng đầu ra và chuẩn hóa
 
-Công thức chung cho bảy đặc trưng vật lý:
+Tám đặc trưng biểu diễn điểm nguy hiểm trong `[0,1]`, làm tròn 4 chữ số. Các metric có `safe/danger` dùng `clip((x-safe)/(danger-safe),0,1)`. Tần suất nháy mắt và FFT dùng đường cong hai nhánh; nhánh nháy mắt thấp nhân với điểm mắt cao hơn giữa PERCLOS và thời lượng nháy mắt.
 
-```text
-normalized = round(clip(raw_value / scale, 0, 1), 4)
-```
-
-| Trường | Giá trị thô | Scale |
-| --- | --- | ---: |
-| `blink_frequency` | Chớp mắt/phút | 30 |
-| `blink_duration` | Trung bình thời lượng chớp mắt, ms | 2.000 |
-| `perclos` | Tỷ lệ đóng mắt sâu, % | 100 |
-| `yawn_frequency` | Ngáp/phút | 5 |
-| `nod_duration` | Trung bình thời lượng gật đầu, ms | 3.500 |
-| `nod_frequency` | Gật đầu/phút | 5 |
-| `dominant_head_motion_frequency` | Tần số pitch trội, Hz | 2 |
-| `cnn_lstm_score` | Điểm dự đoán lớp 1 | Không chia scale; làm tròn 4 chữ số |
-
-Ví dụ `blink_frequency=0.5` tương ứng 15 lần/phút nếu chưa bão hòa. Giá trị 1 có thể là đúng scale hoặc lớn hơn scale vì clipping. Các scale là tham chiếu cấu hình, **chưa được hiệu chuẩn thành ngưỡng sinh lý hoặc xác suất buồn ngủ**. Tần số đầu cao hơn không tự động chứng minh mức buồn ngủ cao hơn.
+Thời lượng nháy mắt dùng P90 theo ms; thời lượng gật dùng max theo giây. PERCLOS đổi phần trăm thành tỷ lệ trước khi áp ngưỡng. Chi tiết đủ tám metric, ví dụ và sơ đồ có trong [NORMALIZATION.md](NORMALIZATION.md).
 
 Mỗi dòng gồm đúng tám đặc trưng trên và metadata:
 
@@ -305,6 +292,7 @@ Mỗi dòng gồm đúng tám đặc trưng trên và metadata:
 | `start_second` | Mốc đầu cửa sổ frame |
 | `end_second` | `start_second + window_sec` |
 | `label` | Nhãn nguyên `0/1` từ manifest |
+| `feature_encoding` | `risk_v2`; không trộn với các phiên bản cũ |
 
 JSONL không lưu feature thô, coverage, subject ID riêng hoặc hash checkpoint. Có thể suy ra subject từ cấu trúc đường dẫn hiện tại, nhưng Engine không thực hiện bước đó. Cần lưu cấu hình và phiên bản checkpoint đi kèm mỗi lần tạo bộ dữ liệu để tái lập kết quả.
 
@@ -357,10 +345,10 @@ Có thể chạy `python -m ai.OptimalAlgorithsm.DataSystem.engine`. Cấu hình
 
 - `INPUT_JSONL`, `VIDEO_ROOT`, `OUTPUT_JSONL`: nguồn và đích dữ liệu.
 - `CNN_PATH`, `CONV_GRU_PATH`: checkpoint cụ thể, được truyền qua `Engine` vào `NeuralNetwork`. Đường dẫn được chỉ định nhưng không tồn tại sẽ báo lỗi, không tự chuyển sang checkpoint khác.
-- `FPS`, `WINDOW_SEC`, `STRIDE_SEC`: timeline và cửa sổ vật lý.
+- `FPS`, `RISK_CONFIG["window_sec"]`, `STRIDE_SEC`: timeline và cửa sổ vật lý.
 - `NEURAL_SEC`, `NEURAL_FPS`, `NEURAL_SIZE`: đoạn ảnh đầu vào mạng.
 - `CHUNK_SIZE`, `DEVICE`: số ảnh mỗi lượt CNN và thiết bị suy luận.
-- `MIN_OBSERVED_RATIO`, `FEATURE_SCALES`, `STRICT`: lọc chất lượng, thang chuẩn hóa và xử lý lỗi. `FEATURE_SCALES` lấy bản sao của bộ `SCALES` mặc định; có thể sửa các khóa tại đây.
+- `MIN_OBSERVED_RATIO`, `RISK_CONFIG`, `STRICT`: lọc chất lượng, cấu hình điểm nguy hiểm và xử lý lỗi. `RISK_CONFIG` lấy bản sao của `DEFAULT_RISK_CONFIG`; có thể sửa các khóa tại đây.
 
 Khối này dùng đường dẫn tuyệt đối, cần chỉnh khi chạy trên máy khác. Kiểm tra `OUTPUT_JSONL` trước khi chạy vì tệp đã tồn tại sẽ bị ghi đè. Các giá trị mặc định của API `Engine` vẫn dùng được khi import từ mã Python khác.
 
@@ -388,7 +376,7 @@ python -m unittest discover -s ai/OptimalAlgorithsm/DataSystem/tests -v
 python -m unittest discover -s ai/PhysicalBranch/tests -v
 ```
 
-Kiểm thử DataSystem bao gồm: cùng FPS không lặp sai frame; tăng/giảm FPS; frame cuối; timestamp thiếu, âm, đi qua 0 và không tăng; giữ tỷ lệ ảnh và màu viền float; cấu hình/nhãn không hợp lệ; JSONL strict/continue; kiểu ảnh uint8/float16/float32/bfloat16; chuyển logits thành điểm nhị phân; lịch cửa sổ, buffer 5 FPS và điều kiện chất lượng.
+Kiểm thử DataSystem bao gồm các mốc điểm nguy hiểm, P90/max, đổi đơn vị, điều kiện nháy mắt thấp, FFT tin cậy, biên thời lượng ngáp/gật, cùng các ca: cùng FPS không lặp sai frame; tăng/giảm FPS; frame cuối; timestamp thiếu, âm, đi qua 0 và không tăng; giữ tỷ lệ ảnh và màu viền float; cấu hình/nhãn không hợp lệ; JSONL strict/continue; kiểu ảnh uint8/float16/float32/bfloat16; chuyển logits thành điểm nhị phân; lịch cửa sổ, buffer 5 FPS và điều kiện chất lượng.
 
 Kiểm thử PhysicalBranch bao gồm FSM, thời lượng sự kiện, mất tín hiệu, PERCLOS theo khoảng thời gian, hiệu chuẩn đầu, FFT và cửa sổ độc lập. Đây là kiểm thử logic; chưa thay thế đánh giá trên landmark và nhãn sự kiện được gán thủ công.
 
@@ -396,7 +384,7 @@ Kết quả rà soát cuối:
 
 | Hạng mục | Kết quả |
 | --- | --- |
-| DataSystem | 11 kiểm thử đạt |
+| DataSystem | 17 kiểm thử đạt |
 | PhysicalBranch | 18 kiểm thử đạt |
 | Trọng số CNN backbone/neck và ConvGRU | Khớp toàn bộ khóa với `strict=True` |
 | Pipeline trên video thật | Chạy đủ 2.100 frame đầu ra, tương đương 70 giây ở 30 FPS |
@@ -405,22 +393,23 @@ Kết quả rà soát cuối:
 
 Video thử là `Fold1_part1/01/0.mov`, nhãn 0, dùng CPU. Bộ đọc thật được giới hạn ở 2.100 frame để kiểm tra hai mốc xuất đầu tiên; không giả lập landmark hoặc đầu ra mạng. Chỉ dependency âm thanh tùy chọn bị vô hiệu hóa như hướng dẫn ở trên.
 
-Mẫu thực tế thu được:
+Mẫu thực tế sau khi cập nhật `risk_v2` (TrainingSystem đã đọc lại thành công):
 
 ```json
 {
-  "blink_frequency": 0.0333,
-  "blink_duration": 0.05,
-  "perclos": 0.0006,
+  "blink_frequency": 0.0,
+  "blink_duration": 0.0,
+  "perclos": 0.0,
   "yawn_frequency": 0.0,
-  "nod_duration": 0.9333,
-  "nod_frequency": 0.2,
-  "dominant_head_motion_frequency": 0.0083,
+  "nod_duration": 1.0,
+  "nod_frequency": 0.3333,
+  "dominant_head_motion_frequency": 0.6669,
   "cnn_lstm_score": 0.0063,
   "source_video": "Fold1_part1/01/0.mov",
   "start_second": 10.0,
   "end_second": 70.0,
-  "label": 0
+  "label": 0,
+  "feature_encoding": "risk_v2"
 }
 ```
 
@@ -428,9 +417,119 @@ Kết quả này xác nhận luồng đọc video → FaceMesh → đặc trưng
 
 ## 13. Những điểm cần giữ khi tạo bộ dữ liệu huấn luyện
 
-1. **Tạo lại dữ liệu cũ.** File `drowsiness_sample.jsonl` hiện có 103 dòng với toàn bộ `cnn_lstm_score=0.5`. Không có đủ bằng chứng để xác định nguyên nhân từ file đó, nhưng chưa thể dùng nó như bằng chứng mạng đang suy luận đúng. Phiên rà soát không ghi đè file này.
+1. **Tạo lại dữ liệu theo `risk_v2`.** Không trộn điểm chia scale hoặc `risk_v1` với dữ liệu mới. Phiên cập nhật không ghi đè dataset hiện có.
 2. **Tách tập theo người/video trước khi đánh giá.** Cửa sổ 60 giây dịch 10 giây chồng lấn 50 giây. Chia ngẫu nhiên theo dòng có thể đưa gần như cùng nội dung vào train và test. Với UTA-RLDD nên giữ toàn bộ video cùng subject trong cùng nhóm; DataSystem chưa tự chia tập.
-3. **Theo dõi tỷ lệ cửa sổ bị loại.** Điều kiện FFT gần 60 giây liên tục có thể loại nhiều video khó. Cần báo cáo số mẫu theo lớp/subject và coverage để nhận biết thiên lệch do chất lượng theo dõi.
+3. **Theo dõi tỷ lệ cửa sổ bị loại.** Điều kiện FFT đủ 60 giây liên tục có thể loại nhiều video khó. Cần báo cáo số mẫu theo lớp/subject và coverage để nhận biết thiên lệch do chất lượng theo dõi.
 4. **Kiểm chứng calibration trên video thực tế.** Tư thế ban đầu, mắt đã nhắm, kính, che khuất, góc quay và ảnh lặp do FPS thấp có thể làm thay đổi phép đo.
 5. **Không đồng nhất chạy đúng với dự đoán đúng.** Muốn kết luận độ chính xác cần tập kiểm thử độc lập, nhãn phù hợp cho từng cửa sổ và đối chiếu sự kiện với annotation. Bộ kiểm thử phần mềm không cung cấp accuracy/precision/recall hành vi.
 6. **Lưu provenance.** Ghi phiên bản mã, đường dẫn/hash checkpoint, tham số Engine, manifest và log tạo dữ liệu. Kiểm tra checkpoint có từng được huấn luyện trên các subject dùng để đánh giá hay không.
+
+## 14. Sơ đồ Mermaid chi tiết: video → JSONL
+
+Các sơ đồ dưới đây mô tả cấu hình mặc định `risk_v2`: nhánh vật lý 30 FPS, cửa sổ 60 giây, stride 10 giây; mạng nhận 50 ảnh ở 5 FPS trong 10 giây cuối. Hai nhánh dùng cùng timeline; mã cập nhật tuần tự theo frame, không chạy hai worker song song.
+
+### 14.1. Điều phối manifest và vòng đời từng video
+
+```mermaid
+flowchart TD
+    START([Bắt đầu]) --> CFG["Đọc cấu hình Engine và RISK_CONFIG<br/>Kiểm tra ngưỡng, đơn vị, FPS và lịch cửa sổ"]
+    CFG --> MODEL["Nạp checkpoint CNN và ConvGRU một lần<br/>Chuyển mô hình sang eval, chọn CPU hoặc CUDA"]
+    MODEL --> FILES["Mở INPUT_JSONL để đọc<br/>Mở OUTPUT_JSONL chế độ w: ghi đè nếu đã tồn tại"]
+    FILES --> LINE{"Còn dòng manifest?"}
+    LINE -->|Không| FINISH["Đóng file và trả tổng số mẫu đã ghi"]
+    FINISH --> END([Kết thúc])
+    LINE -->|Có| BLANK{"Dòng trống?"}
+    BLANK -->|Có| LINE
+    BLANK -->|Không| PARSE["Đọc video_path và label<br/>Kiểm tra đường dẫn tương đối trong VIDEO_ROOT<br/>Nhãn nguyên: 0 hoặc 1"]
+    PARSE --> INIT["Tạo CameraMetrics mới cho video<br/>Buffer mạng và lịch sử blink/nod rỗng<br/>Timeline bắt đầu từ 0"]
+    INIT --> STREAM["Đọc và xử lý từng frame<br/>Theo sơ đồ 14.2"]
+    STREAM -->|Yield một mẫu hợp lệ| WRITE["Serialize JSON: allow_nan=False<br/>Ghi một dòng vào OUTPUT_JSONL<br/>Flush ngay và tăng bộ đếm"]
+    WRITE --> STREAM
+    STREAM -->|Hết video| CLOSE["Đóng CameraMetrics và bộ đọc video<br/>Kết thúc trạng thái của video hiện tại"]
+    CLOSE --> LINE
+    PARSE -.->|Lỗi được run bắt| ERROR{"strict=True?"}
+    STREAM -.->|Lỗi được run bắt; giải phóng tài nguyên| ERROR
+    ERROR -->|Có| STOP([Ném lỗi và dừng])
+    ERROR -->|Không| LOG["Ghi số dòng và lỗi ra stderr<br/>Giữ các mẫu đã ghi; bỏ phần còn lại của video lỗi"]
+    LOG --> LINE
+```
+
+Mỗi video có bộ đo và buffer riêng nên không nối frame, sự kiện hoặc trạng thái hiệu chuẩn sang video tiếp theo. Checkpoint mạng được tái sử dụng. Nhãn của mọi cửa sổ được kế thừa từ manifest, không lấy từ dự đoán của mạng.
+
+### 14.2. Từ frame đến cửa sổ đủ điều kiện suy luận
+
+```mermaid
+flowchart TD
+    READ["OpenCV đọc video nguồn"] --> TIME["Chuẩn hóa timestamp về mốc 0<br/>Lấy mẫu trên timeline 30 FPS<br/>Giữ frame trước khi cần lặp; bỏ frame dư khi giảm FPS"]
+    TIME --> FRAME["Nhận RGB uint8 dạng 3 × H × W<br/>Kiểm tra kiểu và kích thước frame"]
+    FRAME --> BGR["Đổi RGB → BGR cho CameraMetrics"]
+    BGR --> FACE["FaceMesh: landmark khuôn mặt<br/>Tính EAR, MAR và pitch/yaw/roll"]
+    FACE --> EYE["Mắt và miệng: khởi tạo mô hình, HMM và FSM<br/>Đếm sự kiện nháy mắt, ngáp<br/>Tích lũy PERCLOS và thời gian quan sát"]
+    EYE --> HEAD["Đầu: hiệu chuẩn baseline và pitch tương đối<br/>Hysteresis + FSM phát hiện gật<br/>Tích lũy pitch liên tục cho FFT 60 giây"]
+    HEAD --> SAMPLE{"Chỉ số frame chia hết cho 6?"}
+    SAMPLE -->|Có| BUFFER["Letterbox RGB thành 640 × 640<br/>Thêm vào deque tối đa 50 ảnh<br/>Tốc độ lưu ảnh mạng: 5 FPS"]
+    SAMPLE -->|Không| HISTORY
+    BUFFER --> HISTORY["Lưu thời lượng blink/nod hợp lệ vừa kết thúc<br/>Loại sự kiện kết thúc ngoài cửa sổ 60 giây"]
+    HISTORY --> DUE{"Đủ 1.800 frame và đến stride 300 frame?"}
+    DUE -->|Không| NEXT["Đọc frame tiếp theo"]
+    NEXT --> READ
+    DUE -->|Có| READY{"Mắt, miệng đã sẵn sàng<br/>và đầu đã hiệu chuẩn?"}
+    READY -->|Không| SKIP["Bỏ cửa sổ, tiếp tục giữ và cập nhật trạng thái"]
+    READY -->|Có| COVER{"Có PERCLOS và mỗi nhóm mắt, miệng, đầu<br/>quan sát được ít nhất 48 giây?"}
+    COVER -->|Không| SKIP
+    COVER -->|Có| FFT{"FFT tin cậy theo cấu hình?<br/>Pitch liên tục đủ 60 giây, biên độ lớn hơn 0,1 độ<br/>Tần số và độ phân giải hữu hạn, dương"}
+    FFT -->|Không| SKIP
+    SKIP --> NEXT
+    FFT -->|Có| NEURAL["Suy luận 50 ảnh của 10 giây cuối<br/>Theo sơ đồ 14.3"]
+    NEURAL --> RISK["Tính 8 điểm nguy hiểm<br/>Theo sơ đồ 14.4"]
+    RISK --> YIELD["Yield mẫu cho run ghi JSONL"]
+    YIELD --> NEXT
+```
+
+Tại cửa sổ frame `[0,60)`, timestamp cuối là khoảng 59,9667 giây nên chưa đủ chuỗi FFT dài 60 giây. Một cửa sổ bị loại không làm reset cả video. Riêng mất pitch hoặc gián đoạn trên 0,25 giây làm xóa chuỗi FFT, cần tích lũy lại. Sơ đồ thể hiện `require_reliable_motion=True`; nếu tắt, FFT không tin cậy được cho điểm 0.
+
+### 14.3. Nhánh CNN–ConvGRU: chỉ dùng 10 giây cuối
+
+```mermaid
+flowchart LR
+    INPUT["50 ảnh RGB uint8<br/>Ví dụ cửa sổ 10–70 giây:<br/>ảnh tại 60,0; 60,2; ...; 69,8"]
+    INPUT --> STACK["Stack thành T × 3 × 640 × 640<br/>T = 50"]
+    STACK --> CHUNK["Chia chunk tối đa 32 ảnh<br/>Chuyển sang device, float32<br/>Chia 255 để pixel về 0–1"]
+    CHUNK --> CNN["CNN backbone → neck<br/>Trích xuất đặc trưng P3, P4, P5"]
+    CNN --> SEQ["Ghép đặc trưng theo đúng thứ tự thời gian<br/>Thêm chiều batch, seq_lens = 50"]
+    SEQ --> GRU["ConvGRU xử lý chuỗi đặc trưng<br/>Trả logits của clip"]
+    GRU --> PROB["Một logit: sigmoid<br/>Hai logits: softmax lấy lớp 1"]
+    PROB --> CHECK["Kiểm tra score hữu hạn trong 0–1<br/>Đưa vào cnn_lstm_score"]
+```
+
+Tên cột `cnn_lstm_score` được giữ để tương thích bộ 8 đặc trưng; mô hình đang dùng là ConvGRU. Chuẩn hóa pixel ở sơ đồ này khác với chuẩn hóa điểm nguy hiểm ở sơ đồ tiếp theo.
+
+### 14.4. Chuẩn hóa 8 đặc trưng và định dạng dòng JSONL
+
+```mermaid
+flowchart TD
+    METRIC["Metric vật lý của cửa sổ 60 giây<br/>và score mạng của 10 giây cuối"]
+    METRIC --> BF["blink_frequency: sự kiện/phút<br/>Nội suy các mốc 4→1, 15→0, 20→0, 35→1"]
+    METRIC --> BD["blink_duration: P90 thời lượng hợp lệ, ms<br/>safe=400; danger=800"]
+    METRIC --> PC["perclos: perclos_pct / 100<br/>safe=0,05; danger=0,15"]
+    METRIC --> YF["yawn_frequency: sự kiện/phút<br/>Sự kiện hợp lệ dài 4–7,5 giây<br/>safe=0; danger=2"]
+    METRIC --> ND["nod_duration: max thời lượng hợp lệ / 1.000<br/>Đơn vị giây; safe=0,5; danger=2"]
+    METRIC --> NF["nod_frequency: sự kiện/phút<br/>Sự kiện hợp lệ dài 0,8–3,5 giây<br/>safe=0; danger=3"]
+    METRIC --> HF["dominant_head_motion_frequency: FFT pitch, Hz<br/>Nội suy 0→1, 0,05→0, 0,20→0, 0,60→1"]
+    METRIC --> NN["cnn_lstm_score: score mạng<br/>safe=0; danger=1"]
+    BD --> LINEAR["Các nhánh safe/danger:<br/>clip((x - safe) / (danger - safe), 0, 1)"]
+    PC --> LINEAR
+    YF --> LINEAR
+    ND --> LINEAR
+    NF --> LINEAR
+    NN --> LINEAR
+    BF --> GATE["Nếu blink dưới 15 lần/phút và bật gate:<br/>điểm blink nhân max(điểm perclos, điểm blink_duration)<br/>Nhánh blink cao giữ nguyên"]
+    LINEAR -->|Điểm PERCLOS và blink_duration| GATE
+    GATE --> MERGE["Gộp đúng 8 điểm<br/>Làm tròn 4 chữ số thập phân"]
+    LINEAR --> MERGE
+    HF --> MERGE
+    MERGE --> META["Thêm source_video, start_second, end_second<br/>label từ manifest; feature_encoding = risk_v2"]
+    META --> JSONL["Một object JSON trên một dòng<br/>Ghi vào drowsiness_risk.jsonl và flush"]
+```
+
+Tần suất bằng số sự kiện hợp lệ trong cửa sổ nhân 60 rồi chia `window_sec`; không chia riêng cho thời gian quan sát. Không có sự kiện hợp lệ thì P90/max được quy ước bằng 0. Các đường cong hai nhánh bão hòa ngoài hai đầu; riêng tần số FFT bằng 0 không được coi là chuyển động tin cậy. Điểm xuất ra là mức nguy hiểm theo cấu hình, không phải tám xác suất đã được hiệu chuẩn.

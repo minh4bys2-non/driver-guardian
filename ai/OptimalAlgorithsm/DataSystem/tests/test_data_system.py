@@ -143,26 +143,154 @@ class DataSystemTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             model(torch.zeros((2, 3, 4, 8), dtype=torch.uint8))
 
+    def make_engine(self, **options):
+        with patch.object(engine, 'NeuralNetwork'):
+            model = engine.Engine('.', **options)
+        model.neural.return_value = .7
+        return model
+
+    @staticmethod
+    def metrics(window=60, **overrides):
+        return dict(eye_ready=True, mouth_ready=True, head_calibrated=True,
+                    eye_observed_sec=window, mouth_observed_sec=window, head_observed_sec=window,
+                    head_motion_resolution_hz=1 / window, head_motion_frequency_hz=.1,
+                    head_motion_observed_sec=window, perclos_pct=10, blink_rate_per_min=4,
+                    yawning_frequency_per_min=0, nodding_frequency_per_min=0,
+                    blink_detected=False, nod_detected=False) | overrides
+
+    def test_risk_mapping_breakpoints_and_interpolation(self):
+        model = self.make_engine()
+        cases = {
+            'blink_frequency': ((0, 1), (4, 1), (9.5, .5), (15, 0), (20, 0), (27.5, .5), (35, 1)),
+            'blink_duration': ((0, 0), (400, 0), (600, .5), (800, 1), (2000, 1)),
+            'perclos': ((0, 0), (.05, 0), (.1, .5), (.15, 1), (1, 1)),
+            'yawn_frequency': ((0, 0), (1, .5), (2, 1), (3, 1)),
+            'nod_duration': ((0, 0), (.5, 0), (1.25, .5), (2, 1), (3.5, 1)),
+            'nod_frequency': ((0, 0), (1.5, .5), (3, 1), (4, 1)),
+            'dominant_head_motion_frequency': ((0, 1), (.025, .5), (.05, 0), (.1, 0),
+                                               (.2, 0), (.4, .5), (.6, 1), (1, 1)),
+            'cnn_lstm_score': ((0, 0), (.5, .5), (1, 1)),
+        }
+        for key, points in cases.items():
+            for value, expected in points:
+                with self.subTest(key=key, value=value):
+                    self.assertAlmostEqual(model._norm(key, value), expected)
+
+    def test_risk_mapping_rejects_missing_and_nonfinite_values(self):
+        model = self.make_engine()
+        for value in (None, float('nan'), float('inf'), -1):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                model._norm('blink_frequency', value)
+
+    def test_risk_config_validation_and_copy(self):
+        config = {'perclos': {'safe': 0, 'danger': .2}}
+        model = self.make_engine(risk_config=config)
+        self.assertAlmostEqual(model._norm('perclos', .1), .5)
+        config['perclos']['danger'] = .5
+        self.assertAlmostEqual(model._norm('perclos', .1), .5)
+        invalid = (
+            {'perclos': {'safe': .2, 'danger': .1}}, {'perclos': {'danger': 15}},
+            {'blink_duration': {'unit': 'sec'}}, {'blink_duration': {'aggregation': 'mean'}},
+            {'window_sec': 0}, {'blink_frequency': {'normal': (15, 15)}},
+            {'blink_frequency': {'high_danger': float('nan')}},
+            {'yawn_frequency': {'min_event_sec': 7.5}}, {'nod_frequency': {'min_event_sec': -1}},
+            {'dominant_head_motion_frequency': {'method': 'other'}},
+            {'dominant_head_motion_frequency': {'require_reliable_motion': 'yes'}},
+            {'unknown': {}}, {'perclos': {'unknown': 1}},
+        )
+        for config in invalid:
+            with self.subTest(config=config), self.assertRaises(ValueError):
+                self.make_engine(risk_config=config)
+        with self.assertRaises(ValueError):
+            self.make_engine(window_sec=30)
+
+    def test_aggregation_unit_conversion_and_eye_gate(self):
+        model = self.make_engine()
+        frames = [np.zeros((3, 8, 8), np.uint8)]
+        blink = [(1, 100), (2, 200), (3, 800)]  # P90 = 680 ms, not the mean.
+        nod = [(1, 900), (2, 1500)]  # Maximum = 1.5 seconds.
+        metrics = self.metrics(yawning_frequency_per_min=1, nodding_frequency_per_min=1.5)
+        row = model._features(metrics, blink, nod, frames, 'video', 0, 1)
+        for key, expected in dict(blink_duration=.7, nod_duration=.6667, perclos=.5,
+                                  blink_frequency=.7, yawn_frequency=.5, nod_frequency=.5,
+                                  cnn_lstm_score=.7).items():
+            self.assertEqual(row[key], expected)
+        self.assertEqual(row['feature_encoding'], 'risk_v2')
+        for frequency, perclos, expected in ((4, 5, 0), (4, 10, .5), (4, 15, 1),
+                                            (15, 15, 0), (35, 5, 1)):
+            row = model._features(self.metrics(blink_rate_per_min=frequency, perclos_pct=perclos),
+                                  [], [], frames, 'video', 0, 1)
+            self.assertEqual(row['blink_frequency'], expected)
+        model = self.make_engine(risk_config={'blink_frequency': {'gate_low_with_eye_metrics': False}})
+        row = model._features(self.metrics(perclos_pct=5), [], [], frames, 'video', 0, 1)
+        self.assertEqual(row['blink_frequency'], 1)
+
+    def test_motion_reliability_and_configured_window(self):
+        from ai.PhysicalBranch.temporal_metrics import HeadMotionWindow
+        model = self.make_engine()
+        frames = [np.zeros((3, 8, 8), np.uint8)]
+        for change in ({'head_motion_frequency_hz': None}, {'head_motion_frequency_hz': 0},
+                       {'head_motion_frequency_hz': float('nan')},
+                       {'head_motion_resolution_hz': None}, {'head_motion_observed_sec': 59.9}):
+            self.assertIsNone(model._features(self.metrics(**change), [], [], frames, 'video', 0, 1))
+        for frequency in (.1, .4):
+            motion = HeadMotionWindow(60)
+            for i in range(1201):
+                result = motion.process(5 * np.sin(2 * np.pi * frequency * i / 20), i / 20)
+            row = model._features(self.metrics(**result), [], [], frames, 'video', 0, 1)
+            self.assertIsNotNone(row)
+            self.assertAlmostEqual(row['dominant_head_motion_frequency'], 0 if frequency == .1 else .5, delta=.02)
+            lost = motion.process(None, 60.05)
+            self.assertIsNone(model._features(self.metrics(**lost), [], [], frames, 'video', 0, 1))
+        model = self.make_engine(risk_config={'dominant_head_motion_frequency': {'require_reliable_motion': False}})
+        row = model._features(self.metrics(head_motion_frequency_hz=None), [], [], frames, 'video', 0, 1)
+        self.assertEqual(row['dominant_head_motion_frequency'], 0)
+
+    def test_minimum_event_durations_reach_physical_detector(self):
+        model = self.make_engine()
+        with patch.object(engine, 'CameraMetrics') as factory, patch.object(engine, 'read_video', return_value=[]):
+            list(model.process_video('video.mp4', 0))
+            options = factory.call_args.kwargs
+        camera = engine.CameraMetrics(**options)
+        self.assertEqual(camera.head_motion.window, 60)
+        self.assertEqual(camera.mouth.fsm.minimum, 4000)
+        self.assertEqual(camera.nod.minimum, 800)
+        for detector, duration in ((camera.mouth.fsm, 3.9), (camera.mouth.fsm, 4.0),
+                                   (camera.nod, .7), (camera.nod, .8)):
+            detector.reset()
+            detector.process(0, 0)
+            detector.process(1, .1)
+            for i in range(2, round(duration * 10) + 1):
+                detector.process(1, i / 10)
+            event = detector.process(0, (round(duration * 10) + 1) / 10)
+            self.assertEqual(event['event_done'], duration in (4., .8))
+        camera.close()
+
     def test_window_schedule_neural_sampling_and_quality_gate(self):
-        metrics = dict(eye_ready=True, mouth_ready=True, head_calibrated=True,
-                       eye_observed_sec=2, mouth_observed_sec=2, head_observed_sec=2,
-                       head_motion_resolution_hz=.5, head_motion_frequency_hz=None,
-                       perclos_pct=10, blink_rate_per_min=0, yawning_frequency_per_min=0,
-                       nodding_frequency_per_min=0, blink_detected=False, nod_detected=False)
+        metrics = self.metrics(2, head_motion_resolution_hz=.5, head_motion_frequency_hz=.5,
+                               blink_rate_per_min=0)
         frames = [(np.full((3, 4, 8), i, np.uint8), i / 10) for i in range(30)]
         with patch.object(engine, 'NeuralNetwork') as neural, patch.object(engine, 'CameraMetrics') as camera, \
                 patch.object(engine, 'read_video', return_value=iter(frames)):
             neural.return_value.eval.return_value.return_value = .7
             camera.return_value.process.return_value = metrics
-            model = engine.Engine('.', fps=10, window_sec=2, stride_sec=1, neural_sec=1, neural_size=8)
+            model = engine.Engine('.', fps=10, stride_sec=1, neural_sec=1, neural_size=8,
+                                  risk_config={'window_sec': 2, 'dominant_head_motion_frequency': {'window_sec': 2}})
             rows = list(model.process_video('video.mp4', 1))
             self.assertEqual([(r['start_second'], r['end_second']) for r in rows], [(0, 2), (1, 3)])
             batch = model.neural.call_args.args[0]
             self.assertEqual(batch.shape, (5, 3, 8, 8))
             self.assertEqual(batch[:, 0, 3, 3].tolist(), [20, 22, 24, 26, 28])
-            self.assertEqual(rows[0]['perclos'], .1)
-            self.assertEqual(rows[0]['dominant_head_motion_frequency'], 0)
+            self.assertEqual(rows[0]['perclos'], .5)
+            self.assertEqual(rows[0]['blink_frequency'], .5)
+            self.assertEqual(rows[0]['feature_encoding'], 'risk_v2')
+            self.assertEqual(rows[0]['dominant_head_motion_frequency'], .75)
             camera.return_value.close.assert_called_once()
+            for perclos, expected in ((0, 0), (5, 0), (10, .5), (15, 1)):
+                sample = model._features(
+                    metrics | {'blink_rate_per_min': 4, 'perclos_pct': perclos},
+                    [], [], batch, 'video', 0, 1)
+                self.assertEqual(sample['blink_frequency'], expected)
             for missing in ({'eye_ready': False}, {'eye_observed_sec': 0}, {'head_motion_resolution_hz': None}):
                 self.assertIsNone(model._features(metrics | missing, [], [], [], 'video', 0, 1))
 

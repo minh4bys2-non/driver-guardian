@@ -6,6 +6,7 @@ Video lấy từ loadvideo2handle.read_video: (RGB uint8 [3,H,W], timestamp).
 import json
 import sys
 from collections import deque
+from copy import deepcopy
 from pathlib import Path
 
 import cv2
@@ -21,25 +22,46 @@ else:
     from neuralnetwork import NeuralNetwork, letterbox
     from physicalbranch import CameraMetrics
 
-# Các mẫu xuất ra nằm trong [0,1]. Đây là thang tham chiếu cấu hình,
-# KHÔNG phải giới hạn sinh lý đã được hiệu chuẩn trên tập dữ liệu.
-SCALES = {
-    "blink_frequency": 30.0,  # lần/phút
-    "blink_duration": 2000.0,  # ms
-    "perclos": 100.0,  # %
-    "yawn_frequency": 5.0,  # lần/phút
-    "nod_duration": 3500.0,  # ms
-    "nod_frequency": 5.0,  # lần/phút
-    "dominant_head_motion_frequency": 2.0,  # Hz
+DEFAULT_RISK_CONFIG = {
+    "window_sec": 60,
+    "blink_frequency": {
+        "normal": (15, 20), "low_danger": 4, "high_danger": 35,
+        "gate_low_with_eye_metrics": True,
+    },
+    "blink_duration": {"safe": 400, "danger": 800, "unit": "ms", "aggregation": "p90"},
+    "perclos": {"safe": 0.05, "danger": 0.15},
+    "yawn_frequency": {"safe": 0, "danger": 2, "unit": "events/min", "min_event_sec": 4.0},
+    "nod_duration": {"safe": 0.5, "danger": 2.0, "unit": "sec", "aggregation": "max"},
+    "nod_frequency": {"safe": 0, "danger": 3, "unit": "events/min", "min_event_sec": 0.8},
+    "dominant_head_motion_frequency": {
+        "method": "fft_pitch", "unit": "Hz", "window_sec": 60,
+        "reference_band": (0.05, 0.20), "low_danger": 0.0, "high_danger": 0.60,
+        "require_reliable_motion": True,
+    },
+    "cnn_lstm_score": {"safe": 0.0, "danger": 1.0},
 }
 
 
 class Engine:
-    def __init__(self, video_root, fps=30, window_sec=60, stride_sec=10,
-                 neural_sec=10, neural_size=640, min_observed_ratio=0.8, scales=None,
+    def __init__(self, video_root, fps=30, window_sec=None, stride_sec=10,
+                 neural_sec=10, neural_size=640, min_observed_ratio=0.8, risk_config=None,
                  neural_fps=5, device=None, cnn_path=None, conv_gru_path=None,
                  chunk_size=32):
         self.root = Path(video_root).expanduser().resolve()
+        self.risk_config = deepcopy(DEFAULT_RISK_CONFIG)
+        for key, value in (risk_config or {}).items():
+            if key not in self.risk_config:
+                raise ValueError(f"Unknown risk configuration: {key}")
+            if key == "window_sec":
+                self.risk_config[key] = value
+            else:
+                if not isinstance(value, dict) or value.keys() - self.risk_config[key].keys():
+                    raise ValueError(f"Invalid risk configuration: {key}")
+                self.risk_config[key].update(deepcopy(value))
+        self._validate_risk_config()
+        if window_sec is not None and window_sec != self.risk_config["window_sec"]:
+            raise ValueError("window_sec must match risk_config['window_sec']")
+        window_sec = self.risk_config["window_sec"]
         values = (fps, window_sec, stride_sec, neural_sec, neural_size, neural_fps)
         if not np.isfinite(values).all() or any(v <= 0 for v in values):
             raise ValueError("Engine timing and sizes must be finite and positive")
@@ -52,10 +74,8 @@ class Engine:
         self.neural_count = round(neural_sec * neural_fps)
         self.neural_size = int(neural_size)
         self.min_observed_ratio = float(min_observed_ratio)
-        self.scales = SCALES | (scales or {})
         if (fps <= 0 or self.window <= 0 or self.stride <= 0 or self.neural_count <= 0
-                or self.neural_size <= 0 or not 0 <= min_observed_ratio <= 1
-                or any(v <= 0 or not np.isfinite(v) for v in self.scales.values())):
+                or self.neural_size <= 0 or not 0 <= min_observed_ratio <= 1):
             raise ValueError("Invalid engine configuration")
         if abs(self.window / fps - window_sec) > 1e-6 or abs(self.stride / fps - stride_sec) > 1e-6:
             raise ValueError("window_sec and stride_sec must be multiples of 1/fps")
@@ -68,25 +88,77 @@ class Engine:
             device=device, chunk_size=chunk_size,
         ).eval()
 
+    def _validate_risk_config(self):
+        cfg = self.risk_config
+        motion = cfg["dominant_head_motion_frequency"]
+        for value in (cfg["window_sec"], motion["window_sec"]):
+            if not np.isfinite(value) or value <= 0:
+                raise ValueError("Risk windows must be finite and positive")
+        for key, rule in cfg.items():
+            if key == "window_sec":
+                continue
+            if "safe" in rule:
+                points = (rule["safe"], rule["danger"])
+            else:
+                band = rule["normal"] if key == "blink_frequency" else rule["reference_band"]
+                if len(band) != 2:
+                    raise ValueError(f"Expected a two-point reference band: {key}")
+                points = (rule["low_danger"], *band, rule["high_danger"])
+            if not np.isfinite(points).all() or points[0] < 0 or np.any(np.diff(points) <= 0):
+                raise ValueError(f"Risk thresholds must be finite and strictly increasing: {key}")
+            if "unit" in rule and rule["unit"] != DEFAULT_RISK_CONFIG[key]["unit"]:
+                raise ValueError(f"Unsupported unit: {key}")
+            if "aggregation" in rule and rule["aggregation"] not in ("p90", "max"):
+                raise ValueError(f"Unsupported aggregation: {key}")
+        for key, upper_sec in (("yawn_frequency", 7.5), ("nod_frequency", 3.5)):
+            value = cfg[key]["min_event_sec"]
+            if not np.isfinite(value) or not 0 < value < upper_sec:
+                raise ValueError(f"min_event_sec must be below the detector maximum {upper_sec}s: {key}")
+        if cfg["perclos"]["danger"] > 1 or cfg["cnn_lstm_score"]["danger"] > 1:
+            raise ValueError("PERCLOS and neural thresholds must be fractions in [0,1]")
+        if (motion["method"] != "fft_pitch"
+                or type(motion["require_reliable_motion"]) is not bool
+                or type(cfg["blink_frequency"]["gate_low_with_eye_metrics"]) is not bool):
+            raise ValueError("Invalid FFT method or risk gate")
+
     def _norm(self, key, value):
-        # Một sự kiện chưa xảy ra được biểu diễn bằng 0.
-        if value is None:
-            value = 0.0
-        if not np.isfinite(value):
-            raise ValueError(f"Non-finite feature: {key}")
-        return round(float(np.clip(value / self.scales[key], 0, 1)), 4)
+        if value is None or not np.isfinite(value) or value < 0:
+            raise ValueError(f"Invalid raw feature: {key}")
+        rule = self.risk_config[key]
+        if "safe" in rule:
+            return float(np.clip((value - rule["safe"]) / (rule["danger"] - rule["safe"]), 0, 1))
+        band = rule["normal"] if key == "blink_frequency" else rule["reference_band"]
+        return float(np.interp(value, (rule["low_danger"], *band, rule["high_danger"]), (1, 0, 0, 1)))
+
+    def _duration(self, key, history):
+        values = [duration for _, duration in history]
+        if not values:
+            return 0.0
+        rule = self.risk_config[key]
+        duration_ms = float(np.percentile(values, 90 if rule["aggregation"] == "p90" else 100))
+        return duration_ms / 1000 if rule["unit"] == "sec" else duration_ms
 
     def _features(self, m, blink_durations, nod_durations, nn_frames, source, start, label):
         window = self.window_sec
         if (
                 not m["eye_ready"] or not m["mouth_ready"] or not m["head_calibrated"]
-                or m["perclos_pct"] is None or m["head_motion_resolution_hz"] is None
+                or m["perclos_pct"] is None
                 or any((m[k] or 0) < window * self.min_observed_ratio
                        for k in ("eye_observed_sec", "mouth_observed_sec", "head_observed_sec"))):
             return None
 
-        def mean_duration(history):
-            return sum(duration for _, duration in history) / len(history) if history else 0.0
+        motion = self.risk_config["dominant_head_motion_frequency"]
+        frequency = m["head_motion_frequency_hz"]
+        resolution = m["head_motion_resolution_hz"]
+        observed = m["head_motion_observed_sec"]
+        reliable_motion = (
+            frequency is not None and resolution is not None
+            and np.isfinite((frequency, resolution, observed)).all()
+            and frequency > 0 and resolution > 0
+            and observed >= motion["window_sec"] - 1e-9
+        )
+        if motion["require_reliable_motion"] and not reliable_motion:
+            return None
 
         with torch.inference_mode():
             score = float(self.neural(np.stack(nn_frames)))
@@ -95,16 +167,23 @@ class Engine:
 
         raw = {
             "blink_frequency": m["blink_rate_per_min"],
-            "blink_duration": mean_duration(blink_durations),
-            "perclos": m["perclos_pct"],
+            "blink_duration": self._duration("blink_duration", blink_durations),
+            "perclos": m["perclos_pct"] / 100,
             "yawn_frequency": m["yawning_frequency_per_min"],
-            "nod_duration": mean_duration(nod_durations),
+            "nod_duration": self._duration("nod_duration", nod_durations),
             "nod_frequency": m["nodding_frequency_per_min"],
-            "dominant_head_motion_frequency": m["head_motion_frequency_hz"],
+            "dominant_head_motion_frequency": frequency if reliable_motion else 0.0,
+            "cnn_lstm_score": score,
         }
-        return {**{k: self._norm(k, v) for k, v in raw.items()},
-                "cnn_lstm_score": round(score, 4), "source_video": source,
-                "start_second": start, "end_second": start + window, "label": label}
+        risk = {k: self._norm(k, v) for k, v in raw.items()}
+        if not reliable_motion:
+            risk["dominant_head_motion_frequency"] = 0.0
+        blink_rule = self.risk_config["blink_frequency"]
+        if blink_rule["gate_low_with_eye_metrics"] and raw["blink_frequency"] < blink_rule["normal"][0]:
+            risk["blink_frequency"] *= max(risk["perclos"], risk["blink_duration"])
+        return {**{k: round(v, 4) for k, v in risk.items()}, "source_video": source,
+                "start_second": start, "end_second": start + window, "label": label,
+                "feature_encoding": "risk_v2"}
 
     def process_video(self, video_path, label):
         """Stream video một lần; yield từng dòng dữ liệu sau mỗi 10 giây."""
@@ -118,7 +197,9 @@ class Engine:
         path = self.root / relative
         camera = CameraMetrics(
             fps=self.fps, window_sec=self.window_sec,
-            windows={"head_motion": (self.window - 1) / self.fps} if self.window > 1 else None,
+            windows={"head_motion": self.risk_config["dominant_head_motion_frequency"]["window_sec"]},
+            mouth_options={"min_duration_ms": self.risk_config["yawn_frequency"]["min_event_sec"] * 1000},
+            nod_duration_ms=(self.risk_config["nod_frequency"]["min_event_sec"] * 1000, 3500),
         )
         nn_frames = deque(maxlen=self.neural_count)
         blink_durations, nod_durations = deque(), deque()
@@ -178,12 +259,11 @@ class Engine:
 if __name__ == "__main__":
     INPUT_JSONL = "/home/tranmanhduy/Workspace/ptithcm/driver-guardian/ai/OptimalAlgorithsm/UTA-RLDD/dataset.jsonl"
     VIDEO_ROOT = "/home/tranmanhduy/Workspace/ptithcm/driver-guardian/ai/OptimalAlgorithsm/UTA-RLDD"
-    OUTPUT_JSONL = "/home/tranmanhduy/Workspace/ptithcm/driver-guardian/ai/OptimalAlgorithsm/drowsiness_sample.jsonl"
+    OUTPUT_JSONL = "/home/tranmanhduy/Workspace/ptithcm/driver-guardian/ai/OptimalAlgorithsm/drowsiness_risk.jsonl"
     CNN_PATH = "/home/tranmanhduy/Workspace/ptithcm/driver-guardian/ai/OptimalAlgorithsm/model_cnn/best.pt"
     CONV_GRU_PATH = "/home/tranmanhduy/Workspace/ptithcm/driver-guardian/ai/OptimalAlgorithsm/model_convgru/best.pt"
 
     FPS = 30
-    WINDOW_SEC = 60
     STRIDE_SEC = 10
     NEURAL_SEC = 10
     NEURAL_FPS = 5
@@ -191,13 +271,12 @@ if __name__ == "__main__":
     CHUNK_SIZE = 32
     DEVICE = "cuda"  # None: tự chọn CUDA/CPU; hoặc "cuda", "cpu".
     MIN_OBSERVED_RATIO = 0.8
-    FEATURE_SCALES = SCALES.copy()
+    RISK_CONFIG = deepcopy(DEFAULT_RISK_CONFIG)
     STRICT = False
 
     engine = Engine(
         video_root=VIDEO_ROOT,
         fps=FPS,
-        window_sec=WINDOW_SEC,
         stride_sec=STRIDE_SEC,
         neural_sec=NEURAL_SEC,
         neural_fps=NEURAL_FPS,
@@ -207,6 +286,6 @@ if __name__ == "__main__":
         chunk_size=CHUNK_SIZE,
         device=DEVICE,
         min_observed_ratio=MIN_OBSERVED_RATIO,
-        scales=FEATURE_SCALES,
+        risk_config=RISK_CONFIG,
     )
     print(engine.run(INPUT_JSONL, OUTPUT_JSONL, strict=STRICT))

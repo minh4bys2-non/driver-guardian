@@ -1,14 +1,36 @@
+import os
+import json
+from pathlib import Path
+from typing import Union, Optional, Dict, Any, Tuple
+
 import torch
 import torch.nn as nn
-from ai.ObjectDetection_2p6M.src.backbone_neck import Backbone, PAFPN
-from ai.ObjectDetection_2p6M.src.head import DetectHead
-from ai.ObjectDetection_2p6M.src.config import TrainConfig
-from ai.ObjectDetection_2p6M.utils.init_weights import initialize_weights, initialize_detection_head
-import json
+
+from utils.artifacts import validate_metadata
+
+try:
+    from ai.ObjectDetection_2p6M.src.backbone_neck import Backbone, PAFPN
+    from ai.ObjectDetection_2p6M.src.head import DetectHead
+    from ai.ObjectDetection_2p6M.src.config import TrainConfig
+    from ai.ObjectDetection_2p6M.utils.init_weights import initialize_weights, initialize_detection_head
+except ModuleNotFoundError:
+    import sys
+
+    current = Path(__file__).resolve()
+    for parent in current.parents:
+        if (parent / "ai").is_dir():
+            if str(parent) not in sys.path:
+                sys.path.insert(0, str(parent))
+            break
+    from ai.ObjectDetection_2p6M.src.backbone_neck import Backbone, PAFPN
+    from ai.ObjectDetection_2p6M.src.head import DetectHead
+    from ai.ObjectDetection_2p6M.src.config import TrainConfig
+    from ai.ObjectDetection_2p6M.utils.init_weights import initialize_weights, initialize_detection_head
+
 
 class NMSFreeDetector(nn.Module):
     def __init__(self, nc=TrainConfig().nc, reg_max=TrainConfig().reg_max,
-                  backbone_w=TrainConfig().backbone_w,
+                 backbone_w=TrainConfig().backbone_w,
                  backbone_n=TrainConfig().backbone_n,
                  neck_n=TrainConfig().neck_n,
                  strides=TrainConfig().strides,
@@ -77,13 +99,13 @@ class NMSFreeDetector(nn.Module):
         initialize_weights(self, self.img_size)
         return self
 
-    def freeze_trunk(self, freeze=True): 
-        for p in self.backbone.parameters(): 
-            p.requires_grad_(not freeze) 
-        for p in self.neck.parameters(): 
-            p.requires_grad_(not freeze) 
+    def freeze_trunk(self, freeze=True):
+        for p in self.backbone.parameters():
+            p.requires_grad_(not freeze)
+        for p in self.neck.parameters():
+            p.requires_grad_(not freeze)
         return self
-    
+
     @classmethod
     def from_config(cls, config_path):
         with open(config_path, "r", encoding="utf-8") as f:
@@ -98,28 +120,56 @@ class NMSFreeDetector(nn.Module):
             strides=tuple(cfg["strides"]),
             img_size=cfg.get("img_size", 640),
         )
+
+    @classmethod
+    def from_checkpoint(
+            cls,
+            checkpoint_path: Union[str, Path, Dict[str, Any]],
+            map_location: Optional[Union[str, torch.device]] = "cpu",
+            eval_mode: bool = False,
+            # img_size: int = 640
+    ) -> "NMSFreeDetector":
+        """
+        """
+        checkpoint = torch.load(checkpoint_path, map_location=map_location, weights_only=False)
+        metadata = None
+        img_size = checkpoint.get("cfg", {}).get("img_size", 290)
+        try:
+            metadata = validate_metadata(checkpoint_path, checkpoint)
+        except Exception:
+            metadata = checkpoint.get("metadata")
+
+        if metadata and "architecture" in metadata:
+            arch = metadata["architecture"]
+        else:
+            from ai.ObjectDetection_2p6M.src.config import TrainConfig
+            cfg = TrainConfig()
+            arch = {
+                "nc": cfg.nc,
+                "reg_max": cfg.reg_max,
+                "backbone_w": cfg.backbone_w,
+                "backbone_n": cfg.backbone_n,
+                "neck_n": cfg.neck_n,
+                "strides": cfg.strides,
+            }
+        valid_keys = {"nc", "reg_max", "backbone_w", "backbone_n", "neck_n", "strides"}
+        arch = {k: v for k, v in arch.items() if k in valid_keys}
+
+        model = cls(**arch, img_size=img_size)
+        state_dict = checkpoint.get("ema") or checkpoint.get("model") or checkpoint
+        model.load_state_dict(state_dict, strict=False)
+
+        if eval_mode:
+            model.eval()
+
+        return model
+
+
 if __name__ == "__main__":
-    m = NMSFreeDetector().to("cuda").eval()
-
-    n_params = sum(p.numel() for p in m.parameters())
-    print(f"Total parameters: {n_params:,} ({n_params/1e6:.2f}M)")
-    def count_params(module):
-        return sum(p.numel() for p in module.parameters()) / 1e6
-
-    print(f"Backbone : {count_params(m.backbone):.3f} M")
-    print(f"Neck     : {count_params(m.neck):.3f} M")
-    print(f"Head     : {count_params(m.head):.3f} M")
-    print(f"Total    : {count_params(m):.3f} M")
-    import time
-    x = torch.randn(1, 3, 640, 640).to("cuda")
-    # Benchmark tốc độ inference
-    with torch.inference_mode():
-        start = time.time()
-        for _ in range(100):
-            out = m(x)
-        end = time.time()
-    print("Inference time:", end - start)
-    # Kiểm tra kích thước đầu ra
-    print("o2o cls:", out["o2o"]["cls"].shape)
-    print("o2o box:", out["o2o"]["box"].shape)
-    print("anchors:", out["anchors"].shape)
+    model = NMSFreeDetector.from_checkpoint(
+        r"D:\Project\DATN\driver-guardian\ai\ObjectDetection_2p6M\checkpoints\231e35bb4061257f9bcb7cc5e3a0d0064e5e1beb6351a5e0adfc8d0c91ba4e11\da92589d1b67339be4491beaf147575e81a2699bbde06d654c05f852d7f0e9c9\landmark_train\best.pt",
+        eval_mode=True
+    )
+    img = torch.rand((1, 3, 640, 640))
+    preds = model.backbone(img)
+    print(preds[1].shape)

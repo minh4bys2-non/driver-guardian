@@ -134,22 +134,25 @@ class NeuralNetwork(nn.Module):
         T, C, H, W = x.shape
         if T == 0:
             raise ValueError("Empty frame sequence (T = 0)")
+        if H == 0 or W == 0:
+            raise ValueError("Frame dimensions must be nonzero")
         if C != 3:
             raise ValueError(f"Expected 3 color channels (RGB), got C = {C}")
 
+        if x.dtype != torch.uint8 and (
+                not x.is_floating_point() or not torch.isfinite(x).all()
+                or x.min() < 0 or x.max() > 1):
+            raise ValueError("Frames must be uint8 [0,255] or finite float [0,1]")
+
         # Vấn đề 3: Tự động điều chỉnh kích thước về 640x640 qua hàm letterbox nếu H != 640 hoặc W != 640
         if H != 640 or W != 640:
-            if isinstance(x, torch.Tensor):
-                x_np = x.cpu().numpy()
-            else:
-                x_np = x
+            x_cpu = x.detach().cpu()
+            x_np = (x_cpu if x_cpu.dtype == torch.uint8 else x_cpu.float()).numpy()
 
             # Áp dụng hàm letterbox chuẩn hóa từng khung hình về [3, 640, 640]
-            x_lb = np.stack([letterbox(frame, new_size=640) for frame in x_np])
+            x_lb = np.stack([letterbox(np.moveaxis(frame, 0, -1), new_size=640).transpose(2, 0, 1) for frame in x_np])
             x = torch.from_numpy(x_lb)
             H, W = 640, 640
-        elif isinstance(x, np.ndarray):
-            x = torch.from_numpy(x)
 
         p3_list, p4_list, p5_list = [], [], []
 
@@ -177,12 +180,14 @@ class NeuralNetwork(nn.Module):
             seq_lens = torch.tensor([T], dtype=torch.long, device=device)
             logits = self.conv_gru((p3, p4, p5), seq_lens=seq_lens)
 
+            if logits.shape not in ((1, 1), (1, 2)):
+                raise ValueError(f"Expected binary clip logits [1,1] or [1,2], got {tuple(logits.shape)}")
             # Tính điểm xác suất
             if logits.shape[-1] == 1:
                 score = torch.sigmoid(logits).item()
             else:
                 probs = F.softmax(logits, dim=-1)
-                score = probs[0, 1].item() if probs.ndim == 2 else probs[1].item()
+                score = probs[0, 1].item()
 
         return float(score)
 
@@ -207,6 +212,8 @@ def letterbox(
     new_h = max(1, int(round(h * scale)))
     resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
 
+    if np.issubdtype(image.dtype, np.floating):
+        color = np.asarray(color) / 255.0
     canvas = np.full((new_size, new_size, 3), color, dtype=image.dtype)
     pad_left = (new_size - new_w) // 2
     pad_top = (new_size - new_h) // 2

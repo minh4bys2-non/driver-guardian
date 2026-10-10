@@ -329,18 +329,29 @@ class RawVideoFramesDataset(Dataset):
                     if self.split != "all" and row_split != self.split:
                         continue
 
-                    label_val = int(row.get("label", 0))
-                    p_str = row.get("orig_file") or row.get("path") or row.get("file_path") or ""
+                    label_str = row.get("binary_label") or row.get("label") or "0"
+                    label_val = int(label_str)
+                    p_str = (
+                        row.get("processed_path")
+                        or row.get("rel_path")
+                        or row.get("orig_file")
+                        or row.get("path")
+                        or row.get("file_path")
+                        or ""
+                    ).strip()
+                    if not p_str:
+                        continue
+
                     v_path = Path(p_str)
                     if not v_path.is_absolute():
                         v_path = self.dataset_dir / v_path
 
-                    if not v_path.exists():
+                    if not v_path.exists() or v_path.is_dir():
                         continue
 
-                    v_id = row.get("video_id") or v_path.stem
-                    lbl_name = row.get("label_name") or ("0_alert" if label_val == 0 else "1_drowsy")
-                    src = row.get("source_dataset", "custom")
+                    v_id = row.get("clip_id") or row.get("video_id") or v_path.stem
+                    lbl_name = row.get("label_name") or row.get("original_label") or ("0_alert" if label_val == 0 else "1_drowsy")
+                    src = row.get("dataset") or row.get("source_dataset") or "custom"
                     samples.append(
                         RawVideoSample(
                             path=v_path, video_id=v_id, split=row_split,

@@ -1,51 +1,10 @@
 # TrainingSystem — Tối ưu trọng số và chọn đặc trưng
 
-## Phạm vi
+TrainingSystem tối ưu `[w1, ..., w8, T_cls]` trong `[0,1]^9` từ JSONL của DataSystem. Không huấn luyện lại CNN/ConvGRU. Bốn optimizer là các biến thể liên tục, đa mục tiêu; kiểm thử phần mềm không xác nhận tương đương nguyên vẹn bài báo gốc.
 
-TrainingSystem tối ưu một vector `[w1, ..., w8, T_cls]` trong `[0,1]^9` từ dữ liệu JSONL do DataSystem tạo. Hệ thống không huấn luyện lại CNN hoặc ConvGRU.
+## Chạy
 
-`engine.py` và `metaheuristic.py` hiện là file rỗng. Bốn thuật toán được chạy riêng: `cmdpsofs.py`, `IBGWO4.py`, `MOHHO.py`, `NSPSOFS.py`. Các triển khai là biến thể liên tục, đa mục tiêu theo mô tả trong mã; kiểm thử phần mềm không xác nhận chúng tái hiện nguyên vẹn các bài báo tham chiếu.
-
-## Luồng xử lý
-
-```mermaid
-flowchart LR
-    A[JSONL từ DataSystem] --> B[Kiểm tra 8 đặc trưng và nhãn]
-    B --> C[Ma trận X và vector y]
-    C --> D[Khởi tạo quần thể bằng seed]
-    D --> E[Chọn đặc trưng và dự đoán]
-    E --> F[Đánh giá 3 mục tiêu]
-    F --> G[Archive Pareto]
-    G --> H[Cập nhật quần thể]
-    H --> E
-    G --> I[JSONL kết quả và biểu đồ]
-```
-
-Tám đặc trưng và thứ tự được xác định trong `fitnessFunction.FEATURES`. Mỗi giá trị phải hữu hạn, trong `[0,1]`; nhãn JSONL phải là số nguyên `0` hoặc `1`. Dòng trống được bỏ qua; bản ghi sai báo đường dẫn và số dòng. Dataset rỗng bị từ chối. `feature_encoding` hỗ trợ `scale_v1`, `risk_v1`, `risk_v2`; thiếu trường này được xem là `scale_v1`. Không trộn các phiên bản trong một dataset. Chuẩn hóa hiện tại của DataSystem là `risk_v2`, dùng cấu hình điểm nguy hiểm trong `DataSystem/NORMALIZATION.md`.
-
-Đặc trưng `j` được chọn khi `wj >= 0.5`. Chỉ các đặc trưng được chọn tham gia dự đoán:
-
-```text
-weighted_mean: score = sum(Xj * wj) / sum(wj)
-noisy_or:      score = 1 - product(1 - Xj * wj)
-y_pred = 1 nếu score >= T_cls, ngược lại là 0
-```
-
-Đây là hai quy tắc kết hợp điểm; `noisy_or` không tự bảo đảm score là xác suất đã hiệu chuẩn. Nếu không chọn đặc trưng nào, Fitness trả toàn nhãn 0; các optimizer gán mục tiêu phạt `[1,1,1]` cho nghiệm đó.
-
-Ba mục tiêu cùng được tối thiểu hóa:
-
-```text
-[1 - recall, 1 - precision, số đặc trưng được chọn / 8]
-```
-
-Nếu mẫu số recall hoặc precision bằng 0 thì chỉ số tương ứng được đặt bằng 0. Mục tiêu phạt của nghiệm không chọn đặc trưng không được diễn giải thành số đặc trưng thực tế; log và biểu đồ đếm số đặc trưng trực tiếp từ candidate.
-
-Archive giữ các nghiệm không bị trội trong tập đang xét, loại vị trí trùng và giới hạn kích thước theo crowding distance. Archive có giới hạn không bảo đảm chứa mọi nghiệm Pareto từng gặp. NSPSOFS lấy leader từ quần thể; archive của nó phục vụ báo cáo. Các thuật toán còn lại sử dụng archive trong quá trình tìm kiếm theo logic riêng.
-
-## Cách chạy
-
-Chạy từ thư mục gốc repository, sau khi DataSystem đã hoàn tất ghi dữ liệu:
+Từ thư mục gốc repository, sau khi DataSystem hoàn tất ghi dữ liệu:
 
 ```bash
 python -m ai.OptimalAlgorithsm.TrainingSystem.cmdpsofs
@@ -54,43 +13,68 @@ python -m ai.OptimalAlgorithsm.TrainingSystem.MOHHO
 python -m ai.OptimalAlgorithsm.TrainingSystem.NSPSOFS
 ```
 
-Mỗi file có `DATA_PATH`, `OUTPUT_DIR`, `FITNESS_METHOD` và `CONFIG` trong khối `__main__`. Đường dẫn đầu vào mặc định là `ai/OptimalAlgorithsm/drowsiness_sample.jsonl`.
+Chỉnh `DATA_PATH`, `OUTPUT_DIR`, `FITNESS_METHOD`, `CONFIG` trong mỗi entrypoint. Cả bốn mặc định đọc `drowsiness_risk_10.jsonl`, dùng `noisy_or`, quần thể 50, 100 mốc generation, seed 42. `generations` bao gồm quần thể khởi tạo: 100 mốc tương ứng 99 bước cập nhật.
 
-Mặc định IBGWO4 dùng `weighted_mean`, ba thuật toán khác dùng `noisy_or`. Khi so sánh thuật toán cần đặt cùng hàm fitness, cùng tập dữ liệu và kiểm soát seed/ngân sách đánh giá. Một generation của các thuật toán có thể đánh giá số candidate khác nhau. `generations` hiện bao gồm quần thể khởi tạo: cấu hình 100 ghi 100 mốc và thực hiện 99 bước cập nhật.
+Mỗi lần chạy tạo `output/<algorithm>/<algorithm>_<fitness>/`, ví dụ `output/nspsofs/nspsofs_cooccurrence/`. Nếu thư mục đã tồn tại, thêm hậu tố `_2`, `_3`, … để không ghi đè kết quả cũ. Đọc đường dẫn được in cuối lần chạy; các file nằm trực tiếp trong thư mục output cũ không được cập nhật.
 
-Logger tạo `config.json`, `population_log.jsonl`, `generation_log.jsonl`, `pareto_archive.jsonl` và sáu biểu đồ PNG. Khởi tạo logger làm rỗng các file log JSONL cũ trong cùng thư mục. Dùng thư mục output riêng cho mỗi lần chạy nếu cần giữ kết quả trước đó.
+## Đánh giá theo subject
 
-## Kết quả rà soát và sửa lỗi
+`engine.run_experiment()` dùng chung cho cả bốn entrypoint:
 
-| Vấn đề | Xử lý |
-| --- | --- |
-| Bốn entrypoint trỏ tới `drowsiness_hard_200.jsonl` đã bị xóa | Chuyển sang output DataSystem hiện tại |
-| NaN ở candidate không bị từ chối | Kiểm tra tính hữu hạn trước dự đoán |
-| Nhãn phân số hoặc vượt miền bị ép về `int8`, làm sai đánh giá | Kiểm tra nhãn nhị phân và chiều dữ liệu trước ép kiểu, kể cả ở constructor optimizer |
-| Dữ liệu rỗng, sai số cột, feature ngoài miền hoặc không hữu hạn | Báo lỗi thay vì tiếp tục tối ưu |
-| `predict()` có thể gọi nhầm phương thức nội bộ qua tên tùy ý | Chỉ cho phép `weighted_mean` và `noisy_or` |
-| CMDPSOFS chưa kiểm tra cấu hình | Kiểm tra kích thước quần thể, số generation, archive, hệ số và số chiều |
-| Số lượng dạng float được các cấu hình khác chấp nhận | Yêu cầu số nguyên cho các kích thước |
-| Mục tiêu không đổi vẫn tạo biên crowding vô hạn, thiên lệch chọn/truncate | Bỏ qua mục tiêu có span bằng 0 hoặc quá nhỏ |
-| Trộn `float32`/`float64` khi gộp archive gây giữ trùng và so sánh không nhất quán | Chuẩn hóa kiểu trước khi gộp, kiểm tra shape và giá trị hữu hạn |
-| `RunLogger.save_config()` không serialize được `Path` | Chuyển đường dẫn thành chuỗi |
-| Log không nêu rõ phạm vi đánh giá | Thêm `evaluation_scope`: chỉ dữ liệu tối ưu, chưa có đánh giá độc lập |
+1. Đọc một snapshot JSONL, kiểm tra dữ liệu và lưu SHA-256.
+2. Chia 60%/20%/20% **số subject** vào train/validation/test với `split_seed=42`, độc lập seed optimizer. Tỷ lệ số dòng có thể khác vì video dài ngắn khác nhau.
+3. Optimizer chỉ nhận `X_train, y_train`.
+4. Chấm archive cuối trên validation, cùng hai baseline luôn đoán 0 và luôn đoán 1. Chọn theo balanced accuracy cao nhất, rồi F1, rồi ít đặc trưng hơn. Baseline thắng khi candidate không hơn và chỉ dùng nhiều đặc trưng hơn.
+5. Chốt một mô hình rồi mới dự đoán test; không dùng test để chọn candidate hoặc threshold. Báo thêm hai baseline cố định trên test để đối chiếu.
 
-Kiểm thử:
+Balanced accuracy = `(recall + specificity) / 2`; luôn đoán một lớp đạt 0.5 khi tập có cả hai nhãn. Không tự cấm threshold 0: nghiệm luôn báo buồn ngủ vẫn có thể tồn tại trong Pareto, nhưng không được trình bày thành mô hình hoàn hảo.
+
+Metadata bắt buộc có `source_video`. Ưu tiên `subject_id`; nếu thiếu, chỉ suy ra từ đường dẫn UTA-RLDD `FoldN_partN/<subject>/<video>`. ID subject được dùng xuyên fold/part. ID số `1`, `"1"`, `"01"` được gom cùng nhóm; `subject_id` trên đường dẫn UTA phải khớp ID trong đường dẫn. Đường dẫn tương đương được chuẩn hóa trước kiểm tra nhóm. Dataset khác cần bổ sung `subject_id`, hoặc chủ động truyền `group_by="video"` vào `run_experiment()`; chia theo video không bảo đảm người độc lập. Cần ít nhất 5 nhóm và mỗi tập có cả hai nhãn; không tự rơi về chia ngẫu nhiên theo dòng.
+
+Với cửa sổ 60 giây, bước 10 giây, chia theo dòng sẽ làm nội dung chồng lấn giữa các tập. Giữ toàn bộ subject trong một tập tránh vấn đề này. Việc chia này chỉ bảo vệ tầng tối ưu hiện tại: vẫn cần kiểm tra CNN/ConvGRU và các ngưỡng chuẩn hóa trước đó chưa được huấn luyện/tinh chỉnh bằng người thuộc test.
+
+## Hàm dự đoán và mục tiêu
+
+Thứ tự tám đặc trưng nằm trong `fitnessFunction.FEATURES`. Feature phải hữu hạn trong `[0,1]`, nhãn là số nguyên 0 hoặc 1. Dòng trống bỏ qua; dataset rỗng hoặc sai schema bị từ chối. Hỗ trợ `scale_v1`, `risk_v1`, `risk_v2`, không cho trộn encoding. Thiếu encoding được xem là `scale_v1`.
+
+Chọn feature khi `wj >= 0.5`, chỉ feature được chọn tham gia:
+
+```text
+weighted_mean: score = sum(Xj * wj) / sum(wj)
+noisy_or:      score = 1 - product(1 - Xj * wj)
+cooccurrence:  score = a + (1 - a) * a * b
+y_pred = (score >= T_cls)
+objectives = [1 - recall, 1 - precision, số feature / 8]
+```
+
+Với `cooccurrence`, `a`, `b` là hai giá trị `Xj * wj` lớn nhất; chỉ chọn một feature thì `b = 0`. Biểu hiện đơn lẻ mạnh vẫn được giữ, cặp biểu hiện mạnh tăng điểm, nhiều biểu hiện yếu không cộng dồn. Đặt `FITNESS_METHOD = "cooccurrence"` để sử dụng. Hàm giả định feature lớn hơn biểu thị nguy cơ cao hơn; chỉ xét cùng một mẫu/cửa sổ, không mô hình hóa thứ tự thời gian hay chứng minh các biểu hiện xảy ra cùng thời điểm. Đây là giả thuyết tính điểm cần đánh giá trên validation/test, không phải xác suất đã hiệu chuẩn.
+
+Cả ba mục tiêu được tối thiểu hóa trên train. `noisy_or` không mặc nhiên là xác suất đã hiệu chuẩn. Không chọn feature thì dự đoán toàn 0, optimizer phạt `[1,1,1]`. Recall/precision có mẫu số bằng 0 được quy ước bằng 0.
+
+Archive loại vị trí trùng, giữ nghiệm không bị trội, giới hạn bằng crowding distance. Archive hữu hạn không bảo đảm giữ mọi nghiệm Pareto từng gặp. NSPSOFS lấy leader từ quần thể; archive của nó chỉ phục vụ báo cáo.
+
+## Đọc kết quả
+
+- `split.json`: hash dữ liệu, seed chia, số mẫu/nhãn, subject và chỉ số dòng dữ liệu (0-based, bỏ dòng trống) của từng tập.
+- `config.json`: cấu hình và phạm vi đánh giá; `n_samples` là số mẫu train, `n_samples_total` là toàn bộ dữ liệu.
+- `generation_log.jsonl`: `representative` là **một candidate** được chọn theo balanced accuracy/F1/số feature trên train; mọi metric hiển thị cùng thuộc candidate đó. Đây chưa phải mô hình cuối.
+- `archive_extrema` trong generation log giữ các cực trị riêng để phân tích Pareto, không ghép thành thành tích của một mô hình. `best_ideal_distance` chỉ là chẩn đoán archive, không dùng chọn mô hình cuối.
+- `population_log.jsonl`, `pareto_archive.jsonl`: kết quả tối ưu trên train. Archive sắp theo balanced accuracy/F1/số feature trên train, không theo khoảng cách tới điểm lý tưởng.
+- `validation_archive.jsonl`: kết quả validation của archive và baseline, không chứa metric test.
+- **`evaluation.json`**: mô hình đã chọn (`candidate` hoặc `constant_0/constant_1`), metric validation/test, baseline test, tổng số lượt đánh giá và thời gian toàn pipeline. Có TP/TN/FP/FN, recall, precision, F1, specificity, FPR, balanced accuracy và cờ dự đoán một lớp.
+- Sáu biểu đồ PNG: recall/precision/số feature theo cùng representative mỗi generation; khoảng cách lý tưởng, Pareto và tần suất feature trên train.
+
+Chỉ gọi trực tiếp lớp optimizer sẽ chỉ tối ưu trên dữ liệu được truyền vào. Muốn đánh giá đầy đủ cần dùng entrypoint hoặc `run_experiment()`.
+
+`evaluations` đếm lượt gọi mục tiêu trong tìm kiếm, gồm candidate bị phạt vì không chọn feature; không gồm phép tính lại phục vụ log, validation/test. Với 50 × 100, CMDPSOFS và NSPSOFS có 5.000 lượt, IBGWO4 có 9.950; MOHHO tùy số nhánh dive. Cùng số generation không có nghĩa cùng ngân sách tính toán; cần kiểm soát số lượt đánh giá, thời gian và nhiều seed khi so sánh nghiên cứu.
+
+Chạy vài giây với 9k dòng có thể bình thường: fitness chỉ xử lý ma trận tám feature đã trích xuất. Số dòng lớn không đồng nghĩa số quan sát độc lập lớn. Không chọn thuật toán/seed hoặc tiếp tục tinh chỉnh bằng kết quả test; dùng validation cho quyết định đó.
+
+## Kiểm thử
 
 ```bash
 MPLCONFIGDIR=/tmp/driver-guardian-mpl MPLBACKEND=Agg \
 python -m unittest discover -s ai/OptimalAlgorithsm/TrainingSystem/tests -v
 ```
 
-Bộ kiểm thử có 10 ca, gồm công thức dự đoán, confusion matrix biết trước, dữ liệu lỗi, crowding, Pareto sorting/archive và cấu hình. Ca tích hợp chạy **4 thuật toán × 2 hàm fitness × 2 lần cùng seed**, kiểm tra tái lập, miền nghiệm, tính lại mục tiêu và nội dung JSONL đầu ra.
-
-Kết quả: cả 10 ca đều đạt. Lần chạy thử trên dữ liệu thực dùng một bản đọc vào RAM gồm **851 mẫu** (323 nhãn 0, 528 nhãn 1), cùng `noisy_or`, quần thể 8, 5 mốc generation, archive tối đa 12. Cả bốn thuật toán hoàn tất; mỗi thuật toán xuất 12 nghiệm và 6 biểu đồ. Mục tiêu của từng nghiệm đã được tính lại để đối chiếu, đồng thời kiểm tra không có nghiệm trong archive trội hơn nghiệm khác. Đây là lần chạy thử tính đúng của pipeline, không phải thí nghiệm tối ưu đầy đủ. Kết quả thử được lưu riêng trong `/tmp`, không ghi đè thư mục `output` hiện có.
-
-## Giới hạn đánh giá còn tồn tại
-
-- **Chưa có train/validation/test độc lập.** `load_jsonl()` chỉ trả `X, y`, bỏ metadata `source_video`. Recall/precision trong output là kết quả trên chính dữ liệu dùng tối ưu, không phải hiệu năng tổng quát hóa.
-- Cửa sổ DataSystem chồng lấn 50 giây khi dùng cấu hình 60/10. Muốn đánh giá độc lập phải chia theo subject/video và giữ metadata; chia ngẫu nhiên theo dòng dễ làm cùng nội dung xuất hiện ở cả train/test.
-- `best_recall`, `best_precision`, `min_num_features` trong log generation là **các cực trị riêng** của archive, có thể thuộc các nghiệm khác nhau. Không ghép chúng thành thành tích của một mô hình. Muốn xem một nghiệm cụ thể, đọc cùng một dòng trong `pareto_archive.jsonl`.
-- Bộ kiểm thử xác nhận logic và khả năng chạy; chưa chứng minh hội tụ tối ưu, độ chính xác ngoài tập tối ưu hoặc tương đương thuật toán gốc trong bài báo.
-- Dataset đang được DataSystem ghi tiếp sẽ thay đổi giữa các lần chạy. Cần chốt một bản dữ liệu hoàn chỉnh và lưu cùng cấu hình để so sánh thí nghiệm.
+Kiểm thử gồm công thức fitness, confusion matrix, dữ liệu lỗi, Pareto/crowding, cấu hình, 4 optimizer × 2 fitness với tái lập theo seed, bộ đếm đánh giá, log cùng một candidate, chia subject không trùng, chọn baseline và kiểm tra nhãn test không ảnh hưởng mô hình được chọn.

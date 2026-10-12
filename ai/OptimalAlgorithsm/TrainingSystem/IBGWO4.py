@@ -20,7 +20,7 @@ from ai.OptimalAlgorithsm.TrainingSystem.cmdpsofs import (
     crowding_distance,
     dominates,
 )
-from ai.OptimalAlgorithsm.TrainingSystem.fitnessFunction import FEATURES, Fitness, load_jsonl, validate_labels
+from ai.OptimalAlgorithsm.TrainingSystem.fitnessFunction import FEATURES, validate_labels
 
 
 @dataclass
@@ -90,16 +90,20 @@ class IBGWO4:
     def __init__(self, fitness, y_true, method, config, logger):
         self.fitness = fitness
         self.y_true = validate_labels(y_true, len(fitness.X))
-        if method not in ("weighted_mean", "noisy_or"):
+        if method not in ("weighted_mean", "noisy_or", "cooccurrence"):
             raise ValueError(f"Unknown fitness method: {method}")
         self.method = method
         self.cfg = config
         self.logger = logger
+        self.evaluations = 0
+        if logger is not None:
+            logger.set_evaluation(fitness, self.y_true, method)
         self.rng = np.random.default_rng(config.seed)
         self.archive = ParetoArchive(config.archive_size)
         self.particles = []
 
     def _evaluate(self, candidate):
+        self.evaluations += 1
         if not np.any(candidate[:8] >= 0.5):
             return np.ones(3, dtype=np.float32)
         prediction = self.fitness.predict(candidate, method=self.method)
@@ -179,17 +183,10 @@ class IBGWO4:
                 self._step(generation)
             self.logger.log_population(generation, self.particles)
             self.logger.log_generation(
-                generation, self.particles, self.archive, time.perf_counter() - start
+                generation, self.particles, self.archive, time.perf_counter() - start, self.evaluations
             )
-            last = self.logger.history[-1]
-            print(
-                f"[{generation + 1:03d}/{self.cfg.generations}] "
-                f"archive={last['archive_size']:3d} "
-                f"recall={last['best_recall']:.4f} "
-                f"precision={last['best_precision']:.4f} "
-                f"min_features={last['min_num_features']} "
-                f"time={last['elapsed_seconds']:.1f}s"
-            )
+            self.logger.print_progress(self.cfg.generations)
+
         self.logger.save_archive(self.archive)
         self.logger.save_plots(self.archive)
         return self.archive
@@ -197,9 +194,9 @@ class IBGWO4:
 
 if __name__ == "__main__":
     BASE_DIR = Path(__file__).resolve().parent
-    DATA_PATH = BASE_DIR.parent / "drowsiness_risk.jsonl"
+    DATA_PATH = BASE_DIR.parent / "drowsiness_risk_10.jsonl"
     OUTPUT_DIR = BASE_DIR / "output" / "ibgwo4"
-    FITNESS_METHOD = "weighted_mean"
+    FITNESS_METHOD = "cooccurrence"
     CONFIG = IBGWO4Config(
         population_size=50,
         generations=100,
@@ -211,10 +208,6 @@ if __name__ == "__main__":
         seed=42,
     )
 
-    X, y = load_jsonl(DATA_PATH)
-    logger = IBGWO4Logger(OUTPUT_DIR)
-    logger.save_config(CONFIG, DATA_PATH, FITNESS_METHOD, len(y))
-    optimizer = IBGWO4(Fitness(X), y, FITNESS_METHOD, CONFIG, logger)
-    archive = optimizer.run()
-    print(f"\nFinished. Pareto solutions: {len(archive)}")
-    print(f"Outputs: {OUTPUT_DIR}")
+    from ai.OptimalAlgorithsm.TrainingSystem.engine import run_experiment
+
+    run_experiment(IBGWO4, IBGWO4Logger, CONFIG, DATA_PATH, OUTPUT_DIR, FITNESS_METHOD)

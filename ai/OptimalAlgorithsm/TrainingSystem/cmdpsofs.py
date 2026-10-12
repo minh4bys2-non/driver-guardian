@@ -8,7 +8,9 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
-from ai.OptimalAlgorithsm.TrainingSystem.fitnessFunction import FEATURES, Fitness, load_jsonl, validate_labels
+from ai.OptimalAlgorithsm.TrainingSystem.fitnessFunction import (
+    FEATURES, classification_metrics, selection_key, validate_labels,
+)
 
 
 def dominates(a: np.ndarray, b: np.ndarray) -> bool:
@@ -150,6 +152,33 @@ class RunLogger:
         self.population_log.write_text("", encoding="utf-8")
         self.final_archive.write_text("", encoding="utf-8")
 
+    def set_evaluation(self, fitness, y_true, method):
+        self.fitness, self.y_true, self.method = fitness, y_true, method
+
+    def candidate_result(self, candidate):
+        mask = candidate[:8] >= 0.5
+        return {
+            "candidate": candidate.tolist(),
+            "num_features": int(mask.sum()),
+            "selected_features": [FEATURES[j] for j in np.flatnonzero(mask)],
+            "metrics": classification_metrics(
+                self.y_true, self.fitness.predict(candidate, self.method)),
+        }
+
+    def print_progress(self, generations):
+        row = self.history[-1]
+        result = row["representative"]
+        m = result["metrics"]
+        print(
+            f"[{row['generation'] + 1:03d}/{generations}] train representative: "
+            f"acc={m['accuracy']:.4f} "
+            f"recall={m['recall']:.4f} precision={m['precision']:.4f} "
+            f"balanced_acc={m['balanced_accuracy']:.4f} FPR={m['false_positive_rate']:.4f} "
+            f"features={result['num_features']} constant={m['constant_prediction']} "
+            f"archive={row['archive_size']} evaluations={row['evaluations']} "
+            f"time={row['elapsed_seconds']:.1f}s"
+        )
+
     def save_config(self, config, data_path, fitness_method, n_samples):
         payload = {
             "algorithm": "CMDPSOFS-style continuous multi-objective PSO",
@@ -182,7 +211,7 @@ class RunLogger:
                 }
                 f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
-    def log_generation(self, generation, particles, archive, elapsed_seconds):
+    def log_generation(self, generation, particles, archive, elapsed_seconds, evaluations):
         pop_obj = np.vstack([p.objectives for p in particles])
         recall = 1.0 - archive.objectives[:, 0]
         precision = 1.0 - archive.objectives[:, 1]
@@ -192,9 +221,15 @@ class RunLogger:
         row = {
             "generation": generation,
             "archive_size": len(archive),
-            "best_recall": float(recall.max()),
-            "best_precision": float(precision.max()),
-            "min_num_features": int(np.rint(num_features.min())),
+            "evaluation_scope": "train",
+            "evaluations": evaluations,
+            "archive_extrema": {
+                "max_recall": float(recall.max()),
+                "max_precision": float(precision.max()),
+                "min_num_features": int(num_features.min()),
+            },
+            "representative": max(
+                (self.candidate_result(p) for p in archive.positions), key=selection_key),
             "best_ideal_distance": float(ideal_distance.min()),
             "population_mean_objectives": pop_obj.mean(axis=0).tolist(),
             "elapsed_seconds": float(elapsed_seconds),
@@ -204,13 +239,16 @@ class RunLogger:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     def save_archive(self, archive):
-        order = np.argsort(np.linalg.norm(archive.objectives, axis=1))
+        results = [self.candidate_result(p) for p in archive.positions]
+        order = sorted(range(len(results)), key=lambda i: selection_key(results[i]), reverse=True)
         with open(self.final_archive, "w", encoding="utf-8") as f:
             for idx in order:
                 candidate = archive.positions[idx]
                 obj = archive.objectives[idx]
                 mask = candidate[:8] >= 0.5
                 row = {
+                    "evaluation_scope": "train; archive order is not final model selection",
+                    "metrics": results[idx]["metrics"],
                     "candidate": candidate.tolist(),
                     "objectives": obj.tolist(),
                     "recall": float(1.0 - obj[0]),
@@ -226,12 +264,12 @@ class RunLogger:
         if not self.history:
             return
         generations = np.array([x["generation"] for x in self.history])
-        self._line_plot(generations, [x["best_recall"] for x in self.history],
-                        "Best recall", "Recall", "convergence_recall.png")
-        self._line_plot(generations, [x["best_precision"] for x in self.history],
-                        "Best precision", "Precision", "convergence_precision.png")
-        self._line_plot(generations, [x["min_num_features"] for x in self.history],
-                        "Minimum selected features", "Number of features",
+        self._line_plot(generations, [x["representative"]["metrics"]["recall"] for x in self.history],
+                        "Train representative recall", "Recall", "convergence_recall.png")
+        self._line_plot(generations, [x["representative"]["metrics"]["precision"] for x in self.history],
+                        "Train representative precision", "Precision", "convergence_precision.png")
+        self._line_plot(generations, [x["representative"]["num_features"] for x in self.history],
+                        "Train representative selected features", "Number of features",
                         "convergence_num_features.png")
         self._line_plot(generations, [x["best_ideal_distance"] for x in self.history],
                         "Distance to ideal objective point", "Euclidean distance",
@@ -295,16 +333,20 @@ class CMDPSOFS:
     def __init__(self, fitness, y_true, method, config, logger):
         self.fitness = fitness
         self.y_true = validate_labels(y_true, len(fitness.X))
-        if method not in ("weighted_mean", "noisy_or"):
+        if method not in ("weighted_mean", "noisy_or", "cooccurrence"):
             raise ValueError(f"Unknown fitness method: {method}")
         self.method = method
         self.cfg = config
         self.logger = logger
+        self.evaluations = 0
+        if logger is not None:
+            logger.set_evaluation(fitness, self.y_true, method)
         self.rng = np.random.default_rng(config.seed)
         self.archive = ParetoArchive(config.archive_size)
         self.particles = []
 
     def _evaluate(self, candidate):
+        self.evaluations += 1
         # Invalid: no selected feature. Penalize all objectives so it cannot
         # exploit NumFeature=0 and survive on the Pareto front.
         if not np.any(candidate[:8] >= 0.5):
@@ -406,18 +448,10 @@ class CMDPSOFS:
             elapsed = time.perf_counter() - start
             self.logger.log_population(generation, self.particles)
             self.logger.log_generation(
-                generation, self.particles, self.archive, elapsed
+                generation, self.particles, self.archive, elapsed, self.evaluations
             )
 
-            last = self.logger.history[-1]
-            print(
-                f"[{generation + 1:03d}/{self.cfg.generations}] "
-                f"archive={last['archive_size']:3d} "
-                f"recall={last['best_recall']:.4f} "
-                f"precision={last['best_precision']:.4f} "
-                f"min_features={last['min_num_features']} "
-                f"time={elapsed:.1f}s"
-            )
+            self.logger.print_progress(self.cfg.generations)
 
         self.logger.save_archive(self.archive)
         self.logger.save_plots(self.archive)
@@ -427,12 +461,12 @@ if __name__ == "__main__":
     # ============================================================
     # Change experiment parameters directly here.
     # ============================================================
-    DATA_PATH = Path(__file__).resolve().parent.parent / "drowsiness_risk.jsonl"
+    DATA_PATH = "/home/tranmanhduy/Workspace/ptithcm/driver-guardian/ai/OptimalAlgorithsm/drowsiness_risk_10.jsonl"
 
     OUTPUT_DIR = ("/home/tranmanhduy/Workspace/ptithcm/driver-guardian/ai/OptimalAlgorithsm/TrainingSystem/output/cmdpsofs")
 
     # Must match a method implemented in Fitness.
-    FITNESS_METHOD = "noisy_or"
+    FITNESS_METHOD = "cooccurrence"
 
     CONFIG = CMDPSOFSConfig(
         population_size=50,
@@ -446,24 +480,6 @@ if __name__ == "__main__":
         seed=42,
     )
 
-    X, y = load_jsonl(DATA_PATH)
-    fitness = Fitness(X)
-    logger = RunLogger(OUTPUT_DIR)
-    logger.save_config(
-        CONFIG,
-        data_path=DATA_PATH,
-        fitness_method=FITNESS_METHOD,
-        n_samples=len(y),
-    )
+    from ai.OptimalAlgorithsm.TrainingSystem.engine import run_experiment
 
-    optimizer = CMDPSOFS(
-        fitness=fitness,
-        y_true=y,
-        method=FITNESS_METHOD,
-        config=CONFIG,
-        logger=logger,
-    )
-
-    archive = optimizer.run()
-    print(f"\nFinished. Pareto solutions: {len(archive)}")
-    print(f"Outputs: {OUTPUT_DIR}")
+    run_experiment(CMDPSOFS, RunLogger, CONFIG, DATA_PATH, OUTPUT_DIR, FITNESS_METHOD)

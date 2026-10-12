@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -100,6 +101,67 @@ class DataSystemTests(unittest.TestCase):
                 model.run(src, dst, strict=True)
             with self.assertRaises(ValueError):
                 model.run(src, src)
+
+    def test_resume_preserves_samples_and_rejects_broken_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src, dst = Path(tmp) / 'input.jsonl', Path(tmp) / 'output.jsonl'
+            src.write_text('{"video_path":"video.mp4","label":0}\n')
+            model = self.make_engine()
+            row = {k: 0.0 for k in engine.DEFAULT_RISK_CONFIG if k != 'window_sec'}
+            row.update(source_video='video.mp4', label=0, start_second=0,
+                       end_second=60, feature_encoding='risk_v2')
+            second = row | {'start_second': 60, 'end_second': 120}
+            original = json.dumps(row)
+            dst.write_text(original)
+            with patch.object(model, 'process_video', side_effect=lambda *a, **kw: iter([row, second])):
+                self.assertEqual(model.run(src, dst, resume=True), 1)
+                self.assertEqual(model.run(src, dst, resume=True), 0)
+            self.assertEqual([json.loads(s) for s in dst.read_text().splitlines()], [row, second])
+            for bad in ('{"broken":', json.dumps(row | {'feature_encoding': 'risk_v1'}),
+                        json.dumps(row), json.dumps(row | {'label': 1}),
+                        json.dumps(row | {'start_second': 10, 'end_second': 70})):
+                dst.write_text(original + '\n' + bad)
+                with self.assertRaises(ValueError):
+                    model.run(src, dst, resume=True)
+                self.assertEqual(dst.read_text(), original + '\n' + bad)
+
+    def test_bad_manifest_types_continue_and_duplicate_videos_are_skipped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src, dst = Path(tmp) / 'input.jsonl', Path(tmp) / 'output.jsonl'
+            rows = [{'video_path': [], 'label': 0}, {'video_path': 'video.mp4', 'label': []},
+                    {'video_path': 'video.mp4', 'label': True},
+                    {'video_path': 'video.mp4', 'label': 0},
+                    {'video_path': './video.mp4', 'label': 0},
+                    {'video_path': 'video.mp4', 'label': 1}]
+            src.write_text('\n'.join(json.dumps(r) for r in rows))
+            for resume in (False, True):
+                model = self.make_engine()
+                if dst.exists():
+                    dst.write_text('')
+                with patch.object(model, 'process_video', return_value=iter([])) as process, patch('sys.stderr'):
+                    self.assertEqual(model.run(src, dst, resume=resume), 0)
+                    process.assert_called_once()
+                with self.assertRaises(ValueError):
+                    model.run(src, dst, resume=resume, strict=True)
+
+    def test_nonfinite_coverage_cannot_pass_quality_gate(self):
+        model = self.make_engine()
+        frames = [np.zeros((3, 8, 8), np.uint8)]
+        for key in ('eye_observed_sec', 'mouth_observed_sec', 'head_observed_sec', 'head_motion_observed_sec'):
+            for value in (None, float('nan'), float('inf')):
+                with self.subTest(key=key, value=value):
+                    self.assertIsNone(model._features(self.metrics(**{key: value}), [], [], frames, 'video', 0, 1))
+        model.neural.assert_not_called()
+
+    def test_default_stride_produces_nonoverlapping_windows(self):
+        model = self.make_engine(neural_size=8)
+        self.assertEqual(model.stride / model.fps, 60)
+        frames = ((np.zeros((3, 4, 8), np.uint8), i / 30) for i in range(3600))
+        with patch.object(engine, 'CameraMetrics') as camera, \
+                patch.object(engine, 'read_video', return_value=frames):
+            camera.return_value.process.return_value = self.metrics()
+            rows = list(model.process_video('video.mp4', 1))
+        self.assertEqual([(r['start_second'], r['end_second']) for r in rows], [(0, 60), (60, 120)])
 
     def test_neural_preprocessing_and_binary_output(self):
         class Backbone(torch.nn.Module):
@@ -286,6 +348,12 @@ class DataSystemTests(unittest.TestCase):
             self.assertEqual(rows[0]['feature_encoding'], 'risk_v2')
             self.assertEqual(rows[0]['dominant_head_motion_frequency'], .75)
             camera.return_value.close.assert_called_once()
+            model.neural.reset_mock()
+            with patch.object(engine, 'read_video', return_value=iter(frames)):
+                resumed = list(model.process_video('video.mp4', 1, saved_windows={(0, 2)}))
+            self.assertEqual([(r['start_second'], r['end_second']) for r in resumed], [(1, 3)])
+            self.assertEqual(camera.return_value.process.call_count, 60)
+            model.neural.assert_called_once()
             for perclos, expected in ((0, 0), (5, 0), (10, .5), (15, 1)):
                 sample = model._features(
                     metrics | {'blink_rate_per_min': 4, 'perclos_pct': perclos},

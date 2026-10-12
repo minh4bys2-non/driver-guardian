@@ -43,7 +43,7 @@ DEFAULT_RISK_CONFIG = {
 
 
 class Engine:
-    def __init__(self, video_root, fps=30, window_sec=None, stride_sec=10,
+    def __init__(self, video_root, fps=30, window_sec=None, stride_sec=60,
                  neural_sec=10, neural_size=640, min_observed_ratio=0.8, risk_config=None,
                  neural_fps=5, device=None, cnn_path=None, conv_gru_path=None,
                  chunk_size=32):
@@ -140,11 +140,12 @@ class Engine:
 
     def _features(self, m, blink_durations, nod_durations, nn_frames, source, start, label):
         window = self.window_sec
+        coverage = [m[k] for k in ("eye_observed_sec", "mouth_observed_sec", "head_observed_sec")]
         if (
                 not m["eye_ready"] or not m["mouth_ready"] or not m["head_calibrated"]
                 or m["perclos_pct"] is None
-                or any((m[k] or 0) < window * self.min_observed_ratio
-                       for k in ("eye_observed_sec", "mouth_observed_sec", "head_observed_sec"))):
+                or any(v is None or not np.isfinite(v) or v < window * self.min_observed_ratio
+                       for v in coverage)):
             return None
 
         motion = self.risk_config["dominant_head_motion_frequency"]
@@ -152,7 +153,7 @@ class Engine:
         resolution = m["head_motion_resolution_hz"]
         observed = m["head_motion_observed_sec"]
         reliable_motion = (
-            frequency is not None and resolution is not None
+            frequency is not None and resolution is not None and observed is not None
             and np.isfinite((frequency, resolution, observed)).all()
             and frequency > 0 and resolution > 0
             and observed >= motion["window_sec"] - 1e-9
@@ -185,16 +186,20 @@ class Engine:
                 "start_second": start, "end_second": start + window, "label": label,
                 "feature_encoding": "risk_v2"}
 
-    def process_video(self, video_path, label):
-        """Stream video một lần; yield từng dòng dữ liệu sau mỗi 10 giây."""
-        if not isinstance(video_path, str) or not video_path:
+    def _source(self, video_path):
+        if not isinstance(video_path, str) or not video_path.strip():
             raise ValueError("video_path must be a nonempty relative path")
-        if type(label) is not int or label not in (0, 1):
-            raise ValueError("label must be 0 (alert) or 1 (drowsy)")
         relative = Path(video_path)
         if relative.is_absolute() or not (self.root / relative).resolve().is_relative_to(self.root):
             raise ValueError(f"Invalid relative video path: {video_path}")
-        path = self.root / relative
+        return (self.root / relative).resolve().relative_to(self.root).as_posix()
+
+    def process_video(self, video_path, label, saved_windows=None):
+        """Stream video một lần; yield mẫu hợp lệ theo stride đã cấu hình."""
+        video_path = self._source(video_path)
+        if type(label) is not int or label not in (0, 1):
+            raise ValueError("label must be 0 (alert) or 1 (drowsy)")
+        path = self.root / video_path
         camera = CameraMetrics(
             fps=self.fps, window_sec=self.window_sec,
             windows={"head_motion": self.risk_config["dominant_head_motion_frequency"]["window_sec"]},
@@ -225,6 +230,8 @@ class Engine:
                 count = i + 1
                 if count >= self.window and (count - self.window) % self.stride == 0:
                     start = (count - self.window) / self.fps
+                    if saved_windows and (start, start + self.window_sec) in saved_windows:
+                        continue
                     sample = self._features(metrics, blink_durations, nod_durations,
                                             nn_frames, video_path, start, label)
                     if sample is not None:
@@ -232,13 +239,48 @@ class Engine:
         finally:
             camera.close()
 
-    def run(self, input_jsonl, output_jsonl, strict=False):
+    def run(self, input_jsonl, output_jsonl, strict=False, resume=False):
         src, dst = Path(input_jsonl).resolve(), Path(output_jsonl).resolve()
         if src == dst:
             raise ValueError("Input and output JSONL must be different files")
+        saved = {}
+        video_labels = {}
+        needs_newline = False
+        if resume and dst.exists():
+            with dst.open(encoding="utf-8") as existing:
+                for line_number, line in enumerate(existing, 1):
+                    needs_newline = not line.endswith("\n")
+                    if not line.strip():
+                        continue
+                    try:
+                        row = json.loads(line)
+                        source, label = row["source_video"], row["label"]
+                        source = self._source(source)
+                        start, end = row["start_second"], row["end_second"]
+                        if (row["feature_encoding"] != "risk_v2"
+                                or not isinstance(source, str) or not source
+                                or type(label) is not int or label not in (0, 1)
+                                or not np.isfinite((start, end)).all() or start < 0
+                                or abs(end - start - self.window_sec) > 1e-6
+                                or abs(start * self.fps / self.stride - round(start * self.fps / self.stride)) > 1e-6
+                                or any(not np.isfinite(row[k]) or not 0 <= row[k] <= 1
+                                       for k in DEFAULT_RISK_CONFIG if k != "window_sec")):
+                            raise ValueError("Incompatible saved sample")
+                        if source in video_labels and video_labels[source] != label:
+                            raise ValueError(f"Conflicting labels for video: {source}")
+                        video_labels[source] = label
+                        windows = saved.setdefault((source, label), set())
+                        if (start, end) in windows:
+                            raise ValueError(f"Duplicate saved window: {source}, {start}, {end}")
+                        windows.add((start, end))
+                    except (ValueError, KeyError, TypeError) as exc:
+                        raise ValueError(f"Cannot resume {dst}, line {line_number}: {exc}") from exc
         dst.parent.mkdir(parents=True, exist_ok=True)
         count = 0
-        with src.open(encoding="utf-8") as fin, dst.open("w", encoding="utf-8") as fout:
+        seen = set()
+        with src.open(encoding="utf-8") as fin, dst.open("a" if resume else "w", encoding="utf-8") as fout:
+            if needs_newline:
+                fout.write("\n")
             for line_number, line in enumerate(fin, 1):
                 if not line.strip():
                     continue
@@ -246,9 +288,28 @@ class Engine:
                     record = json.loads(line)
                     if not isinstance(record, dict):
                         raise ValueError("Each JSONL record must be an object")
-                    for sample in self.process_video(record["video_path"], record["label"]):
+                    source, label = record["video_path"], record["label"]
+                    source = self._source(source)
+                    if type(label) is not int or label not in (0, 1):
+                        raise ValueError("label must be an integer 0 or 1")
+                    if source in video_labels and video_labels[source] != label:
+                        raise ValueError(f"Conflicting labels for video: {source}")
+                    video_labels[source] = label
+                    key = (source, label)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    windows = saved.setdefault(key, set()) if resume else None
+                    samples = (self.process_video(*key, saved_windows=windows) if resume
+                               else self.process_video(*key))
+                    for sample in samples:
+                        window = (sample["start_second"], sample["end_second"]) if resume else None
+                        if windows is not None and window in windows:
+                            continue
                         fout.write(json.dumps(sample, ensure_ascii=False, allow_nan=False) + "\n")
                         fout.flush()  # giữ kết quả đã xử lý nếu video tiếp theo lỗi
+                        if windows is not None:
+                            windows.add(window)
                         count += 1
                 except (OSError, ValueError, KeyError, RuntimeError, cv2.error) as exc:
                     if strict:
@@ -259,12 +320,12 @@ class Engine:
 if __name__ == "__main__":
     INPUT_JSONL = "/home/tranmanhduy/Workspace/ptithcm/driver-guardian/ai/OptimalAlgorithsm/UTA-RLDD/dataset.jsonl"
     VIDEO_ROOT = "/home/tranmanhduy/Workspace/ptithcm/driver-guardian/ai/OptimalAlgorithsm/UTA-RLDD"
-    OUTPUT_JSONL = "/home/tranmanhduy/Workspace/ptithcm/driver-guardian/ai/OptimalAlgorithsm/drowsiness_risk.jsonl"
+    OUTPUT_JSONL = "/home/tranmanhduy/Workspace/ptithcm/driver-guardian/ai/OptimalAlgorithsm/drowsiness_risk_60.jsonl"
     CNN_PATH = "/home/tranmanhduy/Workspace/ptithcm/driver-guardian/ai/OptimalAlgorithsm/model_cnn/best.pt"
     CONV_GRU_PATH = "/home/tranmanhduy/Workspace/ptithcm/driver-guardian/ai/OptimalAlgorithsm/model_convgru/best.pt"
 
     FPS = 30
-    STRIDE_SEC = 10
+    STRIDE_SEC = 60
     NEURAL_SEC = 10
     NEURAL_FPS = 5
     NEURAL_SIZE = 640
@@ -273,6 +334,7 @@ if __name__ == "__main__":
     MIN_OBSERVED_RATIO = 0.8
     RISK_CONFIG = deepcopy(DEFAULT_RISK_CONFIG)
     STRICT = False
+    RESUME = True  # Giữ mẫu đã lưu; đọc lại nhánh vật lý để khôi phục trạng thái.
 
     engine = Engine(
         video_root=VIDEO_ROOT,
@@ -288,4 +350,4 @@ if __name__ == "__main__":
         min_observed_ratio=MIN_OBSERVED_RATIO,
         risk_config=RISK_CONFIG,
     )
-    print(engine.run(INPUT_JSONL, OUTPUT_JSONL, strict=STRICT))
+    print(engine.run(INPUT_JSONL, OUTPUT_JSONL, strict=STRICT, resume=RESUME))

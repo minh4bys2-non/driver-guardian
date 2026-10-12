@@ -6,7 +6,7 @@
 
 DataSystem đọc video và nhãn từ manifest JSONL, trích xuất **7 đặc trưng vật lý + 1 điểm CNN–ConvGRU**, sau đó ghi từng mẫu thành một dòng JSONL cho `TrainingSystem`.
 
-Một mẫu mặc định mô tả cửa sổ video 60 giây. Nhánh vật lý cập nhật ở 30 FPS; nhánh mạng dùng 50 ảnh ở 5 FPS trong **10 giây cuối** của cửa sổ. Các cửa sổ dịch 10 giây mỗi lần.
+Một mẫu mặc định mô tả cửa sổ video 60 giây. Nhánh vật lý cập nhật ở 30 FPS; nhánh mạng dùng 50 ảnh ở 5 FPS trong **10 giây cuối** của cửa sổ. Các cửa sổ dịch 60 giây mỗi lần, không chồng lấn.
 
 Mã không huấn luyện lại CNN/ConvGRU, không tự gán nhãn và không xác nhận người trong video thực sự buồn ngủ. Nhãn đầu ra được giữ nguyên từ manifest. Các đặc trưng đã chuẩn hóa là đầu vào cho bước tối ưu tiếp theo, không phải tất cả đều là xác suất.
 
@@ -107,7 +107,7 @@ Thời gian đích:  0.00   0.25   0.50   0.75
 | --- | --- | --- |
 | `fps` | 30 | Timeline chung và tốc độ xử lý nhánh vật lý |
 | `risk_config["window_sec"]` | 60 | Độ dài cửa sổ vật lý, 1.800 frame; tham số `window_sec` nếu truyền phải khớp |
-| `stride_sec` | 10 | Khoảng dịch giữa hai cửa sổ, 300 frame |
+| `stride_sec` | 60 | Khoảng dịch giữa hai cửa sổ, 1.800 frame |
 | `neural_sec` | 10 | Độ dài đoạn đưa vào ConvGRU |
 | `neural_fps` | 5 | 5 ảnh/giây, cách nhau 0,2 giây |
 | `neural_size` | 640 | Kích thước letterbox trước khi lưu buffer mạng |
@@ -123,8 +123,8 @@ Với mặc định, cứ mỗi 6 frame của timeline 30 FPS sẽ giữ 1 frame
 ```text
 Cửa sổ vật lý         Frame mạng tương ứng
 [ 0, 60) giây         50.0, 50.2, ..., 59.8
-[10, 70) giây         60.0, 60.2, ..., 69.8
-[20, 80) giây         70.0, 70.2, ..., 79.8
+[60,120) giây        110.0, 110.2, ..., 119.8
+[120,180) giây       170.0, 170.2, ..., 179.8
 ```
 
 Đây là lịch xét xuất, không đảm bảo mỗi mốc đều có một dòng đầu ra. Video ngắn hơn một cửa sổ không tạo mẫu. Cửa sổ cuối chưa đầy bị bỏ.
@@ -309,7 +309,7 @@ engine = Engine(
     video_root="ai/OptimalAlgorithsm/UTA-RLDD",
     fps=30,
     window_sec=60,
-    stride_sec=10,
+    stride_sec=60,
     neural_sec=10,
     neural_fps=5,
     neural_size=640,
@@ -324,7 +324,7 @@ count = engine.run(
 print(f"Đã ghi {count} mẫu")
 ```
 
-`run()` mở output ở chế độ `w`: **ghi đè nếu tệp đã tồn tại**, không resume hoặc append. Input và output cùng đường dẫn bị từ chối. Ví dụ dùng tên mới để không ghi đè dữ liệu trước khi kiểm chứng.
+`run(..., resume=False)` mở output ở chế độ `w`: **ghi đè nếu tệp đã tồn tại**. `resume=True` kiểm tra file đã có rồi mở append; khối chạy chính hiện đặt `RESUME=True`. Input và output cùng đường dẫn bị từ chối. Ví dụ dùng tên mới để không ghi đè dữ liệu trước khi kiểm chứng.
 
 `strict=True` dừng ở lỗi đầu tiên. Mặc định `strict=False` ghi lỗi có số dòng ra stderr và tiếp tục dòng manifest tiếp theo. Dòng JSONL trống được bỏ qua. Output được flush từng mẫu; nếu video lỗi sau khi đã xuất một số cửa sổ, các mẫu trước lỗi vẫn còn trong file. Chưa có rollback theo video hoặc cơ chế chống trùng khi manifest lặp video.
 
@@ -380,7 +380,7 @@ Kiểm thử DataSystem bao gồm các mốc điểm nguy hiểm, P90/max, đổ
 
 Kiểm thử PhysicalBranch bao gồm FSM, thời lượng sự kiện, mất tín hiệu, PERCLOS theo khoảng thời gian, hiệu chuẩn đầu, FFT và cửa sổ độc lập. Đây là kiểm thử logic; chưa thay thế đánh giá trên landmark và nhãn sự kiện được gán thủ công.
 
-Kết quả rà soát cuối:
+Kết quả kiểm chứng video trước đây (stride 10 giây):
 
 | Hạng mục | Kết quả |
 | --- | --- |
@@ -418,7 +418,7 @@ Kết quả này xác nhận luồng đọc video → FaceMesh → đặc trưng
 ## 13. Những điểm cần giữ khi tạo bộ dữ liệu huấn luyện
 
 1. **Tạo lại dữ liệu theo `risk_v2`.** Không trộn điểm chia scale hoặc `risk_v1` với dữ liệu mới. Phiên cập nhật không ghi đè dataset hiện có.
-2. **Tách tập theo người/video trước khi đánh giá.** Cửa sổ 60 giây dịch 10 giây chồng lấn 50 giây. Chia ngẫu nhiên theo dòng có thể đưa gần như cùng nội dung vào train và test. Với UTA-RLDD nên giữ toàn bộ video cùng subject trong cùng nhóm; DataSystem chưa tự chia tập.
+2. **Tách tập theo người/video trước khi đánh giá.** Dữ liệu cũ dùng cửa sổ 60 giây dịch 10 giây, chồng lấn 50 giây; cấu hình mới dùng stride 60 giây. Chia ngẫu nhiên theo dòng có thể đưa gần như cùng nội dung vào train và test. Với UTA-RLDD nên giữ toàn bộ video cùng subject trong cùng nhóm; DataSystem chưa tự chia tập.
 3. **Theo dõi tỷ lệ cửa sổ bị loại.** Điều kiện FFT đủ 60 giây liên tục có thể loại nhiều video khó. Cần báo cáo số mẫu theo lớp/subject và coverage để nhận biết thiên lệch do chất lượng theo dõi.
 4. **Kiểm chứng calibration trên video thực tế.** Tư thế ban đầu, mắt đã nhắm, kính, che khuất, góc quay và ảnh lặp do FPS thấp có thể làm thay đổi phép đo.
 5. **Không đồng nhất chạy đúng với dự đoán đúng.** Muốn kết luận độ chính xác cần tập kiểm thử độc lập, nhãn phù hợp cho từng cửa sổ và đối chiếu sự kiện với annotation. Bộ kiểm thử phần mềm không cung cấp accuracy/precision/recall hành vi.
@@ -426,7 +426,7 @@ Kết quả này xác nhận luồng đọc video → FaceMesh → đặc trưng
 
 ## 14. Sơ đồ Mermaid chi tiết: video → JSONL
 
-Các sơ đồ dưới đây mô tả cấu hình mặc định `risk_v2`: nhánh vật lý 30 FPS, cửa sổ 60 giây, stride 10 giây; mạng nhận 50 ảnh ở 5 FPS trong 10 giây cuối. Hai nhánh dùng cùng timeline; mã cập nhật tuần tự theo frame, không chạy hai worker song song.
+Các sơ đồ dưới đây mô tả cấu hình mặc định `risk_v2`: nhánh vật lý 30 FPS, cửa sổ 60 giây, stride 60 giây; mạng nhận 50 ảnh ở 5 FPS trong 10 giây cuối. Hai nhánh dùng cùng timeline; mã cập nhật tuần tự theo frame, không chạy hai worker song song.
 
 ### 14.1. Điều phối manifest và vòng đời từng video
 
@@ -434,7 +434,7 @@ Các sơ đồ dưới đây mô tả cấu hình mặc định `risk_v2`: nhán
 flowchart TD
     START([Bắt đầu]) --> CFG["Đọc cấu hình Engine và RISK_CONFIG<br/>Kiểm tra ngưỡng, đơn vị, FPS và lịch cửa sổ"]
     CFG --> MODEL["Nạp checkpoint CNN và ConvGRU một lần<br/>Chuyển mô hình sang eval, chọn CPU hoặc CUDA"]
-    MODEL --> FILES["Mở INPUT_JSONL để đọc<br/>Mở OUTPUT_JSONL chế độ w: ghi đè nếu đã tồn tại"]
+    MODEL --> FILES["Mở INPUT_JSONL để đọc<br/>Mở OUTPUT_JSONL: append nếu resume=True<br/>Nếu resume=False: chế độ w, ghi đè file cũ"]
     FILES --> LINE{"Còn dòng manifest?"}
     LINE -->|Không| FINISH["Đóng file và trả tổng số mẫu đã ghi"]
     FINISH --> END([Kết thúc])
@@ -470,10 +470,12 @@ flowchart TD
     SAMPLE -->|Có| BUFFER["Letterbox RGB thành 640 × 640<br/>Thêm vào deque tối đa 50 ảnh<br/>Tốc độ lưu ảnh mạng: 5 FPS"]
     SAMPLE -->|Không| HISTORY
     BUFFER --> HISTORY["Lưu thời lượng blink/nod hợp lệ vừa kết thúc<br/>Loại sự kiện kết thúc ngoài cửa sổ 60 giây"]
-    HISTORY --> DUE{"Đủ 1.800 frame và đến stride 300 frame?"}
+    HISTORY --> DUE{"Đủ 1.800 frame và đến stride 1.800 frame?"}
     DUE -->|Không| NEXT["Đọc frame tiếp theo"]
     NEXT --> READ
-    DUE -->|Có| READY{"Mắt, miệng đã sẵn sàng<br/>và đầu đã hiệu chuẩn?"}
+    DUE -->|Có| SAVED{"Resume và cửa sổ đã có trong JSONL?"}
+    SAVED -->|Có| NEXT
+    SAVED -->|Không| READY{"Mắt, miệng đã sẵn sàng<br/>và đầu đã hiệu chuẩn?"}
     READY -->|Không| SKIP["Bỏ cửa sổ, tiếp tục giữ và cập nhật trạng thái"]
     READY -->|Có| COVER{"Có PERCLOS và mỗi nhóm mắt, miệng, đầu<br/>quan sát được ít nhất 48 giây?"}
     COVER -->|Không| SKIP
@@ -492,7 +494,7 @@ Tại cửa sổ frame `[0,60)`, timestamp cuối là khoảng 59,9667 giây nê
 
 ```mermaid
 flowchart LR
-    INPUT["50 ảnh RGB uint8<br/>Ví dụ cửa sổ 10–70 giây:<br/>ảnh tại 60,0; 60,2; ...; 69,8"]
+    INPUT["50 ảnh RGB uint8<br/>Ví dụ cửa sổ 60–120 giây:<br/>ảnh tại 110,0; 110,2; ...; 119,8"]
     INPUT --> STACK["Stack thành T × 3 × 640 × 640<br/>T = 50"]
     STACK --> CHUNK["Chia chunk tối đa 32 ảnh<br/>Chuyển sang device, float32<br/>Chia 255 để pixel về 0–1"]
     CHUNK --> CNN["CNN backbone → neck<br/>Trích xuất đặc trưng P3, P4, P5"]
@@ -529,7 +531,31 @@ flowchart TD
     LINEAR --> MERGE
     HF --> MERGE
     MERGE --> META["Thêm source_video, start_second, end_second<br/>label từ manifest; feature_encoding = risk_v2"]
-    META --> JSONL["Một object JSON trên một dòng<br/>Ghi vào drowsiness_risk.jsonl và flush"]
+    META --> JSONL["Một object JSON trên một dòng<br/>Ghi vào drowsiness_risk_60.jsonl và flush"]
 ```
 
 Tần suất bằng số sự kiện hợp lệ trong cửa sổ nhân 60 rồi chia `window_sec`; không chia riêng cho thời gian quan sát. Không có sự kiện hợp lệ thì P90/max được quy ước bằng 0. Các đường cong hai nhánh bão hòa ngoài hai đầu; riêng tần số FFT bằng 0 không được coi là chuyển động tin cậy. Điểm xuất ra là mức nguy hiểm theo cấu hình, không phải tám xác suất đã được hiệu chuẩn.
+
+
+## 15. Ngắt và chạy tiếp
+
+Nhấn `Ctrl+C` trong terminal đang chạy. Các dòng đã ghi được flush sau mỗi mẫu; đợi tiến trình kết thúc rồi mới chạy lại, không chạy hai tiến trình ghi cùng output.
+
+Trong khối `__main__` của `engine.py`, giữ cùng manifest, output, checkpoint và cấu hình, đặt:
+
+```python
+RESUME = True
+print(engine.run(INPUT_JSONL, OUTPUT_JSONL, strict=STRICT, resume=RESUME))
+```
+
+Chạy lại lệnh cũ. File chưa tồn tại thì được tạo mới. File đã có được kiểm tra trước khi mở append; mỗi cửa sổ được nhận diện bằng `(source_video, label, start_second, end_second)`. Cửa sổ đã lưu được bỏ qua trước suy luận mạng và không ghi trùng. Giá trị trả về là số mẫu **mới thêm** trong lần chạy này.
+
+Resume này không lưu checkpoint trạng thái HMM/FSM. Nhánh vật lý vẫn đọc lại **tất cả video trong manifest từ đầu**, kể cả video đã có dữ liệu, nhằm khôi phục trạng thái hiệu chuẩn, mô hình thích nghi và lịch sử sự kiện. Vì vậy có thể chưa thấy file tăng kích thước trong lúc đọc lại phần cũ; CNN–ConvGRU không chạy cho cửa sổ đã lưu. Không seek thẳng đến timestamp cuối.
+
+JSONL sai, dòng cuối bị cắt hoặc khác encoding/cửa sổ sẽ báo lỗi trước khi ghi thêm; chương trình không tự xóa dữ liệu lỗi. File hiện không lưu hash checkpoint/cấu hình nên không thể phát hiện mọi thay đổi ngưỡng: khi thay cấu hình hoặc checkpoint, hãy dùng output mới. `RESUME=False` là chạy lại và ghi đè output.
+
+## Rà soát bổ sung
+
+Bộ kiểm thử hiện có 21 ca DataSystem, 17 ca TrainingSystem và 18 ca PhysicalBranch. Đã kiểm tra stride mặc định 60 giây, từ chối resume output dùng bước 10 giây không tương thích, dữ liệu trùng và nhãn mâu thuẫn. Đường dẫn video được chuẩn hóa; mỗi video chỉ xử lý một lần trong một lượt đọc manifest. Nếu video lỗi giữa chừng, lần resume tiếp theo mới thử lại. Coverage thiếu hoặc không hữu hạn bị loại trước suy luận mạng.
+
+Output mặc định của DataSystem là `drowsiness_risk_60.jsonl`. TrainingSystem hiện vẫn đọc `drowsiness_risk_10.jsonl`; chỉ đổi `DATA_PATH` sau khi đã hoàn tất tạo dữ liệu mới. Không ghép hai file vào cùng một thí nghiệm.

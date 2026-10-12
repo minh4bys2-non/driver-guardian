@@ -1,6 +1,6 @@
 # Chuẩn hóa điểm nguy hiểm — risk_v2
 
-Giữ nguyên 8 đặc trưng. `DEFAULT_RISK_CONFIG` trong [engine.py](engine.py) chứa bộ ngưỡng người dùng cung cấp; khối chạy chính lấy bản sao `RISK_CONFIG` và truyền vào `Engine`. Có thể ghi đè từng mục qua `risk_config`. Cửa sổ mặc định 60 giây, stride 10 giây; CNN–ConvGRU chỉ xử lý 10 giây cuối, 5 FPS.
+Giữ nguyên 8 đặc trưng. `DEFAULT_RISK_CONFIG` trong [engine.py](engine.py) chứa bộ ngưỡng người dùng cung cấp; khối chạy chính lấy bản sao `RISK_CONFIG` và truyền vào `Engine`. Có thể ghi đè từng mục qua `risk_config`. Cửa sổ mặc định 60 giây, stride 60 giây; CNN–ConvGRU chỉ xử lý 10 giây cuối, 5 FPS.
 
 `Metric.docx` là tài liệu nguồn về metric. Bộ cấu hình do người dùng chốt bổ sung các mốc định lượng và quy tắc tổng hợp; không xem mọi mốc dưới đây là ngưỡng đã được tài liệu nghiên cứu xác nhận. Điểm biểu diễn mức nguy hiểm theo cấu hình, không phải xác suất được hiệu chuẩn.
 
@@ -67,4 +67,4 @@ flowchart TD
 
 Mỗi video tạo mới bộ đo và buffer, không nối sự kiện hay frame giữa hai video. Các điều kiện readiness và coverage tối thiểu 80% vẫn áp dụng.
 
-Output mặc định là `drowsiness_risk.jsonl`, có `feature_encoding="risk_v2"`. TrainingSystem chấp nhận từng phiên bản `scale_v1`, `risk_v1`, `risk_v2` riêng biệt và từ chối trộn chúng trong một dataset. Dòng cũ thiếu metadata được xem là `scale_v1`. Cần tạo lại dữ liệu từ video để có P90, max và bộ lọc sự kiện mới; không thể chuyển chính xác chỉ từ các điểm JSONL cũ. Các lần chạy với cấu hình tùy chỉnh cũng cần lưu riêng cấu hình, vì `risk_v2` không chứa hash cấu hình.
+Output mặc định là `drowsiness_risk_60.jsonl`, có `feature_encoding="risk_v2"`. TrainingSystem chấp nhận từng phiên bản `scale_v1`, `risk_v1`, `risk_v2` riêng biệt và từ chối trộn chúng trong một dataset. Dòng cũ thiếu metadata được xem là `scale_v1`. Cần tạo lại dữ liệu từ video để có P90, max và bộ lọc sự kiện mới; không thể chuyển chính xác chỉ từ các điểm JSONL cũ. Các lần chạy với cấu hình tùy chỉnh cũng cần lưu riêng cấu hình, vì `risk_v2` không chứa hash cấu hình.

@@ -95,10 +95,10 @@ class ModelInference(nn.Module):
         if C != 3:
             raise ValueError(f"Expected 3 color channels (RGB), got C = {C}")
 
-        if x.dtype != torch.uint8 and (
-                not x.is_floating_point() or not torch.isfinite(x).all()
-                or x.min() < 0 or x.max() > 1):
-            raise ValueError("Frames must be uint8 [0,255] or finite float [0,1]")
+        # if x.dtype != torch.uint8 and (
+        #         not x.is_floating_point() or not torch.isfinite(x).all()
+        #         or x.min() < 0 or x.max() > 1):
+        #     raise ValueError("Frames must be uint8 [0,255] or finite float [0,1]")
 
         # Vấn đề 3: Tự động điều chỉnh kích thước về 640x640 qua hàm letterbox nếu H != 640 hoặc W != 640
         # if H != 640 or W != 640:
@@ -186,7 +186,7 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = ModelInference(device=device, cnn_path=cnn_path, conv_gru_path=conv_gru_path)
     # Test với dummy array 224x224 mô phỏng dữ liệu từ Engine
-    test_dummy = np.zeros((10, 3, 640, 640), dtype=np.uint8)
+    test_dummy = np.zeros((10, 3, 640, 640), dtype=np.float16)
     # test_dummy = torch.rand((10, 3, 224, 224)).to(device)
     # p3, p4, p5 = model.cnn_backbone(test_dummy)
     # output = model.cnn_neck(p3, p4, p5)

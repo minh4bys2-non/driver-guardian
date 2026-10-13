@@ -263,7 +263,7 @@ ai/OptimalAlgorithsm/model_cnn/best.pt
 ai/OptimalAlgorithsm/model_convgru/best.pt
 ```
 
-`_resolve_checkpoint()` tìm ở các thư mục cha của DataSystem và các vị trí `ai/checkpoints`, `checkpoints`, sau đó mới xét working directory. `NeuralNetwork` cũng nhận `cnn_path` và `conv_gru_path` để chỉ định rõ đường dẫn.
+`_resolve_checkpoint()` tìm ở các thư mục cha của DataSystem và các vị trí `ai/checkpoints`, `checkpoints`, sau đó mới xét working directory. `ModelInference` cũng nhận `cnn_path` và `conv_gru_path` để chỉ định rõ đường dẫn.
 
 Cấu hình lưu trong checkpoint ConvGRU hiện tại:
 
@@ -344,7 +344,7 @@ finally:
 Có thể chạy `python -m ai.OptimalAlgorithsm.DataSystem.engine`. Cấu hình chạy tập trung trong khối `if __name__ == "__main__":` của `engine.py`:
 
 - `INPUT_JSONL`, `VIDEO_ROOT`, `OUTPUT_JSONL`: nguồn và đích dữ liệu.
-- `CNN_PATH`, `CONV_GRU_PATH`: checkpoint cụ thể, được truyền qua `Engine` vào `NeuralNetwork`. Đường dẫn được chỉ định nhưng không tồn tại sẽ báo lỗi, không tự chuyển sang checkpoint khác.
+- `CNN_PATH`, `CONV_GRU_PATH`: checkpoint cụ thể, được truyền qua `Engine` vào `ModelInference`. Đường dẫn được chỉ định nhưng không tồn tại sẽ báo lỗi, không tự chuyển sang checkpoint khác.
 - `FPS`, `RISK_CONFIG["window_sec"]`, `STRIDE_SEC`: timeline và cửa sổ vật lý.
 - `NEURAL_SEC`, `NEURAL_FPS`, `NEURAL_SIZE`: đoạn ảnh đầu vào mạng.
 - `CHUNK_SIZE`, `DEVICE`: số ảnh mỗi lượt CNN và thiết bị suy luận.

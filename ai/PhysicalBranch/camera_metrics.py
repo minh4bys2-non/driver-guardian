@@ -59,8 +59,14 @@ class CameraMetrics:
                  nod_duration_ms=(800, 3500), max_gap_sec=0.25,
                  detection_confidence=0.6, tracking_confidence=0.6,
                  windows=None, head_motion_min_amplitude_deg=0.1):
-        if calibration_frames < 1 or nod_direction not in (None, -1, 1):
+        if (type(calibration_frames) is not int or calibration_frames < 1
+                or isinstance(nod_direction, bool) or nod_direction not in (None, -1, 1)):
             raise ValueError("Invalid calibration or nod direction")
+        if (not np.isfinite([detection_confidence, tracking_confidence]).all()
+                or not 0 <= detection_confidence <= 1 or not 0 <= tracking_confidence <= 1):
+            raise ValueError("Detection and tracking confidence must be finite and in [0, 1]")
+        if np.shape(nod_duration_ms) != (2,):
+            raise ValueError("Nod duration limits must contain a minimum and maximum")
         if not np.isfinite([nod_release_deg, nod_pitch_deg]).all() or not 0 <= nod_release_deg < nod_pitch_deg:
             raise ValueError("Nod release must be below the pitch threshold")
         self.angle_limits = np.asarray(angle_limits, dtype=float)
@@ -305,7 +311,8 @@ class CameraMetrics:
 
     def run(self, source=0, display=True, logdir=None, output_interval_sec=1,
             max_frames=None, use_video_time=False, on_metrics=None):
-        if output_interval_sec < 0 or (max_frames is not None and max_frames < 1):
+        if (not np.isfinite(output_interval_sec) or output_interval_sec < 0
+                or (max_frames is not None and (type(max_frames) is not int or max_frames < 1))):
             raise ValueError("Invalid output interval or frame limit")
         self.reset()
         with ExitStack() as stack:

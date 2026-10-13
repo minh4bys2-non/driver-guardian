@@ -8,14 +8,22 @@ class HeadPoseEstimator:
                       (-225, -170, 135), (150, 150, 125), (-150, 150, 125)], dtype=float)
 
     def __init__(self, image_width, image_height, camera_matrix=None, distortion_coeffs=None):
-        if image_width <= 0 or image_height <= 0:
-            raise ValueError("Image dimensions must be positive")
+        if not np.isfinite([image_width, image_height]).all() or image_width <= 0 or image_height <= 0:
+            raise ValueError("Image dimensions must be finite and positive")
         self.camera_matrix = np.asarray(camera_matrix if camera_matrix is not None else
                                         [[image_width, 0, image_width / 2],
                                          [0, image_width, image_height / 2], [0, 0, 1]], dtype=float)
         self.distortion = np.zeros(4) if distortion_coeffs is None else np.asarray(distortion_coeffs, dtype=float)
         if self.camera_matrix.shape != (3, 3) or not np.isfinite(self.camera_matrix).all():
             raise ValueError("Invalid camera matrix")
+        if (self.camera_matrix[0, 0] <= 0 or self.camera_matrix[1, 1] <= 0
+                or not np.array_equal(self.camera_matrix[2], [0, 0, 1])):
+            raise ValueError("Camera matrix requires positive focal lengths and last row [0, 0, 1]")
+        if (self.distortion.ndim not in (1, 2)
+                or (self.distortion.ndim == 2 and 1 not in self.distortion.shape)
+                or self.distortion.size not in (4, 5, 8, 12, 14)
+                or not np.isfinite(self.distortion).all()):
+            raise ValueError("Distortion coefficients must be a finite vector of length 4, 5, 8, 12 or 14")
         self.rotation = self.translation = None
 
     def estimate(self, landmarks_2d):

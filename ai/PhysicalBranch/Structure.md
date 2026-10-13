@@ -154,7 +154,7 @@ hay kết luận buồn ngủ từ các mốc 0.05/0.2 Hz trong tài liệu.
 | Tham số | Giá trị |
 | --- | --- |
 | Thời lượng nháy mắt hợp lệ | 100–2000 ms |
-| Thời lượng ngáp hợp lệ | 3500–7500 ms |
+| Thời lượng ngáp hợp lệ | 4000–7500 ms |
 | Thời lượng gật hợp lệ | 800–3500 ms |
 | Ngưỡng gật / nhả | 14° / 8° |
 | Giới hạn pitch / yaw / roll | 20° / 25° / 20° |
@@ -166,6 +166,13 @@ Các dải thời lượng là cấu hình vận hành kế thừa, không phả
 được tài liệu mới quy định. Có thể đổi qua `eye_options`, `mouth_options`,
 `nod_duration_ms`; các ngưỡng gật và giới hạn góc cũng là tham số constructor.
 Ngưỡng phân nhóm thời lượng 400/800 ms khác với giới hạn xác nhận sự kiện.
+
+Mặc định được đồng bộ với `OptimalAlgorithsm/DataSystem`: 30 FPS, cửa sổ
+60 giây, ngáp tối thiểu 4 giây và gật tối thiểu 0,8 giây. Khởi tạo HMM
+5 giây thay cho 15 giây giúp dành khoảng 55/60 giây đầu cho số đo mắt/miệng,
+đủ điều kiện coverage 80% nếu tín hiệu liên tục. FFT vẫn cần đủ 60 giây
+liên tục sau hiệu chuẩn đầu; giảm thời gian HMM không bỏ điều kiện này.
+Đây là cấu hình vận hành, chưa phải kết quả tối ưu hóa trên dữ liệu gán nhãn.
 
 ### Thuộc tính cấu hình ảnh hưởng đến độ chính xác
 
@@ -197,7 +204,7 @@ Nguồn: [StateMachine](temporal_metrics.py), [CameraMetrics](camera_metrics.py)
 
 | Thuộc tính | Mặc định | Ảnh hưởng |
 | --- | --- | --- |
-| `min_duration_ms` | Mắt: 100 ms; miệng: 3500 ms | Thời lượng tối thiểu để đếm sự kiện; tăng sẽ loại sự kiện ngắn nhưng có thể bỏ sót sự kiện thật. |
+| `min_duration_ms` | Mắt: 100 ms; miệng: 4000 ms | Thời lượng tối thiểu để đếm sự kiện; tăng sẽ loại sự kiện ngắn nhưng có thể bỏ sót sự kiện thật. |
 | `max_duration_ms` | Mắt: 2000 ms; miệng: 7500 ms | Thời lượng tối đa để đếm sự kiện; vượt giới hạn sẽ không được tính vào bộ đếm. |
 | `nod_duration_ms` | `(800, 3500)` ms | Cặp thời lượng tối thiểu/tối đa cho gật đầu, truyền trực tiếp vào `CameraMetrics`. |
 | `max_gap_sec` | 0.25 giây | Khoảng cách tối đa giữa hai mẫu; vượt ngưỡng ngắt sự kiện, loại khoảng trống khỏi tỷ lệ và xóa chuỗi FFT liên tục. |
@@ -220,7 +227,7 @@ Cửa sổ ngắn phản ứng nhanh nhưng dao động nhiều; cửa sổ dài
 nhưng phản ánh thay đổi chậm hơn. Tần suất dùng toàn bộ chiều dài cửa sổ
 làm mẫu số ngay từ đầu, nên lúc mới chạy có thể thấp hơn nhịp sự kiện thực tế.
 `head_motion` mặc định 60 giây khi dùng `CameraMetrics`; lớp
-`HeadMotionWindow` dùng độc lập mặc định 20 giây.
+`HeadMotionWindow` dùng độc lập cũng mặc định 60 giây.
 
 #### Hiệu chuẩn và chuyển động đầu
 

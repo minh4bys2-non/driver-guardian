@@ -2,7 +2,7 @@ from collections import deque
 
 import numpy as np
 
-from ai.PhysicalBranch.temporal_metrics import StateMachine, WindowRatio
+from ai.PhysicalBranch.temporal_metrics import StateMachine, WindowRatio, positive_seconds
 
 
 class AdaptiveHMM:
@@ -21,7 +21,9 @@ class AdaptiveHMM:
 
         if n_states != 2 or not 0 < learning_rate <= 1:
             raise ValueError("HMM requires two states and 0 < learning_rate <= 1")
-        if adapt_interval < 2 or min_variance <= 0 or em_iterations < 1:
+        if (type(adapt_interval) is not int or adapt_interval < 2
+                or type(em_iterations) is not int or em_iterations < 1
+                or not np.isfinite(min_variance) or min_variance <= 0):
             raise ValueError("Invalid adaptation parameters")
         self.n_states = int(n_states)
         self.learning_rate = float(learning_rate)
@@ -78,6 +80,8 @@ class AdaptiveHMM:
         if not self.initialized:
             return False
 
+        if not np.isfinite(value):
+            raise ValueError("Observation must be finite")
         self.buffer.append(float(value))
         if len(self.buffer) < self.adapt_interval:
             return False
@@ -200,11 +204,13 @@ class AdaptiveHMM:
 
 class AdaptiveHMM_FSM:
 
-    def __init__(self, mode="eye", fps=30, init_duration_sec=15, window_size_sec=60,
+    def __init__(self, mode="eye", fps=30, init_duration_sec=5, window_size_sec=60,
                  min_duration_ms=None, max_duration_ms=None, max_gap_sec=0.25,
                  learning_rate=0.01, adapt_interval=300, ratio_window_sec=None):
-        if mode not in ("eye", "mouth", "pitch") or fps <= 0 or init_duration_sec <= 0:
+        if mode not in ("eye", "mouth", "pitch"):
             raise ValueError("Invalid detector configuration")
+        fps = positive_seconds(fps)
+        init_duration_sec = positive_seconds(init_duration_sec)
         self.mode, self.fps = mode, fps
         self.init_frames = max(4, round(fps * init_duration_sec))
         self.hmm = AdaptiveHMM(positive_state="low" if mode == "eye" else "high",
@@ -244,16 +250,15 @@ class AdaptiveHMM_FSM:
         self.samples.clear()
 
     def process(self, value, timestamp=None):
-        if timestamp is not None:
-            timestamp = float(timestamp)
-            if not np.isfinite(timestamp) or (self.fsm.time is not None and timestamp <= self.fsm.time):
-                raise ValueError("Timestamps must be finite and strictly increasing")
-            if self.fsm.time is not None and timestamp - self.fsm.time > self.fsm.max_gap:
-                self.hmm.posterior = None
-                self.hmm.buffer.clear()
+        timestamp = (0 if self.fsm.time is None else self.fsm.time + 1 / self.fps) if timestamp is None else float(timestamp)
+        if not np.isfinite(timestamp) or (self.fsm.time is not None and timestamp <= self.fsm.time):
+            raise ValueError("Timestamps must be finite and strictly increasing")
+        if self.fsm.time is not None and timestamp - self.fsm.time > self.fsm.max_gap:
+            self.hmm.posterior = None
+            self.hmm.buffer.clear()
         try:
             value = float(value)
-            if not np.isfinite(value):
+            if not np.isfinite(value) or (self.mode != "pitch" and value < 0):
                 value = None
         except (TypeError, ValueError):
             value = None

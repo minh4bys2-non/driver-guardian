@@ -13,7 +13,7 @@ class StateMachine:
 
     def __init__(self, mode="eye", fps=30, window_size_sec=60,
                  min_duration_ms=None, max_duration_ms=None, max_gap_sec=0.25):
-        limits = {"eye": (100, 2000), "mouth": (3500, 7500), "pitch": (800, 3500)}
+        limits = {"eye": (100, 2000), "mouth": (4000, 7500), "pitch": (800, 3500)}
         if mode not in limits:
             raise ValueError("Invalid FSM configuration")
         self.mode = mode
@@ -108,7 +108,7 @@ class WindowRatio:
 class HeadMotionWindow:
     """Thống kê pitch tương đối; FFT chỉ dùng cửa sổ đầy, liên tục."""
 
-    def __init__(self, window_sec=20, max_gap_sec=0.25, min_amplitude_deg=0.1):
+    def __init__(self, window_sec=60, max_gap_sec=0.25, min_amplitude_deg=0.1):
         self.window = positive_seconds(window_sec)
         self.max_gap = positive_seconds(max_gap_sec)
         if not np.isfinite(min_amplitude_deg) or min_amplitude_deg < 0:

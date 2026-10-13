@@ -6,7 +6,7 @@ from unittest.mock import patch
 import cv2
 import numpy as np
 
-from ai.PhysicalBranch.adaptive_hmm_fsm import AdaptiveHMM_FSM
+from ai.PhysicalBranch.adaptive_hmm_fsm import AdaptiveHMM, AdaptiveHMM_FSM
 from ai.PhysicalBranch.brand import normalize_metrics
 from ai.PhysicalBranch.camera_metrics import CameraMetrics
 from ai.PhysicalBranch.head_pose_estimation import HeadPoseEstimator
@@ -15,6 +15,16 @@ from ai.PhysicalBranch.temporal_metrics import HeadMotionWindow, StateMachine, W
 
 
 class TemporalTests(unittest.TestCase):
+    def test_default_yawn_duration_matches_data_pipeline(self):
+        for duration, expected in ((3.9, False), (4.0, True), (7.5, True), (7.6, False)):
+            with self.subTest(duration=duration):
+                fsm = StateMachine('mouth')
+                fsm.process(0, 0)
+                for i in range(round(duration * 10)):
+                    fsm.process(1, (i + 1) / 10)
+                result = fsm.process(0, duration + .1)
+                self.assertEqual(result['event_done'], expected)
+
     def test_complete_cycles_and_window_expiry(self):
         fsm = StateMachine('eye', window_size_sec=2)
         fsm.process(1, 0)
@@ -82,7 +92,69 @@ class TemporalTests(unittest.TestCase):
                     metric.process(0, timestamp)
 
 
+class DetectorTests(unittest.TestCase):
+    def test_default_warmup_allows_eighty_percent_coverage(self):
+        detector = AdaptiveHMM_FSM()
+        for i in range(1800):
+            result = detector.process(.3, i / 30)
+        self.assertEqual(detector.init_frames, 150)
+        self.assertGreaterEqual(result['observed_seconds'], 60 * .8)
+        self.assertEqual(result['perclos'], 0)
+
+    def test_implicit_timeline_clears_hmm_at_gaps(self):
+        implicit = AdaptiveHMM_FSM(fps=2, init_duration_sec=2)
+        explicit = AdaptiveHMM_FSM(fps=2, init_duration_sec=2)
+        for i, value in enumerate((.3, .3, .3, .3, .06, .3)):
+            self.assertEqual(implicit.process(value), explicit.process(value, i / 2))
+        self.assertEqual(len(implicit.hmm.buffer), 1)
+
+    def test_invalid_ratios_do_not_calibrate_or_complete_events(self):
+        for mode in ('eye', 'mouth'):
+            with self.subTest(mode=mode):
+                detector = AdaptiveHMM_FSM(mode, fps=10, init_duration_sec=.4)
+                for i in range(4):
+                    self.assertTrue(detector.process(-.1, i / 10)['signal_missing'])
+                self.assertFalse(detector.initialized)
+                self.assertFalse(detector.samples)
+                for i in range(4, 8):
+                    detector.process(.3, i / 10)
+                self.assertTrue(detector.initialized)
+                self.assertIsNone(detector.process(-.1, .8)['state'])
+                self.assertIsNone(detector.hmm.posterior)
+
+    def test_invalid_initialization_is_rejected(self):
+        for name in ('fps', 'init_duration_sec'):
+            for value in (0, -1, float('nan'), float('inf'), True):
+                with self.subTest(name=name, value=value), self.assertRaises(ValueError):
+                    AdaptiveHMM_FSM(**{name: value})
+        for options in ({'adapt_interval': 2.5}, {'adapt_interval': True},
+                        {'em_iterations': 1.5}, {'em_iterations': True},
+                        {'min_variance': float('nan')}, {'min_variance': float('inf')}):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                AdaptiveHMM(**options)
+
+    def test_invalid_online_observation_preserves_model(self):
+        detector = AdaptiveHMM_FSM(fps=10, init_duration_sec=.4)
+        for _ in range(4):
+            detector.process(.3)
+        saved = list(detector.hmm.buffer)
+        means = detector.hmm.means.copy()
+        for value in (float('nan'), float('inf')):
+            with self.assertRaises(ValueError):
+                detector.hmm.update_online(value)
+            self.assertEqual(list(detector.hmm.buffer), saved)
+            np.testing.assert_array_equal(detector.hmm.means, means)
+
+
 class MotionTests(unittest.TestCase):
+    def test_default_fft_waits_for_full_minute(self):
+        motion = HeadMotionWindow()
+        for t in np.linspace(0, 60, 601):
+            result = motion.process(5 * np.sin(2 * np.pi * .1 * t), t)
+            if t < 60:
+                self.assertIsNone(result['head_motion_frequency_hz'])
+        self.assertAlmostEqual(result['head_motion_frequency_hz'], .1, delta=.002)
+
     def test_mean_amplitude_integrates_zero_crossing(self):
         motion = HeadMotionWindow(.1)
         motion.process(-10, 0)
@@ -125,6 +197,41 @@ class MotionTests(unittest.TestCase):
 
 
 class PipelineTests(unittest.TestCase):
+    def test_invalid_camera_configuration_fails_before_tracking(self):
+        options = [
+            {'calibration_frames': value} for value in (0, 1.5, True, float('nan'), float('inf'))
+        ]
+        options += [{name: value} for name in ('detection_confidence', 'tracking_confidence')
+                    for value in (-.1, 1.1, float('nan'), float('inf'))]
+        options += [{'nod_duration_ms': value} for value in ((), (800,), (800, 3500, 4000))]
+        options.append({'nod_direction': True})
+        for config in options:
+            with self.subTest(config=config), self.assertRaises(ValueError):
+                CameraMetrics(**config)
+
+    def test_invalid_run_configuration_does_not_open_camera(self):
+        with patch('cv2.VideoCapture') as capture:
+            for config in ({'output_interval_sec': float('nan')},
+                           {'output_interval_sec': float('inf')},
+                           {'max_frames': 1.5}, {'max_frames': True}):
+                with self.subTest(config=config), self.assertRaises(ValueError):
+                    CameraMetrics().run(**config)
+            capture.assert_not_called()
+
+    def test_invalid_camera_geometry_is_rejected(self):
+        for value in (float('nan'), float('inf'), 0):
+            with self.assertRaises(ValueError):
+                HeadPoseEstimator(value, 480)
+        for matrix in (np.zeros((3, 3)), np.diag([-1, 1, 1]), np.diag([1, 1, 2])):
+            with self.assertRaises(ValueError):
+                HeadPoseEstimator(640, 480, camera_matrix=matrix)
+        for distortion in (np.zeros(3), np.zeros((2, 2)), np.full(4, float('nan'))):
+            with self.assertRaises(ValueError):
+                HeadPoseEstimator(640, 480, distortion_coeffs=distortion)
+        for shape in ((5,), (1, 5), (5, 1)):
+            estimator = HeadPoseEstimator(640, 480, distortion_coeffs=np.zeros(shape))
+            self.assertEqual(estimator.distortion.shape, shape)
+
     def test_eye_mouth_pipeline_with_independent_windows(self):
         monitor = CameraMetrics(fps=10, window_sec=4, calibration_frames=1,
                                 windows={'yawn': 2, 'perclos': 1},

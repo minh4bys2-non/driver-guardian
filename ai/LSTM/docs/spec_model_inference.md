@@ -483,3 +483,60 @@ def predict_video_file(video_path: str, model: ModelInference, sample_fps: int =
    - $\text{Score} < 0.35$: Trạng thái bình thường (Normal).
    - $0.35 \le \text{Score} < 0.65$: Cảnh báo mức nhẹ (Mệt mỏi tiềm ẩn / Buồn ngủ giai đoạn đầu) $\rightarrow$ hiển thị biểu tượng nhắc nhở trên màn hình táp-lô.
    - $\text{Score} \ge 0.65$: Báo động nguy hiểm (Ngủ gật / Nhắm mắt kéo dài) $\rightarrow$ phát chuông cảnh báo âm lượng lớn và rung vô lăng.
+
+---
+
+## 9. ĐỘNG CƠ SUY LUẬN TỐI ƯU CÓ BỘ ĐỆM CACHE (MODELINFERENCECACHE)
+
+- **Tệp nguồn thực thi**: [`model_inference_cache.py`](file:///D:/Project/DATN/driver-guardian/ai/LSTM/model_inference_cache.py)
+- **Tài liệu phân tích**: [`docs/analsys/analsys_cache_sliding_window.md`](file:///D:/Project/DATN/driver-guardian/ai/LSTM/docs/analsys/analsys_cache_sliding_window.md)
+- **Tài liệu kế hoạch**: [`docs/plan/plan_cache_sliding_window.md`](file:///D:/Project/DATN/driver-guardian/ai/LSTM/docs/plan/plan_cache_sliding_window.md)
+
+### 9.1. Động lực và Nguyên lý Tối ưu
+Khi camera nạp dữ liệu với chu kỳ $0.2\,\text{s}$ ($5\,\text{FPS}$) và cửa sổ trượt $50$ frame:
+- Nếu chạy toàn bộ 50 frame qua CNN ở mỗi bước, hệ thống lãng phí $98\%$ tính toán và độ trễ đạt $\approx 770\,\text{ms}$ (> $200\,\text{ms}$, gây trễ hệ thống).
+- Lớp [`ModelInferenceCache`](file:///D:/Project/DATN/driver-guardian/ai/LSTM/model_inference_cache.py) tích hợp [`SlidingWindowFeatureCache`](file:///D:/Project/DATN/driver-guardian/ai/LSTM/model_inference_cache.py) để lưu trữ đặc trưng không gian đa tỷ lệ $(P_3, P_4, P_5)$ trên GPU.
+- **Cơ chế kiểm tra tự động nhiều frame mới ($k > 1$)**: Sử dụng chữ ký frame và grid sampling để tự động xác định $k$ frame mới trong $O(1)$, chỉ trích xuất CNN cho $k$ frame mới và tái sử dụng $50 - k$ frame cũ từ cache.
+
+### 9.2. Bảng chỉ số thực nghiệm đo được trên NVIDIA RTX 3050 Laptop GPU
+
+| Phương thức suy luận | Khối lượng chạy CNN | Latency thực tế | Throughput | Tỷ lệ tăng tốc | Khả năng Real-time (Chu kỳ 200ms) |
+|---|---|---|---|---|---|
+| **Không Cache (`ModelInference`)** | 50 frames | **$769.40\,\text{ms}$** | $\approx 1.3\,\text{FPS}$ | Baseline | **Bị trễ 100% ($> 200\,\text{ms}$)** |
+| **Có Cache `predict_window` ($k=1$)** | 1 frame | **$156.36\,\text{ms}$** | $\approx 6.4\,\text{FPS}$ | **$4.9\times$** | **ĐẠT THỜI GIAN THỰC** |
+| **Có Cache `predict_step` (Streaming)** | 1 frame | **$81.76\,\text{ms}$** | $\approx 12.2\,\text{FPS}$ | **$9.4\times$** | **ĐẠT VƯỢT TRỘI ($81.7\,\text{ms} \ll 200\,\text{ms}$)** |
+
+- **Tính tương đương toán học**: Sai số tuyệt đối giữa có cache và không cache bằng **$0.00000000$** (chính xác 100%).
+- **Dung lượng VRAM Cache**: Chỉ **$136.72\,\text{MB}$** VRAM cho 50 frames.
+
+### 9.3. Hướng dẫn sử dụng nhanh API
+
+```python
+from model_inference_cache import ModelInferenceCache
+import cv2
+
+# Khởi tạo mô hình có cache
+model = ModelInferenceCache.from_checkpoint(
+    cnn_path=r"D:\Project\DATN\driver-guardian\ai\checkpoints\model_cnn\best.pt",
+    conv_gru_path=r"D:\Project\DATN\driver-guardian\ai\checkpoints\model_convgru\best.pt",
+    window_size=50,
+    enable_cache=True
+)
+
+# Chế độ 1: Streaming camera trực tiếp (Mỗi 0.2s nhận 1 frame từ cv2.VideoCapture)
+cap = cv2.VideoCapture(0)
+while cap.isOpened():
+    ret, frame_bgr = cap.read()
+    if not ret:
+        break
+    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB) # [H, W, 3]
+    
+    # Nạp 1 frame và nhận kết quả tức thì (~81ms)
+    score = model.predict_step(frame_rgb)
+    if score is not None and score >= 0.65:
+        print(f"[CẢNH BÁO] Phát hiện buồn ngủ: {score * 100:.1f}%")
+
+# Chế độ 2: Xử lý cửa sổ trượt 50 frames với cơ chế tự động dò tìm k frame mới
+score = model.predict_window(sliding_window_50)
+```
+

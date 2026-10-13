@@ -79,7 +79,7 @@ optimizer:
   # Tổng số epoch huấn luyện
   epochs: 20
   # Learning rate khởi tạo
-  lr0: 0.00001
+  lr0: 0.001
   # Tỷ lệ lr tối thiểu: lr_min = lr0 * lr_min_factor (1e-5)
   lr_min_factor: 0.01
   # Hệ số phạt L2 Regularization (Weight Decay)

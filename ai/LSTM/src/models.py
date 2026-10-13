@@ -57,11 +57,11 @@ class SpatialReductionNeck(nn.Module):
     """
 
     def __init__(
-        self,
-        in_channels: Union[Tuple[Tuple[int, ...], ...], Tuple[int, ...]] = (64, 128, 256),
-        out_channels: int = 64,
-        dropout: float = 0.1,
-        target_size: Tuple[int, int] = (40, 40)
+            self,
+            in_channels: Union[Tuple[Tuple[int, ...], ...], Tuple[int, ...]] = (64, 128, 256),
+            out_channels: int = 64,
+            dropout: float = 0.1,
+            target_size: Tuple[int, int] = (40, 40)
     ):
         super().__init__()
         if len(in_channels) > 0 and isinstance(in_channels[0], (tuple, list)):
@@ -94,23 +94,24 @@ class SpatialReductionNeck(nn.Module):
         )
 
     def _align_features(
-        self,
-        p3: torch.Tensor,
-        p4: torch.Tensor,
-        p5: torch.Tensor
+            self,
+            p3: torch.Tensor,
+            p4: torch.Tensor,
+            p5: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Căn chỉnh kích thước không gian của 3 mức về lưới target_size."""
         th, tw = self.target_size
         out_p3 = self.p3_down(p3) if p3.shape[-2:] != (th, tw) else p3
-        out_p4 = p4 if p4.shape[-2:] == (th, tw) else F.interpolate(p4, size=(th, tw), mode="bilinear", align_corners=False)
+        out_p4 = p4 if p4.shape[-2:] == (th, tw) else F.interpolate(p4, size=(th, tw), mode="bilinear",
+                                                                    align_corners=False)
         out_p5 = self.p5_up(p5) if p5.shape[-2:] != (th, tw) else p5
         return out_p3, out_p4, out_p5
 
     def forward(
-        self,
-        features: Union[Tuple[torch.Tensor, ...], List[torch.Tensor], torch.Tensor],
-        seq_lens: Optional[torch.Tensor] = None,
-        *args: torch.Tensor
+            self,
+            features: Union[Tuple[torch.Tensor, ...], List[torch.Tensor], torch.Tensor],
+            seq_lens: Optional[torch.Tensor] = None,
+            *args: torch.Tensor
     ) -> torch.Tensor:
         """
         Lan truyền xuôi của cổ giảm kênh.
@@ -143,22 +144,24 @@ class SpatialReductionNeck(nn.Module):
 
             out_p3, out_p4, out_p5 = self._align_features(p3, p4, p5)
             fused = torch.cat([out_p3, out_p4, out_p5], dim=1)  # [N, total_in, 40, 40]
-            
+
             if is_5d and seq_lens is not None:
                 time_indices = torch.arange(orig_t, device=fused.device).unsqueeze(0)  # [1, T]
-                lens_expanded = seq_lens.to(fused.device).unsqueeze(1)                 # [B, 1]
-                mask = (time_indices < lens_expanded).view(-1)                         # [B*T]
-                
+                lens_expanded = seq_lens.to(fused.device).unsqueeze(1)  # [B, 1]
+                mask = (time_indices < lens_expanded).view(-1)  # [B*T]
+
                 valid_fused = fused[mask]  # [N_valid, total_in, 40, 40]
                 if valid_fused.numel() > 0:
                     valid_reduced = self.reduction(valid_fused)
                 else:
-                    valid_reduced = torch.empty((0, self.out_channels, self.target_size[0], self.target_size[1]), device=fused.device, dtype=fused.dtype)
-                
-                reduced = torch.zeros((orig_b * orig_t, self.out_channels, self.target_size[0], self.target_size[1]), device=fused.device, dtype=fused.dtype)
+                    valid_reduced = torch.empty((0, self.out_channels, self.target_size[0], self.target_size[1]),
+                                                device=fused.device, dtype=fused.dtype)
+
+                reduced = torch.zeros((orig_b * orig_t, self.out_channels, self.target_size[0], self.target_size[1]),
+                                      device=fused.device, dtype=fused.dtype)
                 reduced[mask] = valid_reduced.to(reduced.dtype)
             else:
-                reduced = self.reduction(fused)                     # [N, out_channels, 40, 40]
+                reduced = self.reduction(fused)  # [N, out_channels, 40, 40]
 
             if is_5d:
                 reduced = reduced.view(orig_b, orig_t, self.out_channels, *reduced.shape[-2:])
@@ -178,14 +181,17 @@ class SpatialReductionNeck(nn.Module):
                     time_indices = torch.arange(orig_t, device=feat.device).unsqueeze(0)
                     lens_expanded = seq_lens.to(feat.device).unsqueeze(1)
                     mask = (time_indices < lens_expanded).view(-1)
-                    
+
                     valid_feat = feat[mask]
                     if valid_feat.numel() > 0:
                         valid_reduced = self.reduction(valid_feat)
                     else:
-                        valid_reduced = torch.empty((0, self.out_channels, self.target_size[0], self.target_size[1]), device=feat.device, dtype=feat.dtype)
-                        
-                    reduced = torch.zeros((orig_b * orig_t, self.out_channels, self.target_size[0], self.target_size[1]), device=feat.device, dtype=feat.dtype)
+                        valid_reduced = torch.empty((0, self.out_channels, self.target_size[0], self.target_size[1]),
+                                                    device=feat.device, dtype=feat.dtype)
+
+                    reduced = torch.zeros(
+                        (orig_b * orig_t, self.out_channels, self.target_size[0], self.target_size[1]),
+                        device=feat.device, dtype=feat.dtype)
                     reduced[mask] = valid_reduced.to(reduced.dtype)
                 else:
                     reduced = self.reduction(feat)
@@ -232,10 +238,10 @@ class SpatialAttentionPooling(nn.Module):
         )
 
     def forward(
-        self,
-        x: torch.Tensor,
-        seq_lens: Optional[torch.Tensor] = None,
-        return_weights: bool = False
+            self,
+            x: torch.Tensor,
+            seq_lens: Optional[torch.Tensor] = None,
+            return_weights: bool = False
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Args:
@@ -264,14 +270,15 @@ class SpatialAttentionPooling(nn.Module):
             time_indices = torch.arange(orig_t, device=x.device).unsqueeze(0)
             lens_expanded = seq_lens.to(x.device).unsqueeze(1)
             mask = (time_indices < lens_expanded).view(-1)
-            
+
             valid_x = x_reshaped[mask]
             if valid_x.numel() > 0:
                 valid_scores = self.attn_conv(valid_x)
             else:
                 valid_scores = torch.empty((0, 1, h, w), device=x.device, dtype=x.dtype)
-                
-            scores = torch.full((orig_b * orig_t, 1, h, w), fill_value=-1e9 if x.dtype == torch.float32 else -1e4, device=x.device, dtype=x.dtype)
+
+            scores = torch.full((orig_b * orig_t, 1, h, w), fill_value=-1e9 if x.dtype == torch.float32 else -1e4,
+                                device=x.device, dtype=x.dtype)
             scores[mask] = valid_scores.to(scores.dtype)
         else:
             scores = self.attn_conv(x_reshaped)
@@ -310,9 +317,9 @@ class TemporalAttentionPooling(nn.Module):
         )
 
     def forward(
-        self,
-        seq_features: torch.Tensor,
-        seq_lens: Optional[torch.Tensor] = None
+            self,
+            seq_features: torch.Tensor,
+            seq_lens: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
@@ -327,8 +334,8 @@ class TemporalAttentionPooling(nn.Module):
 
         if seq_lens is not None:
             time_indices = torch.arange(t, device=seq_features.device).unsqueeze(0)  # [1, T]
-            lens_expanded = seq_lens.to(seq_features.device).unsqueeze(1)            # [B, 1]
-            mask = (time_indices < lens_expanded)                                    # [B, T]
+            lens_expanded = seq_lens.to(seq_features.device).unsqueeze(1)  # [B, 1]
+            mask = (time_indices < lens_expanded)  # [B, T]
             fill_value = -1e4 if scores.dtype == torch.float16 else -1e9
             scores = scores.masked_fill(~mask, fill_value)
 
@@ -352,17 +359,18 @@ class ConvGRUClassifier(nn.Module):
     """
 
     def __init__(
-        self,
-        input_dim: int = 64,
-        hidden_dim: Union[int, List[int], Tuple[int, ...]] = 64,
-        num_layers: int = 2,
-        kernel_size: Union[int, Tuple[int, int]] = 3,
-        num_classes: int = 2,
-        spatial_in_channels: Tuple[int, ...] = (64, 128, 256),
-        neck_dropout: float = 0.1,
-        convgru_dropout: float = 0.1,
-        dropout: float = 0.35,
-        supervision_mode: str = "attention_pooling"
+            self,
+            input_dim: int = 64,
+            hidden_dim: Union[int, List[int], Tuple[int, ...]] = 64,
+            num_layers: int = 2,
+            kernel_size: Union[int, Tuple[int, int]] = 3,
+            num_classes: int = 2,
+            spatial_in_channels: Tuple[int, ...] = (64, 128, 256),
+            target_size: Tuple = (40, 40),
+            neck_dropout: float = 0.1,
+            convgru_dropout: float = 0.1,
+            dropout: float = 0.35,
+            supervision_mode: str = "attention_pooling"
     ):
         """
         Khởi tạo SpatioTemporalConvGRUClassifier.
@@ -384,7 +392,7 @@ class ConvGRUClassifier(nn.Module):
         self.num_layers = int(num_layers)
         self.num_classes = int(num_classes)
         self.supervision_mode = supervision_mode.lower()
-
+        self.target_size = target_size
         # Chuẩn hóa hidden_dims
         if isinstance(hidden_dim, (list, tuple)):
             self.hidden_dims = [int(h) for h in hidden_dim]
@@ -396,7 +404,8 @@ class ConvGRUClassifier(nn.Module):
         self.spatial_neck = SpatialReductionNeck(
             in_channels=spatial_in_channels,
             out_channels=self.input_dim,
-            dropout=neck_dropout
+            dropout=neck_dropout,
+            target_size=self.target_size
         )
 
         # 2. Khối chuỗi không gian - thời gian (Spatio-Temporal ConvGRU)
@@ -468,9 +477,9 @@ class ConvGRUClassifier(nn.Module):
 
     @classmethod
     def from_checkpoint(
-        cls,
-        checkpoint_path: Union[str, Path],
-        map_location: str = "cpu"
+            cls,
+            checkpoint_path: Union[str, Path],
+            map_location: str = "cpu"
     ) -> "ConvGRUClassifier":
         """
         Khởi tạo mô hình và nạp trọng số từ checkpoint .pt/.pth.
@@ -495,7 +504,8 @@ class ConvGRUClassifier(nn.Module):
             hid_dim = 64
 
         # Đếm số tầng ConvGRU
-        layer_keys = {int(k.split(".")[2]) for k in state_dict if k.startswith("convgru.cells.") and k.split(".")[2].isdigit()}
+        layer_keys = {int(k.split(".")[2]) for k in state_dict if
+                      k.startswith("convgru.cells.") and k.split(".")[2].isdigit()}
         num_layers = len(layer_keys) if layer_keys else 2
         num_classes = int(cfg_dict.get("num_classes", 2))
         spatial_in = cfg_dict.get("cnn_neck_channels", (64, 128, 256))
@@ -515,14 +525,14 @@ class ConvGRUClassifier(nn.Module):
         return model
 
     def forward(
-        self,
-        features: Union[Tuple[torch.Tensor, ...], List[torch.Tensor], torch.Tensor],
-        seq_lens: Optional[torch.Tensor] = None,
-        hidden_state: Optional[List[torch.Tensor]] = None,
-        return_sequence: bool = False,
-        return_weights: bool = False,
-        return_state: bool = False,
-        *args: torch.Tensor
+            self,
+            features: Union[Tuple[torch.Tensor, ...], List[torch.Tensor], torch.Tensor],
+            seq_lens: Optional[torch.Tensor] = None,
+            hidden_state: Optional[List[torch.Tensor]] = None,
+            return_sequence: bool = False,
+            return_weights: bool = False,
+            return_state: bool = False,
+            *args: torch.Tensor
     ) -> Union[torch.Tensor, Tuple[Any, ...]]:
         """
         Lan truyền xuôi toàn bộ mô hình.
@@ -584,11 +594,11 @@ class ConvGRUClassifier(nn.Module):
                 logits = logits * mask.to(logits.dtype)
             temporal_weights = None
             if is_single_frame:
-                logits = logits.squeeze(1)    # [B, num_classes]
+                logits = logits.squeeze(1)  # [B, num_classes]
         else:
             # Chế độ Clip-level chuẩn (Temporal Attention Pooling qua thời gian T)
             pooled, temporal_weights = self.temporal_pooling(t_features, seq_lens=seq_lens)
-            logits = self.fc_out(pooled)      # [B, num_classes]
+            logits = self.fc_out(pooled)  # [B, num_classes]
 
         # 5. Đóng gói kết quả đầu ra
         outputs = [logits]
@@ -674,7 +684,7 @@ if __name__ == "__main__":
         padding_weights_sample0 = t_weights[0, 3:].sum().item()
         assert padding_weights_sample0 < 1e-4, f"Lỗi: Frame padding nhận trọng số lớn hơn 0: {padding_weights_sample0}"
         print(f"  --> Trọng số chú ý tại các frame padding của mẫu 0: {padding_weights_sample0:.6f} (~0.0) [PASS]")
-        
+
         # Test sequence mode masking
         out_seq_masked = model(
             (p3_pad, p4_pad, p5_pad),
@@ -765,9 +775,9 @@ if __name__ == "__main__":
     temporal_pool_params = sum(p.numel() for p in model.temporal_pooling.parameters() if p.requires_grad)
     fc_params = sum(p.numel() for p in model.fc_out.parameters() if p.requires_grad)
 
-    print(f"  --> Tổng tham số SpatioTemporalConvGRUClassifier: {total_params:,} ({total_params/1e6:.3f} M)")
-    print(f"      + SpatialReductionNeck : {neck_params:,} tham số ({neck_params/total_params*100:.1f}%)")
-    print(f"      + ConvGRU Core (2 tầng): {convgru_params:,} tham số ({convgru_params/total_params*100:.1f}%)")
+    print(f"  --> Tổng tham số SpatioTemporalConvGRUClassifier: {total_params:,} ({total_params / 1e6:.3f} M)")
+    print(f"      + SpatialReductionNeck : {neck_params:,} tham số ({neck_params / total_params * 100:.1f}%)")
+    print(f"      + ConvGRU Core (2 tầng): {convgru_params:,} tham số ({convgru_params / total_params * 100:.1f}%)")
     print(f"      + SpatialAttentionPool : {spatial_pool_params:,} tham số")
     print(f"      + TemporalAttentionPool: {temporal_pool_params:,} tham số")
     print(f"      + Classification Head  : {fc_params:,} tham số")

@@ -58,6 +58,7 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import numpy as np
 import pandas as pd
 import matplotlib
+
 matplotlib.use("Agg")  # Chế độ headless an toàn cho máy chủ / nền tảng không có GUI
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -96,7 +97,7 @@ class EvalBenchmarkConfig:
     # Trọng số CNN Backbone/PAFPN của NMSFreeDetector
     cnn_checkpoint_path: str = r"D:\Project\DATN\driver-guardian\ai\checkpoints\model_cnn\best.pt"
     # Trọng số Spatio-Temporal ConvGRUClassifier
-    conv_gru_checkpoint_path: str = r"D:\Project\DATN\driver-guardian\ai\checkpoints\model_convgru\best.pt"
+    conv_gru_checkpoint_path: str = r"D:\Project\DATN\driver-guardian\ai\LSTM\checkpoints\1m9\epoch_10.pt"
     # Kích thước chunk chia nhỏ khung hình khi trích xuất đặc trưng Backbone (chống tràn VRAM)
     chunk_size: int = 32
     # Thiết bị tính toán ('cuda' nếu có GPU NVIDIA, tự động fallback sang 'cpu')
@@ -104,11 +105,11 @@ class EvalBenchmarkConfig:
 
     # ---- 2. CẤU HÌNH BỘ DỮ LIỆU TÙY CHỌN (DATASET FLEXIBILITY) ----
     # Thư mục gốc chứa bộ dữ liệu video (người dùng tự do trỏ đến bất kỳ dataset nào)
-    dataset_dir: str = r"E:\LSTM\data_processed"
+    dataset_dir: str = r"E:\LSTM\UL-DD_Processed"
     # Tệp manifest CSV chứa danh sách video clip, nhãn và trường phân chia split (None nếu quét thư mục)
     manifest_file: Optional[str] = "dataset_merged_split.csv"
     # Lựa chọn tập kiểm định: 'val', 'test', 'train', hoặc 'all'
-    split: str = "val"
+    split: str = "test"
     # Bộ lọc nguồn dữ liệu con: 'all', 'ul-dd', 'uta-rldd', 'sust', ...
     dataset_source: str = "all"
     # Khoảng thời gian (giây) giữa các khung hình lấy mẫu (0.2s tương đương 5.0 FPS)
@@ -126,7 +127,7 @@ class EvalBenchmarkConfig:
     # Bật/tắt benchmark tốc độ quét qua các độ dài chuỗi cố định
     run_synthetic_speed_benchmark: bool = True
     # Danh sách các độ dài chuỗi cần khảo sát tốc độ (ngắn đến dài)
-    benchmark_seq_lengths: Tuple[int, ...] = (8, 16, 24, 32, 48, 64, 96, 128)
+    benchmark_seq_lengths: Tuple[int, ...] = (10, 20, 30, 40, 50, 70, 90, 125)
     # Kích thước khung hình chuẩn dùng cho kiểm thử tốc độ
     benchmark_img_size: int = 640
     # Số lượt chạy khởi động GPU làm ấm cache (warm-up)
@@ -145,7 +146,7 @@ class EvalBenchmarkConfig:
     seed: int = 42
 
     # ---- 5. THƯ MỤC LƯU TRỮ & TRỰC QUAN HÓA ----
-    output_dir: str = "logs/benchmark_val_SUST"
+    output_dir: str = "logs/benchmark_test_UL-DD"
     plot_confusion_matrix: bool = True
     plot_speed_curves: bool = True
     plot_roc_pr: bool = True
@@ -304,11 +305,11 @@ def build_benchmark_dataset(config: EvalBenchmarkConfig) -> Optional[RawVideoFra
 # 4. ĐỘNG CƠ TÍNH TOÁN HỆ THỐNG CHỈ SỐ (METRICS ENGINE)
 # ==============================================================================
 def compute_benchmark_classification_metrics(
-    targets: np.ndarray,
-    preds: np.ndarray,
-    probs: Optional[np.ndarray] = None,
-    num_classes: int = 2,
-    beta: float = 2.0,
+        targets: np.ndarray,
+        preds: np.ndarray,
+        probs: Optional[np.ndarray] = None,
+        num_classes: int = 2,
+        beta: float = 2.0,
 ) -> Dict[str, Any]:
     """
     Tính toán đầy đủ hệ thống chỉ số phân loại nhị phân:
@@ -336,7 +337,8 @@ def compute_benchmark_classification_metrics(
     per_class_rec = recall_score(targets, preds, average=None, labels=list(range(num_classes)), zero_division=0)
     per_class_prec = precision_score(targets, preds, average=None, labels=list(range(num_classes)), zero_division=0)
     per_class_f1 = f1_score(targets, preds, average=None, labels=list(range(num_classes)), zero_division=0)
-    per_class_f2 = fbeta_score(targets, preds, beta=beta, average=None, labels=list(range(num_classes)), zero_division=0)
+    per_class_f2 = fbeta_score(targets, preds, beta=beta, average=None, labels=list(range(num_classes)),
+                               zero_division=0)
 
     res: Dict[str, Any] = {
         "total_samples": int(len(targets)),
@@ -382,9 +384,9 @@ def compute_benchmark_classification_metrics(
 
 
 def tune_classification_thresholds(
-    targets: np.ndarray,
-    probs: np.ndarray,
-    num_steps: int = 100,
+        targets: np.ndarray,
+        probs: np.ndarray,
+        num_steps: int = 100,
 ) -> Dict[str, Any]:
     """
     Khảo sát biến thiên của F1 và F2 trên 100 ngưỡng từ 0.01 đến 0.99,
@@ -440,8 +442,8 @@ def tune_classification_thresholds(
 # 5. ĐỘNG CƠ KHẢO SÁT TỐC ĐỘ THEO ĐỘ DÀI (SPEED PROFILING ENGINES)
 # ==============================================================================
 def profile_synthetic_speed_sweep(
-    model: Any,
-    config: EvalBenchmarkConfig,
+        model: Any,
+        config: EvalBenchmarkConfig,
 ) -> Dict[str, Any]:
     """
     Thực hiện benchmark tốc độ có kiểm soát (Synthetic Sequence Length Sweep)
@@ -515,9 +517,9 @@ def profile_synthetic_speed_sweep(
 
 
 def evaluate_dataset(
-    model: Any,
-    dataset: RawVideoFramesDataset,
-    config: EvalBenchmarkConfig,
+        model: Any,
+        dataset: RawVideoFramesDataset,
+        config: EvalBenchmarkConfig,
 ) -> Dict[str, Any]:
     """
     Chạy suy luận và đo đạc toàn diện trên tập dữ liệu video thực tế,
@@ -691,11 +693,11 @@ def set_plot_style() -> None:
 
 
 def plot_confusion_matrix(
-    cm: np.ndarray,
-    class_names: Sequence[str],
-    save_path: Path,
-    metrics: Optional[Dict[str, Any]] = None,
-    title: str = "Ma Trận Nhầm Lẫn - ModelInference",
+        cm: np.ndarray,
+        class_names: Sequence[str],
+        save_path: Path,
+        metrics: Optional[Dict[str, Any]] = None,
+        title: str = "Ma Trận Nhầm Lẫn - ModelInference",
 ) -> None:
     """
     Vẽ ma trận nhầm lẫn (Confusion Matrix) dạng Heatmap trực quan.
@@ -776,8 +778,8 @@ def plot_confusion_matrix(
 
 
 def plot_speed_vs_sequence_length(
-    speed_sweep_data: Dict[str, Any],
-    save_path: Path,
+        speed_sweep_data: Dict[str, Any],
+        save_path: Path,
 ) -> None:
     """
     Vẽ lưới biểu đồ 2x2 khảo sát tốc độ xử lý theo độ dài chuỗi khung hình:
@@ -865,9 +867,9 @@ def plot_speed_vs_sequence_length(
 
 
 def plot_roc_pr_curves(
-    targets: np.ndarray,
-    probs: np.ndarray,
-    save_path: Path,
+        targets: np.ndarray,
+        probs: np.ndarray,
+        save_path: Path,
 ) -> None:
     """Vẽ đồ thị đường cong ROC và Precision-Recall."""
     set_plot_style()
@@ -912,8 +914,8 @@ def plot_roc_pr_curves(
 
 
 def plot_threshold_curves(
-    threshold_data: Dict[str, Any],
-    save_path: Path,
+        threshold_data: Dict[str, Any],
+        save_path: Path,
 ) -> None:
     """
     Vẽ đồ thị phân tích sự biến thiên của F1-Score, F2-Score, Precision và Recall
@@ -935,8 +937,10 @@ def plot_threshold_curves(
 
     fig, ax = plt.subplots(figsize=(10, 6), dpi=300)
 
-    ax.plot(thresholds, f1_scores, color="#1976D2", lw=2.4, label=f"F1-Score (Max: {best_val_f1:.3f} @ Th={best_th_f1:.2f})")
-    ax.plot(thresholds, f2_scores, color="#D32F2F", lw=2.4, label=f"F2-Score (Max: {best_val_f2:.3f} @ Th={best_th_f2:.2f})")
+    ax.plot(thresholds, f1_scores, color="#1976D2", lw=2.4,
+            label=f"F1-Score (Max: {best_val_f1:.3f} @ Th={best_th_f1:.2f})")
+    ax.plot(thresholds, f2_scores, color="#D32F2F", lw=2.4,
+            label=f"F2-Score (Max: {best_val_f2:.3f} @ Th={best_th_f2:.2f})")
     ax.plot(thresholds, rec_scores, color="#7B1FA2", lw=1.8, linestyle="--", label="Drowsy Recall")
     ax.plot(thresholds, prec_scores, color="#388E3C", lw=1.8, linestyle=":", label="Drowsy Precision")
 
@@ -947,7 +951,8 @@ def plot_threshold_curves(
     ax.axvline(x=best_th_f2, color="#D32F2F", linestyle="--", alpha=0.7)
     ax.scatter([best_th_f2], [best_val_f2], color="#D32F2F", s=140, zorder=5, marker="X")
 
-    ax.set_title("PHÂN TÍCH BIẾN THIÊN F1 VÀ F2 THEO NGƯỠNG QUYẾT ĐỊNH (THRESHOLD TUNING)", fontsize=13, fontweight="bold")
+    ax.set_title("PHÂN TÍCH BIẾN THIÊN F1 VÀ F2 THEO NGƯỠNG QUYẾT ĐỊNH (THRESHOLD TUNING)", fontsize=13,
+                 fontweight="bold")
     ax.set_xlabel("Ngưỡng Quyết Định Phân Loại (Decision Threshold)", fontsize=11, fontweight="bold")
     ax.set_ylabel("Giá Trị Chỉ Số (Metric Score)", fontsize=11, fontweight="bold")
     ax.set_xlim([0.0, 1.0])
@@ -973,9 +978,9 @@ def save_benchmark_summary(summary_data: Dict[str, Any], save_path: Path) -> Non
 
 
 def print_benchmark_summary(
-    eval_results: Dict[str, Any],
-    speed_sweep_results: Optional[Dict[str, Any]],
-    config: EvalBenchmarkConfig,
+        eval_results: Dict[str, Any],
+        speed_sweep_results: Optional[Dict[str, Any]],
+        config: EvalBenchmarkConfig,
 ) -> None:
     """Hiển thị bảng tổng kết đẹp mắt trên giao diện dòng lệnh."""
     metrics = eval_results.get("metrics", {})
@@ -1010,7 +1015,8 @@ def print_benchmark_summary(
 
     # Bảng chi tiết từng lớp
     print("-" * 82)
-    print(f" {'Lớp Phân Loại':<22} | {'Precision':<10} | {'Recall':<10} | {'F1-Score':<10} | {'F2-Score':<10} | {'Mẫu':<6}")
+    print(
+        f" {'Lớp Phân Loại':<22} | {'Precision':<10} | {'Recall':<10} | {'F1-Score':<10} | {'F2-Score':<10} | {'Mẫu':<6}")
     print("-" * 82)
 
     per_cls = metrics.get("per_class", {})
@@ -1047,15 +1053,18 @@ def print_benchmark_summary(
         tt = metrics["threshold_tuning"]
         print("-" * 82)
         print(" [*] Phân Tích Ngưỡng Tối Ưu (Optimal Thresholds):")
-        print(f"     - Ngưỡng đạt Max F1-Score: Threshold = {tt['best_thresh_f1']:.2f} (F1 = {tt['best_f1_val'] * 100.0:.2f}%)")
-        print(f"     - Ngưỡng đạt Max F2-Score: Threshold = {tt['best_thresh_f2']:.2f} (F2 = {tt['best_f2_val'] * 100.0:.2f}%)")
+        print(
+            f"     - Ngưỡng đạt Max F1-Score: Threshold = {tt['best_thresh_f1']:.2f} (F1 = {tt['best_f1_val'] * 100.0:.2f}%)")
+        print(
+            f"     - Ngưỡng đạt Max F2-Score: Threshold = {tt['best_thresh_f2']:.2f} (F2 = {tt['best_f2_val'] * 100.0:.2f}%)")
 
     # Bảng phân nhóm độ dài thực tế
     length_bins = metrics.get("length_bins_analysis", [])
     if length_bins:
         print("-" * 82)
         print(" [*] Phân Tích Hiệu Năng & Tốc Độ Theo Nhóm Độ Dài Thực Tế (Length Bins):")
-        print(f" {'Nhóm Độ Dài':<16} | {'Mẫu':<6} | {'Latency':<12} | {'FPS':<8} | {'Acc':<8} | {'Drowsy Rec':<11} | {'F2 Drowsy':<10}")
+        print(
+            f" {'Nhóm Độ Dài':<16} | {'Mẫu':<6} | {'Latency':<12} | {'FPS':<8} | {'Acc':<8} | {'Drowsy Rec':<11} | {'F2 Drowsy':<10}")
         print("-" * 82)
         for b in length_bins:
             print(
@@ -1073,7 +1082,8 @@ def print_benchmark_summary(
         records = speed_sweep_results["benchmark_records"]
         print("-" * 82)
         print(" [*] Benchmark Tốc Độ Có Kiểm Soát (Synthetic Sequence Length Sweep):")
-        print(f" {'Độ Dài T':<10} | {'Latency Clip':<16} | {'Latency Frame':<15} | {'Throughput':<12} | {'Peak VRAM':<10}")
+        print(
+            f" {'Độ Dài T':<10} | {'Latency Clip':<16} | {'Latency Frame':<15} | {'Throughput':<12} | {'Peak VRAM':<10}")
         print("-" * 82)
         for r in records:
             print(

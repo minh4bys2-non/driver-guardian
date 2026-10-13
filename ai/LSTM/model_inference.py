@@ -101,14 +101,14 @@ class ModelInference(nn.Module):
             raise ValueError("Frames must be uint8 [0,255] or finite float [0,1]")
 
         # Vấn đề 3: Tự động điều chỉnh kích thước về 640x640 qua hàm letterbox nếu H != 640 hoặc W != 640
-        if H != 640 or W != 640:
-            x_cpu = x.detach().cpu()
-            x_np = (x_cpu if x_cpu.dtype == torch.uint8 else x_cpu.float()).numpy()
-
-            # Áp dụng hàm letterbox chuẩn hóa từng khung hình về [3, 640, 640]
-            x_lb = np.stack([letterbox(np.moveaxis(frame, 0, -1), new_size=640).transpose(2, 0, 1) for frame in x_np])
-            x = torch.from_numpy(x_lb)
-            H, W = 640, 640
+        # if H != 640 or W != 640:
+        #     x_cpu = x.detach().cpu()
+        #     x_np = (x_cpu if x_cpu.dtype == torch.uint8 else x_cpu.float()).numpy()
+        #
+        #     # Áp dụng hàm letterbox chuẩn hóa từng khung hình về [3, 640, 640]
+        #     x_lb = np.stack([letterbox(np.moveaxis(frame, 0, -1), new_size=640).transpose(2, 0, 1) for frame in x_np])
+        #     x = torch.from_numpy(x_lb)
+        #     H, W = 640, 640
 
         p3_list, p4_list, p5_list = [], [], []
 
@@ -132,7 +132,6 @@ class ModelInference(nn.Module):
             p3 = torch.cat(p3_list, dim=0).unsqueeze(0)
             p4 = torch.cat(p4_list, dim=0).unsqueeze(0)
             p5 = torch.cat(p5_list, dim=0).unsqueeze(0)
-
             seq_lens = torch.tensor([T], dtype=torch.long, device=device)
             logits = self.conv_gru((p3, p4, p5), seq_lens=seq_lens)
 
@@ -187,6 +186,12 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = ModelInference(device=device, cnn_path=cnn_path, conv_gru_path=conv_gru_path)
     # Test với dummy array 224x224 mô phỏng dữ liệu từ Engine
-    test_dummy = np.zeros((10, 3, 224, 224), dtype=np.uint8)
+    test_dummy = np.zeros((10, 3, 640, 640), dtype=np.uint8)
+    # test_dummy = torch.rand((10, 3, 224, 224)).to(device)
+    # p3, p4, p5 = model.cnn_backbone(test_dummy)
+    # output = model.cnn_neck(p3, p4, p5)
+    # print(output[0].shape)
+    # print(output[1].shape)
+    # print(output[2].shape)
     score = model(test_dummy)
     print(score)

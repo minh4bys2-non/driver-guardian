@@ -3,19 +3,25 @@ import cv2
 import numpy as np
 from ai.PhysicalBranch.camera_metrics import CameraMetrics
 
+
 class VideoMetrics:
     def __init__(self, fps=30, window_sec=60, **options):
         self.fps = fps
         self.camera = CameraMetrics(fps=fps, window_sec=window_sec, **options)
+
     def process(self, frames):
         """frames: iterable of (RGB uint8 [3,H,W], timestamp_sec)."""
         self.camera.reset()
         result = None
         try:
             for frame, timestamp in frames:
-                if (not isinstance(frame, np.ndarray) or frame.dtype != np.uint8
-                        or frame.ndim != 3 or frame.shape[0] != 3
-                        or min(frame.shape[1:]) == 0):
+                if (
+                    not isinstance(frame, np.ndarray)
+                    or frame.dtype != np.uint8
+                    or frame.ndim != 3
+                    or frame.shape[0] != 3
+                    or min(frame.shape[1:]) == 0
+                ):
                     raise ValueError("Expected RGB uint8 frame with shape [3,H,W]")
 
                 start = time.perf_counter()

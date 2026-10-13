@@ -1,5 +1,6 @@
 import math
 import sys
+from time import perf_counter
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
@@ -26,7 +27,9 @@ from ai.LSTM.src import ConvGRUClassifier
 from ai.ObjectDetection_2p6M.src.model import NMSFreeDetector
 
 
-def _resolve_checkpoint(user_path: Optional[Union[str, Path]], relative_fallback: str) -> Path:
+def _resolve_checkpoint(
+    user_path: Optional[Union[str, Path]], relative_fallback: str
+) -> Path:
     """Tự động phân giải đường dẫn checkpoint hợp lệ trong dự án."""
     if user_path is not None:
         p = Path(user_path).expanduser().resolve()
@@ -59,13 +62,13 @@ def _resolve_checkpoint(user_path: Optional[Union[str, Path]], relative_fallback
 
 class NeuralNetwork(nn.Module):
     def __init__(
-            self,
-            cnn_model: Optional[NMSFreeDetector] = None,
-            conv_gru_model: Optional[ConvGRUClassifier] = None,
-            chunk_size: int = 32,
-            cnn_path: Optional[Union[str, Path]] = None,
-            conv_gru_path: Optional[Union[str, Path]] = None,
-            device: Optional[Union[str, torch.device]] = None,
+        self,
+        cnn_model: Optional[NMSFreeDetector] = None,
+        conv_gru_model: Optional[ConvGRUClassifier] = None,
+        chunk_size: int = 32,
+        cnn_path: Optional[Union[str, Path]] = None,
+        conv_gru_path: Optional[Union[str, Path]] = None,
+        device: Optional[Union[str, torch.device]] = None,
     ):
         super().__init__()
         if device is None:
@@ -76,11 +79,15 @@ class NeuralNetwork(nn.Module):
         # Tự động nạp checkpoints tối ưu nếu chưa truyền model
         if cnn_model is None:
             resolved_cnn = _resolve_checkpoint(cnn_path, "model_cnn/best.pt")
-            cnn_model = NMSFreeDetector.from_checkpoint(resolved_cnn, map_location=self.device, eval_mode=True)
+            cnn_model = NMSFreeDetector.from_checkpoint(
+                resolved_cnn, map_location=self.device, eval_mode=True
+            )
 
         if conv_gru_model is None:
             resolved_gru = _resolve_checkpoint(conv_gru_path, "model_convgru/best.pt")
-            conv_gru_model = ConvGRUClassifier.from_checkpoint(resolved_gru, map_location=str(self.device))
+            conv_gru_model = ConvGRUClassifier.from_checkpoint(
+                resolved_gru, map_location=str(self.device)
+            )
 
         self.cnn_model: NMSFreeDetector = cnn_model
         self.conv_gru: ConvGRUClassifier = conv_gru_model.eval()
@@ -91,11 +98,11 @@ class NeuralNetwork(nn.Module):
 
     @classmethod
     def from_checkpoint(
-            cls,
-            cnn_path: Optional[Union[str, Path]] = None,
-            conv_gru_path: Optional[Union[str, Path]] = None,
-            device: Optional[Union[str, torch.device]] = None,
-            chunk_size: int = 32,
+        cls,
+        cnn_path: Optional[Union[str, Path]] = None,
+        conv_gru_path: Optional[Union[str, Path]] = None,
+        device: Optional[Union[str, torch.device]] = None,
+        chunk_size: int = 32,
     ):
         """Khởi tạo NeuralNetwork trực tiếp từ các file checkpoint .pt"""
         return cls(
@@ -126,10 +133,14 @@ class NeuralNetwork(nn.Module):
         if isinstance(x, np.ndarray):
             x = torch.from_numpy(x)
         elif not isinstance(x, torch.Tensor):
-            raise TypeError(f"Expected numpy.ndarray or torch.Tensor, got {type(x).__name__}")
+            raise TypeError(
+                f"Expected numpy.ndarray or torch.Tensor, got {type(x).__name__}"
+            )
 
         if x.ndim != 4:
-            raise ValueError(f"Expected input with 4 dimensions [T, C, H, W], got shape {tuple(x.shape)}")
+            raise ValueError(
+                f"Expected input with 4 dimensions [T, C, H, W], got shape {tuple(x.shape)}"
+            )
 
         T, C, H, W = x.shape
         if T == 0:
@@ -140,8 +151,11 @@ class NeuralNetwork(nn.Module):
             raise ValueError(f"Expected 3 color channels (RGB), got C = {C}")
 
         if x.dtype != torch.uint8 and (
-                not x.is_floating_point() or not torch.isfinite(x).all()
-                or x.min() < 0 or x.max() > 1):
+            not x.is_floating_point()
+            or not torch.isfinite(x).all()
+            or x.min() < 0
+            or x.max() > 1
+        ):
             raise ValueError("Frames must be uint8 [0,255] or finite float [0,1]")
 
         # Vấn đề 3: Tự động điều chỉnh kích thước về 640x640 qua hàm letterbox nếu H != 640 hoặc W != 640
@@ -150,7 +164,14 @@ class NeuralNetwork(nn.Module):
             x_np = (x_cpu if x_cpu.dtype == torch.uint8 else x_cpu.float()).numpy()
 
             # Áp dụng hàm letterbox chuẩn hóa từng khung hình về [3, 640, 640]
-            x_lb = np.stack([letterbox(np.moveaxis(frame, 0, -1), new_size=640).transpose(2, 0, 1) for frame in x_np])
+            x_lb = np.stack(
+                [
+                    letterbox(np.moveaxis(frame, 0, -1), new_size=640).transpose(
+                        2, 0, 1
+                    )
+                    for frame in x_np
+                ]
+            )
             x = torch.from_numpy(x_lb)
             H, W = 640, 640
 
@@ -181,7 +202,9 @@ class NeuralNetwork(nn.Module):
             logits = self.conv_gru((p3, p4, p5), seq_lens=seq_lens)
 
             if logits.shape not in ((1, 1), (1, 2)):
-                raise ValueError(f"Expected binary clip logits [1,1] or [1,2], got {tuple(logits.shape)}")
+                raise ValueError(
+                    f"Expected binary clip logits [1,1] or [1,2], got {tuple(logits.shape)}"
+                )
             # Tính điểm xác suất
             if logits.shape[-1] == 1:
                 score = torch.sigmoid(logits).item()
@@ -193,16 +216,16 @@ class NeuralNetwork(nn.Module):
 
 
 def letterbox(
-        image: np.ndarray,
-        new_size: int = 640,
-        color: Tuple[int, int, int] = (114, 114, 114)
+    image: np.ndarray,
+    new_size: int = 640,
+    color: Tuple[int, int, int] = (114, 114, 114),
 ) -> np.ndarray:
     """
     Căn chỉnh kích thước ảnh về new_size x new_size giữ nguyên tỷ lệ khung hình
     và chèn viền màu (mặc định 114, 114, 114).
     Hỗ trợ linh hoạt cả định dạng HWC [H, W, 3] và CHW [3, H, W].
     """
-    is_chw = (image.ndim == 3 and image.shape[0] == 3 and image.shape[-1] != 3)
+    is_chw = image.ndim == 3 and image.shape[0] == 3 and image.shape[-1] != 3
     if is_chw:
         image = np.transpose(image, (1, 2, 0))
 
@@ -225,13 +248,50 @@ def letterbox(
 
 
 if __name__ == "__main__":
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Benchmark tốc độ suy luận NeuralNetwork")
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--frames", type=int, default=10)
+    parser.add_argument("--size", type=int, default=224)
+    parser.add_argument("--warmup", type=int, default=3)
+    parser.add_argument("--runs", type=int, default=20)
+    parser.add_argument("--chunk-size", type=int, default=32)
+    parser.add_argument("--cnn-path")
+    parser.add_argument("--conv-gru-path")
+    args = parser.parse_args()
+    if min(args.frames, args.size, args.runs, args.chunk_size) < 1 or args.warmup < 0:
+        parser.error("frames, size, runs, chunk-size phải > 0; warmup phải >= 0")
+
+    device = torch.device(args.device)
     print(f"[*] Khởi tạo NeuralNetwork trên device: {device}")
-    model = NeuralNetwork(device=device)
+    model = NeuralNetwork(
+        device=device, chunk_size=args.chunk_size,
+        cnn_path=args.cnn_path, conv_gru_path=args.conv_gru_path,
+    ).eval()
     print("[*] Nạp model thành công!")
 
-    # Test với dummy array 224x224 mô phỏng dữ liệu từ Engine
-    test_dummy = np.zeros((10, 3, 224, 224), dtype=np.uint8)
+    test_dummy = np.zeros((args.frames, 3, args.size, args.size), dtype=np.uint8)
+    print(f"[*] Input giả lập: {test_dummy.shape}, uint8; chunk_size={args.chunk_size}")
+    print(f"[*] Warm-up {args.warmup} lượt, đo {args.runs} lượt...")
+    for _ in range(args.warmup):
+        model(test_dummy)
 
-    score = model(test_dummy)
-    print(f"[*] Điểm dự đoán với mảng 224x224: {score:.4f}")
+    elapsed = []
+    for _ in range(args.runs):
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        start = perf_counter()
+        score = model(test_dummy)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        elapsed.append(perf_counter() - start)
+
+    latency_ms = np.asarray(elapsed) * 1000
+    print(f"[*] Điểm dự đoán: {score:.4f}")
+    print("[*] Thời gian gồm tiền xử lý, truyền dữ liệu và suy luận; không gồm nạp model.")
+    print(f"[*] Độ trễ/chuỗi: mean={latency_ms.mean():.2f} ms, "
+          f"P50={np.percentile(latency_ms, 50):.2f} ms, "
+          f"P95={np.percentile(latency_ms, 95):.2f} ms")
+    print(f"[*] Tốc độ: {args.runs / sum(elapsed):.2f} chuỗi/s, "
+          f"{args.frames * args.runs / sum(elapsed):.2f} frame/s")

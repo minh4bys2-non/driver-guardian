@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 
+
 # [Frame: RGB, shape: [3, H, W], dtype: uint8, range: [0, 255], timeline = 30FPS]
 # (frame: np.ndarray, timestamp: float)
 def read_video(path, target_fps=30):
@@ -28,7 +29,11 @@ def read_video(path, target_fps=30):
             if index == 1:
                 use_frame_index = origin == 0 and t == 0
             t = index / source_fps if use_frame_index else t - origin
-            if not np.isfinite(t) or t < 0 or (previous_t is not None and t <= previous_t):
+            if (
+                not np.isfinite(t)
+                or t < 0
+                or (previous_t is not None and t <= previous_t)
+            ):
                 raise ValueError(f"Invalid video timestamp: {path}")
             frame = np.transpose(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), (2, 0, 1))
             if previous is not None:
@@ -46,6 +51,7 @@ def read_video(path, target_fps=30):
             output_index += 1
     finally:
         cap.release()
+
 
 if __name__ == "__main__":
     path = "/home/tranmanhduy/Workspace/ptithcm/driver-guardian/ai/OptimalAlgorithsm/UTA-RLDD/Fold1_part1/01/10.MOV"

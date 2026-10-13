@@ -3,6 +3,7 @@
 Input JSONL: {"video_path": "Fold1_part1/04/0.mp4", "label": 0}
 Video lấy từ loadvideo2handle.read_video: (RGB uint8 [3,H,W], timestamp).
 """
+
 import json
 import sys
 from collections import deque
@@ -25,17 +26,33 @@ else:
 DEFAULT_RISK_CONFIG = {
     "window_sec": 60,
     "blink_frequency": {
-        "normal": (15, 20), "low_danger": 4, "high_danger": 35,
+        "normal": (15, 20),
+        "low_danger": 4,
+        "high_danger": 35,
         "gate_low_with_eye_metrics": True,
     },
     "blink_duration": {"safe": 400, "danger": 800, "unit": "ms", "aggregation": "p90"},
     "perclos": {"safe": 0.05, "danger": 0.15},
-    "yawn_frequency": {"safe": 0, "danger": 2, "unit": "events/min", "min_event_sec": 4.0},
+    "yawn_frequency": {
+        "safe": 0,
+        "danger": 2,
+        "unit": "events/min",
+        "min_event_sec": 4.0,
+    },
     "nod_duration": {"safe": 0.5, "danger": 2.0, "unit": "sec", "aggregation": "max"},
-    "nod_frequency": {"safe": 0, "danger": 3, "unit": "events/min", "min_event_sec": 0.8},
+    "nod_frequency": {
+        "safe": 0,
+        "danger": 3,
+        "unit": "events/min",
+        "min_event_sec": 0.8,
+    },
     "dominant_head_motion_frequency": {
-        "method": "fft_pitch", "unit": "Hz", "window_sec": 60,
-        "reference_band": (0.05, 0.20), "low_danger": 0.0, "high_danger": 0.60,
+        "method": "fft_pitch",
+        "unit": "Hz",
+        "window_sec": 60,
+        "reference_band": (0.05, 0.20),
+        "low_danger": 0.0,
+        "high_danger": 0.60,
         "require_reliable_motion": True,
     },
     "cnn_lstm_score": {"safe": 0.0, "danger": 1.0},
@@ -43,10 +60,22 @@ DEFAULT_RISK_CONFIG = {
 
 
 class Engine:
-    def __init__(self, video_root, fps=30, window_sec=None, stride_sec=60,
-                 neural_sec=10, neural_size=640, min_observed_ratio=0.8, risk_config=None,
-                 neural_fps=5, device=None, cnn_path=None, conv_gru_path=None,
-                 chunk_size=32):
+    def __init__(
+        self,
+        video_root,
+        fps=30,
+        window_sec=None,
+        stride_sec=60,
+        neural_sec=10,
+        neural_size=640,
+        min_observed_ratio=0.8,
+        risk_config=None,
+        neural_fps=5,
+        device=None,
+        cnn_path=None,
+        conv_gru_path=None,
+        chunk_size=32,
+    ):
         self.root = Path(video_root).expanduser().resolve()
         self.risk_config = deepcopy(DEFAULT_RISK_CONFIG)
         for key, value in (risk_config or {}).items():
@@ -55,7 +84,10 @@ class Engine:
             if key == "window_sec":
                 self.risk_config[key] = value
             else:
-                if not isinstance(value, dict) or value.keys() - self.risk_config[key].keys():
+                if (
+                    not isinstance(value, dict)
+                    or value.keys() - self.risk_config[key].keys()
+                ):
                     raise ValueError(f"Invalid risk configuration: {key}")
                 self.risk_config[key].update(deepcopy(value))
         self._validate_risk_config()
@@ -66,7 +98,9 @@ class Engine:
         if not np.isfinite(values).all() or any(v <= 0 for v in values):
             raise ValueError("Engine timing and sizes must be finite and positive")
         if fps != int(fps) or neural_size != int(neural_size) or fps % neural_fps:
-            raise ValueError("fps and neural_size must be integers; neural_fps must divide fps")
+            raise ValueError(
+                "fps and neural_size must be integers; neural_fps must divide fps"
+            )
         self.neural_step = int(fps / neural_fps)
         self.fps = int(fps)
         self.window = round(window_sec * fps)
@@ -74,18 +108,33 @@ class Engine:
         self.neural_count = round(neural_sec * neural_fps)
         self.neural_size = int(neural_size)
         self.min_observed_ratio = float(min_observed_ratio)
-        if (fps <= 0 or self.window <= 0 or self.stride <= 0 or self.neural_count <= 0
-                or self.neural_size <= 0 or not 0 <= min_observed_ratio <= 1):
+        if (
+            fps <= 0
+            or self.window <= 0
+            or self.stride <= 0
+            or self.neural_count <= 0
+            or self.neural_size <= 0
+            or not 0 <= min_observed_ratio <= 1
+        ):
             raise ValueError("Invalid engine configuration")
-        if abs(self.window / fps - window_sec) > 1e-6 or abs(self.stride / fps - stride_sec) > 1e-6:
+        if (
+            abs(self.window / fps - window_sec) > 1e-6
+            or abs(self.stride / fps - stride_sec) > 1e-6
+        ):
             raise ValueError("window_sec and stride_sec must be multiples of 1/fps")
-        if (neural_sec > window_sec or abs(self.neural_count / neural_fps - neural_sec) > 1e-6
-                or self.window % self.neural_step or self.stride % self.neural_step):
+        if (
+            neural_sec > window_sec
+            or abs(self.neural_count / neural_fps - neural_sec) > 1e-6
+            or self.window % self.neural_step
+            or self.stride % self.neural_step
+        ):
             raise ValueError("Neural sampling must align with complete video windows")
         self.window_sec = self.window / fps
         self.neural = NeuralNetwork(
-            cnn_path=cnn_path, conv_gru_path=conv_gru_path,
-            device=device, chunk_size=chunk_size,
+            cnn_path=cnn_path,
+            conv_gru_path=conv_gru_path,
+            device=device,
+            chunk_size=chunk_size,
         ).eval()
 
     def _validate_risk_config(self):
@@ -100,12 +149,22 @@ class Engine:
             if "safe" in rule:
                 points = (rule["safe"], rule["danger"])
             else:
-                band = rule["normal"] if key == "blink_frequency" else rule["reference_band"]
+                band = (
+                    rule["normal"]
+                    if key == "blink_frequency"
+                    else rule["reference_band"]
+                )
                 if len(band) != 2:
                     raise ValueError(f"Expected a two-point reference band: {key}")
                 points = (rule["low_danger"], *band, rule["high_danger"])
-            if not np.isfinite(points).all() or points[0] < 0 or np.any(np.diff(points) <= 0):
-                raise ValueError(f"Risk thresholds must be finite and strictly increasing: {key}")
+            if (
+                not np.isfinite(points).all()
+                or points[0] < 0
+                or np.any(np.diff(points) <= 0)
+            ):
+                raise ValueError(
+                    f"Risk thresholds must be finite and strictly increasing: {key}"
+                )
             if "unit" in rule and rule["unit"] != DEFAULT_RISK_CONFIG[key]["unit"]:
                 raise ValueError(f"Unsupported unit: {key}")
             if "aggregation" in rule and rule["aggregation"] not in ("p90", "max"):
@@ -113,12 +172,16 @@ class Engine:
         for key, upper_sec in (("yawn_frequency", 7.5), ("nod_frequency", 3.5)):
             value = cfg[key]["min_event_sec"]
             if not np.isfinite(value) or not 0 < value < upper_sec:
-                raise ValueError(f"min_event_sec must be below the detector maximum {upper_sec}s: {key}")
+                raise ValueError(
+                    f"min_event_sec must be below the detector maximum {upper_sec}s: {key}"
+                )
         if cfg["perclos"]["danger"] > 1 or cfg["cnn_lstm_score"]["danger"] > 1:
             raise ValueError("PERCLOS and neural thresholds must be fractions in [0,1]")
-        if (motion["method"] != "fft_pitch"
-                or type(motion["require_reliable_motion"]) is not bool
-                or type(cfg["blink_frequency"]["gate_low_with_eye_metrics"]) is not bool):
+        if (
+            motion["method"] != "fft_pitch"
+            or type(motion["require_reliable_motion"]) is not bool
+            or type(cfg["blink_frequency"]["gate_low_with_eye_metrics"]) is not bool
+        ):
             raise ValueError("Invalid FFT method or risk gate")
 
     def _norm(self, key, value):
@@ -126,26 +189,44 @@ class Engine:
             raise ValueError(f"Invalid raw feature: {key}")
         rule = self.risk_config[key]
         if "safe" in rule:
-            return float(np.clip((value - rule["safe"]) / (rule["danger"] - rule["safe"]), 0, 1))
+            return float(
+                np.clip((value - rule["safe"]) / (rule["danger"] - rule["safe"]), 0, 1)
+            )
         band = rule["normal"] if key == "blink_frequency" else rule["reference_band"]
-        return float(np.interp(value, (rule["low_danger"], *band, rule["high_danger"]), (1, 0, 0, 1)))
+        return float(
+            np.interp(
+                value, (rule["low_danger"], *band, rule["high_danger"]), (1, 0, 0, 1)
+            )
+        )
 
     def _duration(self, key, history):
         values = [duration for _, duration in history]
         if not values:
             return 0.0
         rule = self.risk_config[key]
-        duration_ms = float(np.percentile(values, 90 if rule["aggregation"] == "p90" else 100))
+        duration_ms = float(
+            np.percentile(values, 90 if rule["aggregation"] == "p90" else 100)
+        )
         return duration_ms / 1000 if rule["unit"] == "sec" else duration_ms
 
-    def _features(self, m, blink_durations, nod_durations, nn_frames, source, start, label):
+    def _features(
+        self, m, blink_durations, nod_durations, nn_frames, source, start, label
+    ):
         window = self.window_sec
-        coverage = [m[k] for k in ("eye_observed_sec", "mouth_observed_sec", "head_observed_sec")]
+        coverage = [
+            m[k]
+            for k in ("eye_observed_sec", "mouth_observed_sec", "head_observed_sec")
+        ]
         if (
-                not m["eye_ready"] or not m["mouth_ready"] or not m["head_calibrated"]
-                or m["perclos_pct"] is None
-                or any(v is None or not np.isfinite(v) or v < window * self.min_observed_ratio
-                       for v in coverage)):
+            not m["eye_ready"]
+            or not m["mouth_ready"]
+            or not m["head_calibrated"]
+            or m["perclos_pct"] is None
+            or any(
+                v is None or not np.isfinite(v) or v < window * self.min_observed_ratio
+                for v in coverage
+            )
+        ):
             return None
 
         motion = self.risk_config["dominant_head_motion_frequency"]
@@ -153,9 +234,12 @@ class Engine:
         resolution = m["head_motion_resolution_hz"]
         observed = m["head_motion_observed_sec"]
         reliable_motion = (
-            frequency is not None and resolution is not None and observed is not None
+            frequency is not None
+            and resolution is not None
+            and observed is not None
             and np.isfinite((frequency, resolution, observed)).all()
-            and frequency > 0 and resolution > 0
+            and frequency > 0
+            and resolution > 0
             and observed >= motion["window_sec"] - 1e-9
         )
         if motion["require_reliable_motion"] and not reliable_motion:
@@ -180,17 +264,27 @@ class Engine:
         if not reliable_motion:
             risk["dominant_head_motion_frequency"] = 0.0
         blink_rule = self.risk_config["blink_frequency"]
-        if blink_rule["gate_low_with_eye_metrics"] and raw["blink_frequency"] < blink_rule["normal"][0]:
+        if (
+            blink_rule["gate_low_with_eye_metrics"]
+            and raw["blink_frequency"] < blink_rule["normal"][0]
+        ):
             risk["blink_frequency"] *= max(risk["perclos"], risk["blink_duration"])
-        return {**{k: round(v, 4) for k, v in risk.items()}, "source_video": source,
-                "start_second": start, "end_second": start + window, "label": label,
-                "feature_encoding": "risk_v2"}
+        return {
+            **{k: round(v, 4) for k, v in risk.items()},
+            "source_video": source,
+            "start_second": start,
+            "end_second": start + window,
+            "label": label,
+            "feature_encoding": "risk_v2",
+        }
 
     def _source(self, video_path):
         if not isinstance(video_path, str) or not video_path.strip():
             raise ValueError("video_path must be a nonempty relative path")
         relative = Path(video_path)
-        if relative.is_absolute() or not (self.root / relative).resolve().is_relative_to(self.root):
+        if relative.is_absolute() or not (
+            self.root / relative
+        ).resolve().is_relative_to(self.root):
             raise ValueError(f"Invalid relative video path: {video_path}")
         return (self.root / relative).resolve().relative_to(self.root).as_posix()
 
@@ -201,26 +295,54 @@ class Engine:
             raise ValueError("label must be 0 (alert) or 1 (drowsy)")
         path = self.root / video_path
         camera = CameraMetrics(
-            fps=self.fps, window_sec=self.window_sec,
-            windows={"head_motion": self.risk_config["dominant_head_motion_frequency"]["window_sec"]},
-            mouth_options={"min_duration_ms": self.risk_config["yawn_frequency"]["min_event_sec"] * 1000},
-            nod_duration_ms=(self.risk_config["nod_frequency"]["min_event_sec"] * 1000, 3500),
+            fps=self.fps,
+            window_sec=self.window_sec,
+            windows={
+                "head_motion": self.risk_config["dominant_head_motion_frequency"][
+                    "window_sec"
+                ]
+            },
+            mouth_options={
+                "min_duration_ms": self.risk_config["yawn_frequency"]["min_event_sec"]
+                * 1000
+            },
+            nod_duration_ms=(
+                self.risk_config["nod_frequency"]["min_event_sec"] * 1000,
+                3500,
+            ),
         )
         nn_frames = deque(maxlen=self.neural_count)
         blink_durations, nod_durations = deque(), deque()
         try:
-            for i, (frame, timestamp) in enumerate(read_video(str(path), target_fps=self.fps)):
-                if not isinstance(frame, np.ndarray) or frame.dtype != np.uint8 or frame.ndim != 3 or frame.shape[
-                    0] != 3 or min(frame.shape[1:]) == 0:
+            for i, (frame, timestamp) in enumerate(
+                read_video(str(path), target_fps=self.fps)
+            ):
+                if (
+                    not isinstance(frame, np.ndarray)
+                    or frame.dtype != np.uint8
+                    or frame.ndim != 3
+                    or frame.shape[0] != 3
+                    or min(frame.shape[1:]) == 0
+                ):
                     raise ValueError(f"Invalid RGB frame [3,H,W]: {path}")
                 rgb = np.moveaxis(frame, 0, -1)
-                metrics = camera.process(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), timestamp)
+                metrics = camera.process(
+                    cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), timestamp
+                )
                 if i % self.neural_step == 0:
-                    nn_frames.append(np.moveaxis(letterbox(rgb, self.neural_size), -1, 0))
+                    nn_frames.append(
+                        np.moveaxis(letterbox(rgb, self.neural_size), -1, 0)
+                    )
 
-                if metrics["blink_detected"] and metrics["blink_duration_ms"] is not None:
+                if (
+                    metrics["blink_detected"]
+                    and metrics["blink_duration_ms"] is not None
+                ):
                     blink_durations.append((timestamp, metrics["blink_duration_ms"]))
-                if metrics["nod_detected"] and metrics["nod_event_duration_ms"] is not None:
+                if (
+                    metrics["nod_detected"]
+                    and metrics["nod_event_duration_ms"] is not None
+                ):
                     nod_durations.append((timestamp, metrics["nod_event_duration_ms"]))
                 cutoff = timestamp - self.window_sec
                 for history in (blink_durations, nod_durations):
@@ -230,10 +352,20 @@ class Engine:
                 count = i + 1
                 if count >= self.window and (count - self.window) % self.stride == 0:
                     start = (count - self.window) / self.fps
-                    if saved_windows and (start, start + self.window_sec) in saved_windows:
+                    if (
+                        saved_windows
+                        and (start, start + self.window_sec) in saved_windows
+                    ):
                         continue
-                    sample = self._features(metrics, blink_durations, nod_durations,
-                                            nn_frames, video_path, start, label)
+                    sample = self._features(
+                        metrics,
+                        blink_durations,
+                        nod_durations,
+                        nn_frames,
+                        video_path,
+                        start,
+                        label,
+                    )
                     if sample is not None:
                         yield sample
         finally:
@@ -257,28 +389,46 @@ class Engine:
                         source, label = row["source_video"], row["label"]
                         source = self._source(source)
                         start, end = row["start_second"], row["end_second"]
-                        if (row["feature_encoding"] != "risk_v2"
-                                or not isinstance(source, str) or not source
-                                or type(label) is not int or label not in (0, 1)
-                                or not np.isfinite((start, end)).all() or start < 0
-                                or abs(end - start - self.window_sec) > 1e-6
-                                or abs(start * self.fps / self.stride - round(start * self.fps / self.stride)) > 1e-6
-                                or any(not np.isfinite(row[k]) or not 0 <= row[k] <= 1
-                                       for k in DEFAULT_RISK_CONFIG if k != "window_sec")):
+                        if (
+                            row["feature_encoding"] != "risk_v2"
+                            or not isinstance(source, str)
+                            or not source
+                            or type(label) is not int
+                            or label not in (0, 1)
+                            or not np.isfinite((start, end)).all()
+                            or start < 0
+                            or abs(end - start - self.window_sec) > 1e-6
+                            or abs(
+                                start * self.fps / self.stride
+                                - round(start * self.fps / self.stride)
+                            )
+                            > 1e-6
+                            or any(
+                                not np.isfinite(row[k]) or not 0 <= row[k] <= 1
+                                for k in DEFAULT_RISK_CONFIG
+                                if k != "window_sec"
+                            )
+                        ):
                             raise ValueError("Incompatible saved sample")
                         if source in video_labels and video_labels[source] != label:
                             raise ValueError(f"Conflicting labels for video: {source}")
                         video_labels[source] = label
                         windows = saved.setdefault((source, label), set())
                         if (start, end) in windows:
-                            raise ValueError(f"Duplicate saved window: {source}, {start}, {end}")
+                            raise ValueError(
+                                f"Duplicate saved window: {source}, {start}, {end}"
+                            )
                         windows.add((start, end))
                     except (ValueError, KeyError, TypeError) as exc:
-                        raise ValueError(f"Cannot resume {dst}, line {line_number}: {exc}") from exc
+                        raise ValueError(
+                            f"Cannot resume {dst}, line {line_number}: {exc}"
+                        ) from exc
         dst.parent.mkdir(parents=True, exist_ok=True)
         count = 0
         seen = set()
-        with src.open(encoding="utf-8") as fin, dst.open("a" if resume else "w", encoding="utf-8") as fout:
+        with src.open(encoding="utf-8") as fin, dst.open(
+            "a" if resume else "w", encoding="utf-8"
+        ) as fout:
             if needs_newline:
                 fout.write("\n")
             for line_number, line in enumerate(fin, 1):
@@ -300,13 +450,23 @@ class Engine:
                         continue
                     seen.add(key)
                     windows = saved.setdefault(key, set()) if resume else None
-                    samples = (self.process_video(*key, saved_windows=windows) if resume
-                               else self.process_video(*key))
+                    samples = (
+                        self.process_video(*key, saved_windows=windows)
+                        if resume
+                        else self.process_video(*key)
+                    )
                     for sample in samples:
-                        window = (sample["start_second"], sample["end_second"]) if resume else None
+                        window = (
+                            (sample["start_second"], sample["end_second"])
+                            if resume
+                            else None
+                        )
                         if windows is not None and window in windows:
                             continue
-                        fout.write(json.dumps(sample, ensure_ascii=False, allow_nan=False) + "\n")
+                        fout.write(
+                            json.dumps(sample, ensure_ascii=False, allow_nan=False)
+                            + "\n"
+                        )
                         fout.flush()  # giữ kết quả đã xử lý nếu video tiếp theo lỗi
                         if windows is not None:
                             windows.add(window)
@@ -316,6 +476,7 @@ class Engine:
                         raise
                     print(f"[line {line_number}] {exc}", file=sys.stderr)
         return count
+
 
 if __name__ == "__main__":
     INPUT_JSONL = "/home/tranmanhduy/Workspace/ptithcm/driver-guardian/ai/OptimalAlgorithsm/UTA-RLDD/dataset.jsonl"

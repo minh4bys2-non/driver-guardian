@@ -162,7 +162,7 @@ aspect_ratio = (||p1 - p5|| + ||p2 - p4||) / (2 * ||p0 - p3||)
 
 EAR là trung bình tỷ lệ của hai mắt; MAR là tỷ lệ miệng. Tín hiệu không hợp lệ hoặc không tìm thấy mặt được biểu diễn bằng `None`.
 
-Mắt và miệng khởi tạo từ **450 quan sát hợp lệ** ở cấu hình 30 FPS, tương đương khoảng 15 giây nếu tín hiệu liên tục. Các mẫu khởi tạo có thể tích lũy lâu hơn khi mất mặt. HMM phân biệt trạng thái mắt mở/đóng và miệng nghỉ/mở; FSM xác nhận sự kiện theo thời lượng.
+Mắt và miệng khởi tạo từ **150 quan sát hợp lệ** ở cấu hình 30 FPS, tương đương khoảng 5 giây nếu tín hiệu liên tục. Các mẫu khởi tạo có thể tích lũy lâu hơn khi mất mặt. HMM phân biệt trạng thái mắt mở/đóng và miệng nghỉ/mở; FSM xác nhận sự kiện theo thời lượng.
 
 ### 7.2. Sự kiện và thời lượng
 
@@ -224,7 +224,7 @@ flowchart TD
 
 Coverage mặc định yêu cầu từng giá trị `eye_observed_sec`, `mouth_observed_sec`, `head_observed_sec` đạt ít nhất `60 * 0.8 = 48 giây`.
 
-Trong điều kiện liên tục, cửa sổ `[0,60)` thường bị loại: HMM cần khoảng 15 giây khởi tạo, còn khoảng 45 giây quan sát mắt/miệng. Cửa sổ `[10,70)` mới có thể đạt điều kiện. Mất tín hiệu có thể làm mốc đầu ra đầu tiên muộn hơn.
+Trong điều kiện liên tục, HMM khởi tạo khoảng 5 giây, còn khoảng 55 giây quan sát mắt/miệng trong cửa sổ đầu. Tuy nhiên, `[0,60)` vẫn bị loại với cấu hình mặc định vì FFT chưa đủ 60 giây liên tục sau hiệu chuẩn đầu. Với stride mặc định 60 giây, `[60,120)` là cửa sổ tiếp theo có thể đạt điều kiện. Mất tín hiệu hoặc chuyển động đầu không đủ biên độ có thể làm đầu ra muộn hơn.
 
 `min_observed_ratio=0` chỉ bỏ ngưỡng coverage. Các điều kiện khởi tạo và PERCLOS vẫn áp dụng; với `require_reliable_motion=True`, FFT phải có tần số dương hữu hạn và đủ 60 giây quan sát liên tục. Thiếu chuyển động đáng tin cậy làm loại mẫu.
 

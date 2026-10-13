@@ -20,7 +20,10 @@ from ai.OptimalAlgorithsm.TrainingSystem.cmdpsofs import (
     crowding_distance,
     dominates,
 )
-from ai.OptimalAlgorithsm.TrainingSystem.fitnessFunction import FEATURES, validate_labels
+from ai.OptimalAlgorithsm.TrainingSystem.fitnessFunction import (
+    FEATURES,
+    validate_labels,
+)
 
 
 @dataclass
@@ -36,23 +39,33 @@ class IBGWO4Config:
     seed: int = 42
 
     def __post_init__(self):
-        if any(type(v) is not int for v in (self.population_size, self.generations, self.archive_size)):
-            raise ValueError("population_size, generations and archive_size must be integers")
+        if any(
+            type(v) is not int
+            for v in (self.population_size, self.generations, self.archive_size)
+        ):
+            raise ValueError(
+                "population_size, generations and archive_size must be integers"
+            )
         if self.population_size < 3 or self.generations < 1 or self.archive_size < 1:
-            raise ValueError("Require population_size >= 3, generations >= 1, archive_size >= 1")
+            raise ValueError(
+                "Require population_size >= 3, generations >= 1, archive_size >= 1"
+            )
         if type(self.dimensions) is not int or self.dimensions != 9:
-            raise ValueError("Fitness requires 8 weights and 1 classification threshold")
+            raise ValueError(
+                "Fitness requires 8 weights and 1 classification threshold"
+            )
         coefficients = (self.inertia, self.cognitive, self.social, self.velocity_limit)
         if not np.all(np.isfinite(coefficients)) or min(coefficients) < 0:
-            raise ValueError("PSO coefficients and velocity_limit must be finite and nonnegative")
+            raise ValueError(
+                "PSO coefficients and velocity_limit must be finite and nonnegative"
+            )
 
 
 def pareto_order(objectives):
     """Rank by nondominated front, then descending crowding distance."""
     objectives = np.asarray(objectives)
-    domination = (
-        np.all(objectives[:, None] <= objectives[None, :], axis=2)
-        & np.any(objectives[:, None] < objectives[None, :], axis=2)
+    domination = np.all(objectives[:, None] <= objectives[None, :], axis=2) & np.any(
+        objectives[:, None] < objectives[None, :], axis=2
     )
     counts = domination.sum(axis=0)
     front = np.flatnonzero(counts == 0)
@@ -117,16 +130,20 @@ class IBGWO4:
 
     def _initialize(self):
         cfg = self.cfg
-        positions = self.rng.random((cfg.population_size, cfg.dimensions)).astype(np.float32)
+        positions = self.rng.random((cfg.population_size, cfg.dimensions)).astype(
+            np.float32
+        )
         velocities = self.rng.uniform(
             -cfg.velocity_limit, cfg.velocity_limit, size=positions.shape
         ).astype(np.float32)
         self.particles = []
         for position, velocity in zip(positions, velocities):
             objectives = self._evaluate(position)
-            self.particles.append(Particle(
-                position, velocity, objectives, position.copy(), objectives.copy()
-            ))
+            self.particles.append(
+                Particle(
+                    position, velocity, objectives, position.copy(), objectives.copy()
+                )
+            )
         self._update_archive(self.particles)
 
     def _child(self, parent, position, velocity):
@@ -140,7 +157,9 @@ class IBGWO4:
             velocity=np.asarray(velocity, dtype=np.float32).copy(),
             objectives=objectives,
             pbest_position=(position if improved else parent.pbest_position).copy(),
-            pbest_objectives=(objectives if improved else parent.pbest_objectives).copy(),
+            pbest_objectives=(
+                objectives if improved else parent.pbest_objectives
+            ).copy(),
         )
 
     def _step(self, generation):
@@ -154,7 +173,9 @@ class IBGWO4:
         for parent in parents:
             A = 2.0 * a * self.rng.random(leaders.shape) - a
             C = 2.0 * self.rng.random(leaders.shape)
-            position = (leaders - A * np.abs(C * leaders - parent.position)).mean(axis=0)
+            position = (leaders - A * np.abs(C * leaders - parent.position)).mean(
+                axis=0
+            )
             gwo_population.append(self._child(parent, position, parent.velocity))
 
         self._update_archive(gwo_population)
@@ -173,7 +194,7 @@ class IBGWO4:
         candidates = parents + gwo_population + pso_population
         self._update_archive(candidates)
         order = pareto_order(np.vstack([p.objectives for p in candidates]))
-        self.particles = [candidates[i] for i in order[:cfg.population_size]]
+        self.particles = [candidates[i] for i in order[: cfg.population_size]]
 
     def run(self):
         start = time.perf_counter()
@@ -183,7 +204,11 @@ class IBGWO4:
                 self._step(generation)
             self.logger.log_population(generation, self.particles)
             self.logger.log_generation(
-                generation, self.particles, self.archive, time.perf_counter() - start, self.evaluations
+                generation,
+                self.particles,
+                self.archive,
+                time.perf_counter() - start,
+                self.evaluations,
             )
             self.logger.print_progress(self.cfg.generations)
 

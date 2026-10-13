@@ -14,7 +14,6 @@ FEATURES = [
     "cnn_lstm_score",
 ]
 
-
 def validate_labels(values, n_samples=None):
     values = np.asarray(values)
     if (values.ndim != 1 or not values.size or not np.isin(values, (0, 1)).all()

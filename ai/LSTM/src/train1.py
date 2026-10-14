@@ -507,8 +507,8 @@ class Trainer:
         tmp_path.rename(target_path)
 
     def save_checkpoint(self, epoch: int, is_best: bool = False, val_f1: Optional[float] = None) -> None:
-        if is_best and val_f1 is not None and val_f1 > self.best_val_f1:
-            self.best_val_f1 = val_f1
+        if is_best and val_f1 is not None:
+            self.best_val_f1 = float(val_f1)
 
         state = {
             "epoch": epoch,
@@ -587,7 +587,6 @@ class Trainer:
                       f"Val Acc: {val_metrics['acc']:.4f}")
 
                 if val_metrics["f1"] > self.best_val_f1:
-                    self.best_val_f1 = val_metrics["f1"]
                     is_best = True
             else:
                 print(f"Epoch {epoch:02d}/{self.cfg.epochs} | Train Loss: {train_metrics['loss']:.4f} | "

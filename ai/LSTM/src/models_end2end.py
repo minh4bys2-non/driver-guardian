@@ -11,7 +11,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.models import ConvGRUClassifier
+from src.models_convgru import ConvGRUClassifier
 from ai.ObjectDetection_2p6M.src.backbone_neck import Backbone, PAFPN
 
 
@@ -42,6 +42,7 @@ class DrowsyClassifier(nn.Module):
             supervision_mode: str = "attention_pooling",
             gradient_checkpointing: bool = False,
             freeze_bn: bool = True,
+            prior_prob: float = 0.5,
     ):
         """
         Khởi tạo DrowsyClassifier End-to-End.
@@ -59,6 +60,7 @@ class DrowsyClassifier(nn.Module):
             supervision_mode (str): 'attention_pooling' (clip-level) hoặc 'sequence' (frame-level).
             gradient_checkpointing (bool): Bật checkpointing cho Backbone/PAFPN để tiết kiệm VRAM khi train.
             freeze_bn (bool): Khóa thống kê running mean/var của BatchNorm trong Backbone/PAFPN (mặc định True).
+            prior_prob (float): Xác suất prior khởi tạo bias cho head phân loại để phá vỡ đối xứng (mặc định 0.5).
         """
         super().__init__()
         self.num_classes = int(num_classes)
@@ -72,6 +74,7 @@ class DrowsyClassifier(nn.Module):
         self.supervision_mode = str(supervision_mode).lower()
         self.gradient_checkpointing = bool(gradient_checkpointing)
         self.freeze_bn = bool(freeze_bn)
+        self.prior_prob = float(prior_prob)
 
         # 1. Trích xuất đặc trưng không gian (Spatial Backbone)
         self.backbone = Backbone(w=self.backbone_w, n=self.backbone_n)
@@ -91,9 +94,47 @@ class DrowsyClassifier(nn.Module):
             supervision_mode=self.supervision_mode,
         )
 
-        # 4. Tự động áp dụng khóa BatchNorm ngay khi khởi tạo nếu freeze_bn=True
+        # 4. Khởi tạo trọng số tổng thể phá vỡ tính đối xứng (Symmetry Breaking Initialization)
+        self._init_weights(prior_prob=self.prior_prob)
+
+        # 5. Tự động áp dụng khóa BatchNorm ngay khi khởi tạo nếu freeze_bn=True
         if self.freeze_bn:
             self._freeze_backbone_neck_bn()
+
+    def _init_weights(self, prior_prob: float = 0.5) -> None:
+        """
+        Khởi tạo trọng số chuyên nghiệp phá vỡ hoàn toàn tính đối xứng cho DrowsyClassifier:
+          - Conv2d: Kaiming Normal (mode='fan_out', nonlinearity='relu') phù hợp với SiLU.
+          - BatchNorm2d: weight=1.0, bias=0.0.
+          - Linear: Xavier Uniform cho các tầng ẩn.
+          - Head Classifier (fc_out): Khởi tạo Prior Bias để loại bỏ đối xứng xác suất 50/50 ban đầu.
+        """
+        import math
+        for name, m in self.named_modules():
+            # Bỏ qua conv_gates và conv_candidate vì đã có reset_parameters chuyên biệt
+            if "conv_gates" in name or "conv_candidate" in name:
+                continue
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
+                if m.weight is not None:
+                    nn.init.ones_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Linear):
+                if "fc_out" in name and m.out_features == 2:
+                    nn.init.xavier_uniform_(m.weight)
+                    if m.bias is not None:
+                        prob = max(1e-4, min(1.0 - 1e-4, float(prior_prob)))
+                        bias_val = -math.log((1.0 - prob) / prob)
+                        nn.init.zeros_(m.bias)
+                        m.bias.data[1] = bias_val
+                else:
+                    nn.init.xavier_uniform_(m.weight)
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
 
     def train(self, mode: bool = True):
         """Chuyển đổi trạng thái train/eval kèm hỗ trợ khóa BatchNorm tự động nếu freeze_bn=True."""
@@ -179,7 +220,7 @@ class DrowsyClassifier(nn.Module):
         p3_list, p4_list, p5_list = [], [], []
 
         for i in range(0, num_active, step):
-            chunk = active_frames[i : min(i + step, num_active)]
+            chunk = active_frames[i: min(i + step, num_active)]
             is_single = (chunk.shape[0] <= 1)
 
             # Phòng vệ: Nếu freeze_bn=False nhưng chunk <= 1 frame (do padding lẻ),
@@ -273,8 +314,8 @@ class DrowsyClassifier(nn.Module):
         valid_mask = None
         if seq_lens is not None:
             time_indices = torch.arange(T, device=x.device).unsqueeze(0)  # [1, T]
-            lens_expanded = seq_lens.to(x.device).unsqueeze(1)            # [B, 1]
-            valid_mask = (time_indices < lens_expanded).view(-1)          # [B * T]
+            lens_expanded = seq_lens.to(x.device).unsqueeze(1)  # [B, 1]
+            valid_mask = (time_indices < lens_expanded).view(-1)  # [B * T]
 
         # 3. Định hình lại không gian an toàn cho cả non-contiguous tensors
         flat_frames = x.reshape(B * T, C, H, W)
@@ -314,7 +355,7 @@ if __name__ == "__main__":
     print(f"[*] Thiết bị kiểm thử: {device}")
     if device.type == "cuda":
         print(f"[*] Tên GPU: {torch.cuda.get_device_name(0)}")
-        print(f"[*] VRAM vật lý: {torch.cuda.get_device_properties(0).total_memory / (1024**3):.2f} GB")
+        print(f"[*] VRAM vật lý: {torch.cuda.get_device_properties(0).total_memory / (1024 ** 3):.2f} GB")
 
     # TEST 1: Forward Shape Check
     print("\n[Test 1] Kiểm tra shape đầu ra với seq_lens và uint8 đầu vào...")
@@ -324,7 +365,8 @@ if __name__ == "__main__":
     seq_lens = torch.tensor([8, 5], device=device)
     with torch.no_grad():
         out = model(x, seq_lens=seq_lens)
-    print(f"    -> Output shape: {out.shape} (Kỳ vọng: torch.Size([2, 2])) -> {'PASS' if out.shape == torch.Size([2, 2]) else 'FAIL'}")
+    print(
+        f"    -> Output shape: {out.shape} (Kỳ vọng: torch.Size([2, 2])) -> {'PASS' if out.shape == torch.Size([2, 2]) else 'FAIL'}")
 
     # TEST 2: Gradient Accumulation & Equivalence
     print("\n[Test 2] Kiểm tra tính tương đương toán học Gradient (Chunked vs Full Batch)...")
@@ -358,7 +400,8 @@ if __name__ == "__main__":
                 max_grad_diff = diff
     print(f"    -> Sai số feature map tối đa: {max_feat_diff:.2e} (Kỳ vọng: < 1e-7)")
     print(f"    -> Sai số gradient Backbone/Neck tối đa: {max_grad_diff:.2e} (Do thứ tự cộng dồn FP32)")
-    print(f"    -> Trạng thái: {'PASS (Tương đương toán học 100%)' if max_feat_diff < 1e-6 and max_grad_diff < 1e-2 else 'FAIL'}")
+    print(
+        f"    -> Trạng thái: {'PASS (Tương đương toán học 100%)' if max_feat_diff < 1e-6 and max_grad_diff < 1e-2 else 'FAIL'}")
 
     # TEST 3: Padding Zero-Gradient Check
     print("\n[Test 3] Kiểm tra cách ly khung hình padding (Zero Gradient trên padding frame)...")
@@ -373,9 +416,11 @@ if __name__ == "__main__":
 
     # TEST 4: BatchNorm Invariance & Double-Update Immunity Check
     print("\n[Test 4] Kiểm tra bảo vệ thống kê BatchNorm & Triệt tiêu Double Update (Training + GradCkpt)...")
-    m_bn_test = DrowsyClassifier(num_classes=2, chunk_size=4, gradient_checkpointing=True, freeze_bn=True).to(device).train()
-    bn_stats_before = [m.running_mean.clone() for m in m_bn_test.backbone.modules() if isinstance(m, nn.BatchNorm2d) and m.running_mean is not None]
-    
+    m_bn_test = DrowsyClassifier(num_classes=2, chunk_size=4, gradient_checkpointing=True, freeze_bn=True).to(
+        device).train()
+    bn_stats_before = [m.running_mean.clone() for m in m_bn_test.backbone.modules() if
+                       isinstance(m, nn.BatchNorm2d) and m.running_mean is not None]
+
     # Huấn luyện batch có padding bất đối xứng: video 0 có 4 frames, video 1 có 5 frames (5 chia chunk 4 ra chunk 1 frame!)
     x_bn = torch.randn(2, 5, 3, 224, 224, device=device)
     lens_bn = torch.tensor([4, 5], device=device)
@@ -383,16 +428,19 @@ if __name__ == "__main__":
     loss_bn = out_bn.sum()
     loss_bn.backward()
 
-    bn_stats_after = [m.running_mean.clone() for m in m_bn_test.backbone.modules() if isinstance(m, nn.BatchNorm2d) and m.running_mean is not None]
+    bn_stats_after = [m.running_mean.clone() for m in m_bn_test.backbone.modules() if
+                      isinstance(m, nn.BatchNorm2d) and m.running_mean is not None]
     max_stat_drift = max((b - a).abs().max().item() for b, a in zip(bn_stats_before, bn_stats_after))
-    
+
     # Kiểm tra tính học được của trọng số BatchNorm (Affine weights gamma, beta phải nhận gradient)
-    bn_grads = [m.weight.grad is not None and m.weight.grad.abs().sum().item() > 0 for m in m_bn_test.backbone.modules() if isinstance(m, nn.BatchNorm2d) and m.weight is not None]
+    bn_grads = [m.weight.grad is not None and m.weight.grad.abs().sum().item() > 0 for m in m_bn_test.backbone.modules()
+                if isinstance(m, nn.BatchNorm2d) and m.weight is not None]
     has_bn_grads = any(bn_grads)
 
     print(f"    -> Độ trôi thống kê running_mean sau Train Forward & Backward: {max_stat_drift:.6f} (Kỳ vọng: 0.0)")
     print(f"    -> Trọng số Affine (gamma, beta) của BatchNorm vẫn nhận gradient: {'PASS' if has_bn_grads else 'FAIL'}")
-    print(f"    -> Trạng thái: {'PASS (Triệt tiêu 100% Double Update & Bảo toàn Học tập)' if max_stat_drift == 0.0 and has_bn_grads else 'FAIL'}")
+    print(
+        f"    -> Trạng thái: {'PASS (Triệt tiêu 100% Double Update & Bảo toàn Học tập)' if max_stat_drift == 0.0 and has_bn_grads else 'FAIL'}")
 
     # TEST 5: VRAM Benchmark Check
     if device.type == "cuda":
@@ -401,7 +449,8 @@ if __name__ == "__main__":
             gc.collect()
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
-            m_vram = DrowsyClassifier(num_classes=2, chunk_size=32, gradient_checkpointing=True, freeze_bn=True).to(device).train()
+            m_vram = DrowsyClassifier(num_classes=2, chunk_size=32, gradient_checkpointing=True, freeze_bn=True).to(
+                device).train()
             opt = torch.optim.AdamW(m_vram.parameters(), lr=1e-3)
             scaler = torch.amp.GradScaler('cuda')
             x_vram = torch.randn(bz_val, t_val, 3, 224, 224, device=device)
@@ -416,7 +465,8 @@ if __name__ == "__main__":
             torch.cuda.synchronize()
             pk_alloc = torch.cuda.max_memory_allocated() / (1024 ** 2)
             pk_resv = torch.cuda.max_memory_reserved() / (1024 ** 2)
-            print(f"    -> bz={bz_val}, T={t_val:3d} (Tổng {bz_val*t_val:3d} frames) | Peak Alloc: {pk_alloc:7.2f} MB ({pk_alloc/1024:.2f} GB) | Peak Resv: {pk_resv:7.2f} MB ({pk_resv/1024:.2f} GB) -> PASS")
+            print(
+                f"    -> bz={bz_val}, T={t_val:3d} (Tổng {bz_val * t_val:3d} frames) | Peak Alloc: {pk_alloc:7.2f} MB ({pk_alloc / 1024:.2f} GB) | Peak Resv: {pk_resv:7.2f} MB ({pk_resv / 1024:.2f} GB) -> PASS")
             del m_vram, opt, x_vram, tgt_vram
             gc.collect()
             torch.cuda.empty_cache()

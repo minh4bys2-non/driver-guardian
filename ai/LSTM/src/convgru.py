@@ -115,7 +115,9 @@ class ConvGRUCell(nn.Module):
             w_gates_h = w_gates[:, self.input_dim:, :, :]
 
             nn.init.kaiming_normal_(w_gates_x, mode="fan_out", nonlinearity="relu")
-            nn.init.orthogonal_(w_gates_h)
+            # Khởi tạo trực giao độc lập cho từng cổng Reset và Update để phá vỡ hoàn toàn tính liên đới đối xứng
+            nn.init.orthogonal_(w_gates_h[:self.hidden_dim])
+            nn.init.orthogonal_(w_gates_h[self.hidden_dim:])
 
             if self.conv_gates.bias is not None:
                 nn.init.zeros_(self.conv_gates.bias)

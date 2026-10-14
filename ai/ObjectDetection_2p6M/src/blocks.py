@@ -151,18 +151,9 @@ class Attention(nn.Module):
         )
         q, k, v = qkv.permute(1, 0, 2, 4, 3).contiguous().unbind(0)
         v_spatial = v.transpose(-2, -1).reshape(B, C, H, W)
-        # ==============================================================================
-        # TRƯỚC KHI THAY THẾ:
-        # out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0)
-        # ==============================================================================
 
-        # ==============================================================================
-        # SAU KHI THAY THẾ (HOÀN TOÀN TƯƠNG THÍCH VULKAN GPU & LOẠI BỎ LOGICAL_NOT):
-        scale = 1.0 / math.sqrt(self.head_dim)
-        attn_weights = torch.matmul(q, k.transpose(-2, -1)) * scale
-        attn_weights = F.softmax(attn_weights, dim=-1)
-        out = torch.matmul(attn_weights, v)
-        # ==============================================================================
+        out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0)
+
         out = out.transpose(-2, -1).reshape(B, C, H, W)
         out = self.proj(out + self.pe(v_spatial))
 

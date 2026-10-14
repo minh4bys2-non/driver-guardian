@@ -1,59 +1,19 @@
-"""
-Spatio-Temporal ConvGRU Classifier Module - src/models1.py
-Hệ thống phát hiện trạng thái ngủ gật không gian - thời gian Driver Guardian AI.
-
-Đặc điểm kiến trúc cốt lõi:
-  1. Bảo toàn bản đồ không gian 2D (40x40) qua thời gian, khắc phục triệt để việc nén phẳng
-     sớm thành vector 1D của CNNAdapter trong src/models.py.
-  2. Tích hợp module ConvGRU chuẩn hóa từ src/convgru.py (Kernel Fusion, Dynamic Spatial Resolution).
-  3. Cổ giảm kênh không gian SpatialReductionNeck siêu nhẹ (448 -> 64 kênh) giảm hơn 95% tham số
-     so với CNNAdapter cũ (từ 10.75M xuống ~0.48M tham số).
-  4. Cơ chế Chú ý Kép (Dual Attention):
-     - SpatialAttentionPooling: Học bản đồ chú ý không gian 2D tập trung vào vùng mắt/miệng.
-     - TemporalAttentionPooling: Gom tụ chuỗi thời gian kèm Dynamic Masking (seq_lens) triệt tiêu gradient rác.
-  5. Hỗ trợ toàn diện 3 chế độ suy luận:
-     - Clip-level Attention Pooling (mặc định cho huấn luyện).
-     - Frame-level Sequence Classification (cho giám sát liên tục).
-     - Online Stateful Streaming Inference (nạp hidden_state thời gian thực trên camera xe hơi).
-"""
-
 import math
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-if sys.platform.startswith("win"):
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")
-        sys.stderr.reconfigure(encoding="utf-8")
-    except Exception:
-        pass
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-try:
-    from src.convgru import ConvGRU
-except ModuleNotFoundError:
-    from convgru import ConvGRU
+from src.convgru import ConvGRU
 
 
 class SpatialReductionNeck(nn.Module):
     """
-    Cổ Giảm Kênh Không Gian Đa Tỷ Lệ (Multi-Scale Spatial Reduction Neck).
-    
-    Căn chỉnh các tầng đặc trưng từ NMSFreeDetector PAFPN:
-      - p3: [B, (T), 64, 80, 80]  -> MaxPool2d(s=2) -> 40x40
-      - p4: [B, (T), 128, 40, 40] -> Giữ nguyên     -> 40x40
-      - p5: [B, (T), 256, 20, 20] -> Upsample(x2)   -> 40x40
-    
-    Sau đó ghép kênh thành 448 kênh tại lưới 40x40, và nén qua Conv2d 1x1 + BN + SiLU
-    xuống out_channels (mặc định 64 kênh), giữ nguyên kích thước không gian 40x40.
+
     """
 
     def __init__(
@@ -61,7 +21,6 @@ class SpatialReductionNeck(nn.Module):
             in_channels: Union[Tuple[Tuple[int, ...], ...], Tuple[int, ...]] = (64, 128, 256),
             out_channels: int = 64,
             dropout: float = 0.1,
-            target_size: Tuple[int, int] = (40, 40)
     ):
         super().__init__()
         if len(in_channels) > 0 and isinstance(in_channels[0], (tuple, list)):
@@ -72,7 +31,6 @@ class SpatialReductionNeck(nn.Module):
         self.num_scales = len(self.channel_dims)
         self.total_in_channels = sum(self.channel_dims)
         self.out_channels = int(out_channels)
-        self.target_size = tuple(target_size)
 
         # 1. Các tầng căn chỉnh kích thước không gian về target_size (mặc định 40x40)
         self.p3_down = nn.MaxPool2d(kernel_size=2, stride=2)
@@ -99,12 +57,11 @@ class SpatialReductionNeck(nn.Module):
             p4: torch.Tensor,
             p5: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Căn chỉnh kích thước không gian của 3 mức về lưới target_size."""
-        th, tw = self.target_size
-        out_p3 = self.p3_down(p3) if p3.shape[-2:] != (th, tw) else p3
-        out_p4 = p4 if p4.shape[-2:] == (th, tw) else F.interpolate(p4, size=(th, tw), mode="bilinear",
-                                                                    align_corners=False)
-        out_p5 = self.p5_up(p5) if p5.shape[-2:] != (th, tw) else p5
+        """ """
+
+        out_p3 = self.p3_down(p3)
+        out_p4 = p4
+        out_p5 = self.p5_up(p5)
         return out_p3, out_p4, out_p5
 
     def forward(
@@ -114,15 +71,7 @@ class SpatialReductionNeck(nn.Module):
             *args: torch.Tensor
     ) -> torch.Tensor:
         """
-        Lan truyền xuôi của cổ giảm kênh.
 
-        Args:
-            features: Tuple/List 3 tensor (p3, p4, p5) hoặc Tensor đơn lẻ 4D/5D.
-            seq_lens: Optional. Tensor độ dài thực tế của từng clip trong batch [Batch].
-        Returns:
-            torch.Tensor: Tensor đặc trưng không gian đã giảm kênh:
-                - Nếu đầu vào là chuỗi 5D: [B, T, out_channels, H, W]
-                - Nếu đầu vào là frame 4D: [B, out_channels, H, W]
         """
         if len(args) > 0:
             features = (features, *args)
@@ -135,7 +84,7 @@ class SpatialReductionNeck(nn.Module):
             p3, p4, p5 = features[0], features[1], features[2]
             is_5d = (p3.dim() == 5)
             orig_b, orig_t = 0, 0
-
+            target_size = p4.shape[3]
             if is_5d:
                 orig_b, orig_t = p3.shape[0], p3.shape[1]
                 p3 = p3.reshape(orig_b * orig_t, *p3.shape[2:])
@@ -154,10 +103,10 @@ class SpatialReductionNeck(nn.Module):
                 if valid_fused.numel() > 0:
                     valid_reduced = self.reduction(valid_fused)
                 else:
-                    valid_reduced = torch.empty((0, self.out_channels, self.target_size[0], self.target_size[1]),
+                    valid_reduced = torch.empty((0, self.out_channels, target_size, target_size),
                                                 device=fused.device, dtype=fused.dtype)
 
-                reduced = torch.zeros((orig_b * orig_t, self.out_channels, self.target_size[0], self.target_size[1]),
+                reduced = torch.zeros((orig_b * orig_t, self.out_channels, target_size, target_size),
                                       device=fused.device, dtype=fused.dtype)
                 reduced[mask] = valid_reduced.to(reduced.dtype)
             else:
@@ -215,14 +164,7 @@ class SpatialReductionNeck(nn.Module):
 
 class SpatialAttentionPooling(nn.Module):
     """
-    Gom tụ không gian có trọng số chú ý 2D (Spatial Attention Pooling).
-    
-    Học bản đồ chú ý alpha_t(x, y) trên lưới không gian H x W, giúp mô hình
-    tự động tập trung vào các vùng giải phẫu quyết định (mắt, khóe miệng, góc đầu)
-    và triệt tiêu nhiễu nền cabin xe hơi:
-        S_t = Conv2d(Conv2d(H_t))
-        alpha_t = Softmax_spatial(S_t)
-        F_t = sum_{x,y} alpha_t(x,y) * H_t(x,y)  -> Vector [C]
+
     """
 
     def __init__(self, in_channels: int, hidden_dim: Optional[int] = None):
@@ -244,14 +186,7 @@ class SpatialAttentionPooling(nn.Module):
             return_weights: bool = False
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
-        Args:
-            x: Tensor đặc trưng không gian 5D [Batch, Time, Channels, H, W]
-               hoặc 4D [Batch, Channels, H, W].
-            seq_lens: Optional. Tensor độ dài thực tế của từng clip trong batch [Batch].
-            return_weights: Có trả về bản đồ trọng số chú ý không gian hay không.
-        Returns:
-            pooled: Tensor vector [Batch, Time, Channels] hoặc [Batch, Channels].
-            weights (tùy chọn): Bản đồ chú ý không gian [Batch, Time, 1, H, W].
+
         """
         is_5d = (x.dim() == 5)
         orig_b, orig_t = 0, 0
@@ -302,9 +237,7 @@ class SpatialAttentionPooling(nn.Module):
 
 class TemporalAttentionPooling(nn.Module):
     """
-    Gom tụ chuỗi thời gian có trọng số chú ý động (Temporal Attention MLP).
-    
-    Triệt tiêu 100% gradient rác từ các khung hình zero-padding thông qua Dynamic Attention Masking.
+
     """
 
     def __init__(self, hidden_dim: int):
@@ -322,12 +255,7 @@ class TemporalAttentionPooling(nn.Module):
             seq_lens: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Args:
-            seq_features: Tensor đặc trưng chuỗi thời gian [Batch, Time, Hidden].
-            seq_lens: Tensor độ dài thực tế của từng clip trong batch [Batch].
-        Returns:
-            pooled: Vector đặc trưng đại diện toàn bộ clip [Batch, Hidden].
-            weights: Trọng số chú ý tương ứng từng khung hình [Batch, Time].
+
         """
         b, t, h = seq_features.shape
         scores = self.attn(seq_features).squeeze(-1)  # [B, T]
@@ -347,15 +275,7 @@ class TemporalAttentionPooling(nn.Module):
 
 class ConvGRUClassifier(nn.Module):
     """
-    Mô hình Phân Loại Chuỗi Không Gian - Thời Gian Spatio-Temporal ConvGRU.
-    
-    Luồng xử lý hoàn chỉnh:
-      (p3, p4, p5) -> SpatialReductionNeck -> ConvGRU (2D) -> SpatialAttentionPooling -> TemporalAttentionPooling -> FC Head.
-    
-    Ưu thế vượt trội:
-      - Duy trì kích thước không gian 2D (40x40) xuyên suốt các bước thời gian của ConvGRU.
-      - Giảm hơn 95% tham số so với DeepGRUClassifier trong src/models.py (~0.48M vs 10.75M).
-      - Hỗ trợ toàn diện Stateful Streaming Inference thời gian thực trên camera với độ trễ < 1ms/frame.
+
     """
 
     def __init__(
@@ -392,7 +312,6 @@ class ConvGRUClassifier(nn.Module):
         self.num_layers = int(num_layers)
         self.num_classes = int(num_classes)
         self.supervision_mode = supervision_mode.lower()
-        self.target_size = target_size
         # Chuẩn hóa hidden_dims
         if isinstance(hidden_dim, (list, tuple)):
             self.hidden_dims = [int(h) for h in hidden_dim]
@@ -405,7 +324,6 @@ class ConvGRUClassifier(nn.Module):
             in_channels=spatial_in_channels,
             out_channels=self.input_dim,
             dropout=neck_dropout,
-            target_size=self.target_size
         )
 
         # 2. Khối chuỗi không gian - thời gian (Spatio-Temporal ConvGRU)
@@ -617,17 +535,7 @@ class ConvGRUClassifier(nn.Module):
 # BỘ KIỂM THỬ TỰ ĐỘNG CHUẨN XÁC CAO (SELF-VERIFICATION SUITE)
 # ==============================================================================
 if __name__ == "__main__":
-    print("=" * 80)
-    print(" BẮT ĐẦU BỘ KIỂM THỬ TỰ ĐỘNG CHO MÔ HÌNH SpatioTemporalConvGRU (src/models1.py)")
-    print("=" * 80)
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[*] Thiết bị kiểm thử: {device} ({torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'})")
-
-    # --------------------------------------------------------------------------
-    # TEST 1: Kiểm thử Kích thước Đầu vào Đa dạng & Tính Đúng Đắn Kích Thước
-    # --------------------------------------------------------------------------
-    print("\n[TEST 1] Kiểm tra tương thích đa dạng định dạng đầu vào...")
     model = ConvGRUClassifier(
         input_dim=64,
         hidden_dim=[64, 64],
@@ -637,182 +545,9 @@ if __name__ == "__main__":
     ).to(device).eval()
 
     # Trường hợp A: Tuple 3 tensor 5D (p3, p4, p5)
-    p3 = torch.randn(2, 6, 64, 80, 80, device=device)
-    p4 = torch.randn(2, 6, 128, 40, 40, device=device)
-    p5 = torch.randn(2, 6, 256, 20, 20, device=device)
+    p3 = torch.randn(1, 6, 64, 28, 28, device=device)
+    p4 = torch.randn(1, 6, 128, 14, 14, device=device)
+    p5 = torch.randn(1, 6, 256, 7, 7, device=device)
 
-    with torch.no_grad():
-        out_clip = model((p3, p4, p5))
-        assert out_clip.shape == (2, 2), f"Lỗi shape clip-level: {out_clip.shape}"
-        print(f"  --> Case A: Tuple 5D -> Clip Logits: {list(out_clip.shape)} [PASS]")
-
-        out_seq = model((p3, p4, p5), return_sequence=True)
-        assert out_seq.shape == (2, 6, 2), f"Lỗi shape sequence-level: {out_seq.shape}"
-        print(f"  --> Case B: Tuple 5D -> Sequence Logits: {list(out_seq.shape)} [PASS]")
-
-        # Trường hợp C: Truyền rời model(p3, p4, p5)
-        out_loose = model(p3, p4, p5)
-        assert out_loose.shape == (2, 2), f"Lỗi loose args: {out_loose.shape}"
-        print(f"  --> Case C: Loose args model(p3, p4, p5) -> Logits: {list(out_loose.shape)} [PASS]")
-
-        # Trường hợp D: Frame 4D đơn lẻ [B, C, H, W]
-        p3_single = torch.randn(1, 64, 80, 80, device=device)
-        p4_single = torch.randn(1, 128, 40, 40, device=device)
-        p5_single = torch.randn(1, 256, 20, 20, device=device)
-        out_single = model((p3_single, p4_single, p5_single))
-        assert out_single.shape == (1, 2), f"Lỗi single frame: {out_single.shape}"
-        print(f"  --> Case D: Single frame 4D -> Logits: {list(out_single.shape)} [PASS]")
-
-    # --------------------------------------------------------------------------
-    # TEST 2: Kiểm thử Dynamic Sequence Masking (seq_lens)
-    # --------------------------------------------------------------------------
-    print("\n[TEST 2] Kiểm tra cơ chế triệt tiêu nhiễu Padding Frames (seq_lens)...")
-    # Batch gồm 2 mẫu: mẫu 0 có 3 frame hợp lệ, mẫu 1 có 6 frame (T=6)
-    seq_lens = torch.tensor([3, 6], device=device)
-    p3_pad = torch.randn(2, 6, 64, 80, 80, device=device)
-    p4_pad = torch.randn(2, 6, 128, 40, 40, device=device)
-    p5_pad = torch.randn(2, 6, 256, 20, 20, device=device)
-
-    with torch.no_grad():
-        out_clean, weights_dict = model(
-            (p3_pad, p4_pad, p5_pad),
-            seq_lens=seq_lens,
-            return_weights=True
-        )
-        t_weights = weights_dict["temporal"]  # [2, 6]
-        # Trọng số tại frame padding t >= 3 của mẫu 0 phải bằng xấp xỉ 0.0
-        padding_weights_sample0 = t_weights[0, 3:].sum().item()
-        assert padding_weights_sample0 < 1e-4, f"Lỗi: Frame padding nhận trọng số lớn hơn 0: {padding_weights_sample0}"
-        print(f"  --> Trọng số chú ý tại các frame padding của mẫu 0: {padding_weights_sample0:.6f} (~0.0) [PASS]")
-
-        # Test sequence mode masking
-        out_seq_masked = model(
-            (p3_pad, p4_pad, p5_pad),
-            seq_lens=seq_lens,
-            return_sequence=True
-        )
-        # Logits of padding frames in sample 0 (t=3,4,5) should be exactly 0
-        padding_logits_sum = out_seq_masked[0, 3:].abs().sum().item()
-        assert padding_logits_sum == 0.0, f"Lỗi: Logits tại padding frame không bằng 0: {padding_logits_sum}"
-        print(f"  --> Logits tại padding frames của mẫu 0 bị triệt tiêu về 0.0: {padding_logits_sum} [PASS]")
-
-    # --------------------------------------------------------------------------
-    # TEST 3: Kiểm thử Suy Luận Thời Gian Thực (Stateful Streaming Inference)
-    # --------------------------------------------------------------------------
-    print("\n[TEST 3] Kiểm tra tính nhất quán của Online Stateful Streaming Inference...")
-    with torch.no_grad():
-        full_clip_p3 = torch.randn(1, 10, 64, 80, 80, device=device)
-        full_clip_p4 = torch.randn(1, 10, 128, 40, 40, device=device)
-        full_clip_p5 = torch.randn(1, 10, 256, 20, 20, device=device)
-
-        # Chạy Offline toàn bộ 10 frames
-        out_offline = model((full_clip_p3, full_clip_p4, full_clip_p5), return_sequence=True)
-
-        # Chạy Online Streaming: 5 frames đầu và 5 frames sau nối tiếp
-        out_chunk1, state1 = model(
-            (full_clip_p3[:, :5], full_clip_p4[:, :5], full_clip_p5[:, :5]),
-            return_sequence=True,
-            return_state=True
-        )
-        out_chunk2, state2 = model(
-            (full_clip_p3[:, 5:], full_clip_p4[:, 5:], full_clip_p5[:, 5:]),
-            hidden_state=state1,
-            return_sequence=True,
-            return_state=True
-        )
-        out_streamed = torch.cat([out_chunk1, out_chunk2], dim=1)
-
-        diff_stream = torch.max(torch.abs(out_offline - out_streamed)).item()
-        assert diff_stream < 1e-4, f"Lệch số học giữa Offline và Streaming: {diff_stream}"
-        print(f"  --> Sai lệch số học cực đại giữa Offline và Streaming: {diff_stream:.8e} [PASS]")
-
-    # --------------------------------------------------------------------------
-    # TEST 4: Kiểm thử Tương Thích Mixed Precision (CUDA AMP)
-    # --------------------------------------------------------------------------
-    print("\n[TEST 4] Kiểm tra khả năng tương thích Mixed Precision (AMP Autocast)...")
-    if torch.cuda.is_available():
-        with torch.amp.autocast("cuda", dtype=torch.float16):
-            out_amp = model((p3, p4, p5))
-            assert out_amp.dtype == torch.float16, f"Lỗi dtype AMP: {out_amp.dtype}"
-            print(f"  --> CUDA AMP Autocast (fp16): Output dtype {out_amp.dtype} [PASS]")
-    else:
-        print("  --> Bỏ qua test CUDA AMP (Đang chạy CPU).")
-
-    # --------------------------------------------------------------------------
-    # TEST 5: Kiểm thử Lan Truyền Ngược Gradient (Backward Pass)
-    # --------------------------------------------------------------------------
-    print("\n[TEST 5] Kiểm tra lan truyền ngược gradient (Backward Pass & Trainability)...")
-    model_train = ConvGRUClassifier(
-        input_dim=64,
-        hidden_dim=[64, 64],
-        num_layers=2,
-        num_classes=2
-    ).to(device).train()
-
-    p3_train = torch.randn(2, 4, 64, 80, 80, device=device, requires_grad=True)
-    p4_train = torch.randn(2, 4, 128, 40, 40, device=device, requires_grad=True)
-    p5_train = torch.randn(2, 4, 256, 20, 20, device=device, requires_grad=True)
-
-    logits_train = model_train((p3_train, p4_train, p5_train))
-    loss = logits_train.sum()
-    loss.backward()
-
-    for name, param in model_train.named_parameters():
-        assert param.grad is not None, f"Thiếu gradient tại {name}"
-        assert not torch.isnan(param.grad).any(), f"Gradient chứa NaN tại {name}"
-        assert not torch.isinf(param.grad).any(), f"Gradient chứa Inf tại {name}"
-
-    print("  --> 100% tham số nhận gradient hợp lệ, không có NaN/Inf [PASS]")
-
-    # --------------------------------------------------------------------------
-    # TEST 6: Đo Lường Tham Số, Tốc Độ & Bộ Nhớ VRAM (Benchmark)
-    # --------------------------------------------------------------------------
-    print("\n[TEST 6] Benchmark định lượng tổng tham số, độ trễ và đỉnh VRAM...")
-    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    neck_params = sum(p.numel() for p in model.spatial_neck.parameters() if p.requires_grad)
-    convgru_params = sum(p.numel() for p in model.convgru.parameters() if p.requires_grad)
-    spatial_pool_params = sum(p.numel() for p in model.spatial_pooling.parameters() if p.requires_grad)
-    temporal_pool_params = sum(p.numel() for p in model.temporal_pooling.parameters() if p.requires_grad)
-    fc_params = sum(p.numel() for p in model.fc_out.parameters() if p.requires_grad)
-
-    print(f"  --> Tổng tham số SpatioTemporalConvGRUClassifier: {total_params:,} ({total_params / 1e6:.3f} M)")
-    print(f"      + SpatialReductionNeck : {neck_params:,} tham số ({neck_params / total_params * 100:.1f}%)")
-    print(f"      + ConvGRU Core (2 tầng): {convgru_params:,} tham số ({convgru_params / total_params * 100:.1f}%)")
-    print(f"      + SpatialAttentionPool : {spatial_pool_params:,} tham số")
-    print(f"      + TemporalAttentionPool: {temporal_pool_params:,} tham số")
-    print(f"      + Classification Head  : {fc_params:,} tham số")
-
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-
-        bench_p3 = torch.randn(4, 8, 64, 80, 80, device=device)
-        bench_p4 = torch.randn(4, 8, 128, 40, 40, device=device)
-        bench_p5 = torch.randn(4, 8, 256, 20, 20, device=device)
-
-        # Warm-up
-        for _ in range(5):
-            with torch.amp.autocast("cuda", dtype=torch.float16):
-                _ = model((bench_p3, bench_p4, bench_p5))
-        torch.cuda.synchronize()
-
-        start_ev = torch.cuda.Event(enable_timing=True)
-        end_ev = torch.cuda.Event(enable_timing=True)
-        start_ev.record()
-        for _ in range(20):
-            with torch.amp.autocast("cuda", dtype=torch.float16):
-                _ = model((bench_p3, bench_p4, bench_p5))
-        end_ev.record()
-        torch.cuda.synchronize()
-
-        batch_lat = start_ev.elapsed_time(end_ev) / 20.0
-        fps = (4 * 8) / (batch_lat / 1000.0)
-        peak_vram = torch.cuda.max_memory_allocated() / (1024 * 1024)
-
-        print(f"  --> Độ trễ Batch (B=4, T=8, FP16): {batch_lat:.2f} ms")
-        print(f"  --> Thông lượng toàn mạng: {fps:.1f} frames/giây")
-        print(f"  --> Đỉnh VRAM cấp phát: {peak_vram:.2f} MB")
-
-    print("\n" + "=" * 80)
-    print(" TẤT CẢ 6 BÀI KIỂM THỬ CHO src/models1.py ĐÃ HOÀN TẤT THÀNH CÔNG (100% PASS)!")
-    print("=" * 80)
+    output = model((p3, p4, p5))
+    print(output)

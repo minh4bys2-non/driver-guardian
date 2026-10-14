@@ -24,6 +24,7 @@ checkpoints/*
 # Training logs
 logs/*
 !logs/.gitkeep
+./docs
 
 # OS specific files
 .DS_Store

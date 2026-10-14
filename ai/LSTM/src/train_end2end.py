@@ -22,7 +22,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 # Import các thành phần dự án
 from configs.config import load_config, TrainConfig
-from src.models1 import DrowsyClassifier
+from src.models_end2end import DrowsyClassifier
 from src.dataset import build_raw_video_dataloaders
 
 

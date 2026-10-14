@@ -44,16 +44,7 @@ from ai.ObjectDetection_2p6M.src.backbone_neck import Backbone, PAFPN
 
 class BackboneNeck(nn.Module):
     """
-    Mô hình tích hợp Không gian Spatio: Backbone và PAFPN Neck.
-    Chuyên trách trích xuất 3 mức đặc trưng kim tự tháp (P3, P4, P5) từ ảnh đầu vào.
 
-    Đầu vào:
-        x (torch.Tensor): Tensor hình ảnh khuôn mặt [B, 3, H, W] (ví dụ: [B, 3, 640, 640]).
-    Đầu ra:
-        Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-            - p3: [B, 64, H/8, W/8] (stride 8)
-            - p4: [B, 128, H/16, W/16] (stride 16)
-            - p5: [B, 256, H/32, W/32] (stride 32)
     """
 
     def __init__(
@@ -65,11 +56,7 @@ class BackboneNeck(nn.Module):
         neck_n: int = 1,
     ):
         """
-        Khởi tạo BackboneNeck.
 
-        Hỗ trợ 2 chế độ:
-          1. Truyền trực tiếp module backbone và neck đã khởi tạo (tương thích ngược).
-          2. Tự động khởi tạo Backbone và PAFPN từ cấu hình kiến trúc (backbone_w, backbone_n, neck_n).
         """
         super().__init__()
         self.backbone_w = tuple(backbone_w)
@@ -100,23 +87,7 @@ class BackboneNeck(nn.Module):
         **kwargs,
     ) -> "BackboneNeck":
         """
-        Khởi tạo mô hình BackboneNeck và nạp trọng số trực tiếp từ checkpoint.
 
-        Hỗ trợ cả:
-          1. Checkpoint tinh gọn chỉ chứa tham số BackboneNeck (ví dụ best1.pt).
-          2. Checkpoint gốc đầy đủ của Landmark/Object Detector (ví dụ best.pt 65MB),
-             tự động lọc lấy các trọng số thuộc Backbone và Neck, bỏ qua Head và Optimizer.
-
-        Args:
-            checkpoint_path (Union[str, Path, Dict[str, Any]]): Đường dẫn tệp .pt hoặc dict checkpoint.
-            map_location (Optional[Union[str, torch.device]]): Thiết bị nạp (mặc định 'cpu').
-            eval_mode (bool): Chuyển mô hình sang chế độ eval() sau khi nạp (mặc định True).
-            strict (bool): Bắt buộc khớp chính xác toàn bộ tham số của Backbone và Neck (mặc định True).
-            use_ema (bool): Ưu tiên nạp trọng số EMA nếu checkpoint có lưu (mặc định True).
-            **kwargs: Cho phép ghi đè các tham số kiến trúc (backbone_w, backbone_n, neck_n).
-
-        Returns:
-            BackboneNeck: Thể hiện mô hình đã nạp trọng số hoàn chỉnh.
         """
         # 1. Nạp checkpoint từ file hoặc sử dụng dict trực tiếp
         if isinstance(checkpoint_path, (str, Path)):
@@ -211,16 +182,6 @@ def extract_backbone_neck_checkpoint(
     strict_validation: bool = True,
 ) -> Path:
     """
-    Trích xuất chỉ các tham số của BackboneNeck từ một checkpoint detector gốc và lưu thành file .pt tinh gọn.
-
-    Args:
-        source_ckpt_path: Đường dẫn checkpoint gốc (chứa full detector).
-        output_ckpt_path: Đường dẫn tệp đích cần lưu.
-        use_ema: Ưu tiên lấy trọng số EMA nếu có (mặc định True).
-        strict_validation: Kiểm tra tính hợp lệ bằng cách nạp lại vào BackboneNeck (mặc định True).
-
-    Returns:
-        Path: Đường dẫn tệp checkpoint đã trích xuất thành công.
     """
     src = Path(source_ckpt_path)
     if not src.exists():

@@ -1,30 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-r"""
-Tệp: src/dataset2.py
-Mục đích:
-    Xây dựng PyTorch Dataset (RawVideoFramesDataset), hàm gom batch (collate_video_frames)
-    và hàm factory (build_raw_video_dataloaders) để nạp trực tiếp video thô (.mp4, .avi, .mkv, .mov).
-    Module cũng cung cấp lớp ChunkedBackboneNeckExtractor để trích xuất đặc trưng
-    BackboneNeck (p3, p4, p5) trực tiếp trên GPU theo cơ chế Mini-Chunk, giúp ngăn chặn 
-    lỗi tràn VRAM (OOM) trên các GPU giới hạn bộ nhớ (ví dụ 4GB VRAM).
-
-Đặc tính kỹ thuật cốt lõi:
-    1. Dataset Siêu Nhẹ (CPU-bound):
-       RawVideoFramesDataset chỉ làm nhiệm vụ decode video, letterbox và trả về
-       Tensor uint8 trên CPU, đảm bảo tiết kiệm RAM và tuyệt đối không chạm tới GPU.
-    2. An toàn Tuyệt đối Đa Tiến trình:
-       Sử dụng num_workers > 0 không gây chết/đóng băng tiến trình do PyTorch Dataset
-       hoàn toàn tách biệt khỏi mô hình mạng.
-    3. Trích xuất Đặc trưng On-The-Fly (Mini-Chunk GPU):
-       ChunkedBackboneNeckExtractor được thiết kế để nhúng vào Vòng lặp Huấn luyện (Main Loop),
-       cắt nhỏ batch ảnh ra thành các chunk (VD: 4 hoặc 8 khung hình) đi qua Backbone,
-       bảo đảm trần VRAM (VRAM ceiling) không bao giờ bị vượt qua.
-    4. Tối ưu Băng thông PCIe:
-       Dữ liệu Tensor uint8 được đẩy lên GPU một lần, chạy qua Backbone và forward thẳng
-       vào LSTM/GRU, triệt tiêu overhead chuyển tiếp qua lại CPU-GPU.
-"""
-
 import os
 import sys
 import math

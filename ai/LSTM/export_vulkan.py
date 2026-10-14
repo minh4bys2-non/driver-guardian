@@ -1,15 +1,3 @@
-"""
-Pipeline Xuất Mô hình NMSFreeDetector và ConvGRUClassifier sang ExecuTorch .pte (Vulkan Backend)
-Hệ thống Giám sát và Cảnh báo Ngủ gật Tài xế - Driver Guardian AI.
-
-Đặc điểm kiến trúc:
-  1. ExportNMSFreeDetector: Trích xuất đặc trưng không gian P3, P4, P5 qua Backbone + PAFPN Neck.
-     Nhận ảnh [B, 3, H, W], đồ thị thuần khiết tĩnh, không nhúng chunking loop.
-  2. ExportConvGRUClassifier: Phân loại chuỗi không gian - thời gian 5D qua SpatialReductionNeck,
-     ConvGRU và Dual Attention Pooling. Bỏ qua seq_lens để loại bỏ SymNode guard, trả về Tensor [B].
-  3. Cấu hình tập trung ExportConfig: Quản lý toàn bộ đường dẫn, kích thước tensor và cờ backend tại một nơi.
-"""
-
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,7 +24,7 @@ import torch.nn.functional as F
 from executorch.backends.vulkan.partitioner.vulkan_partitioner import VulkanPartitioner
 from executorch.exir import to_edge, EdgeCompileConfig
 
-from ai.LSTM.src.models import ConvGRUClassifier
+from ai.LSTM.src.models_convgru import ConvGRUClassifier
 from ai.ObjectDetection_2p6M.src.backbone_neck import Backbone, PAFPN
 from ai.ObjectDetection_2p6M.src.model import NMSFreeDetector
 

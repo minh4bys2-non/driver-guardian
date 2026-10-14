@@ -5,28 +5,13 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.utils.checkpoint
-
-# Đảm bảo đường dẫn thư mục gốc dự án được thêm vào sys.path
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
 from src.models_convgru import ConvGRUClassifier
 from ai.ObjectDetection_2p6M.src.backbone_neck import Backbone, PAFPN
 
 
 class DrowsyClassifier(nn.Module):
     """
-    Mô hình Phân loại Trạng thái Buồn ngủ Toàn diện End-to-End Spatio-Temporal.
-    
-    Luồng xử lý (Data Flow):
-      Video [B, T, 3, H, W]
-        -> Reshape [B*T, 3, H, W]
-        -> Backbone & PAFPN (Gradient Checkpointing tùy chọn)
-        -> Trích xuất 3 mức đặc trưng không gian: p3, p4, p5
-        -> Reshape [B, T, C, H_feat, W_feat]
-        -> ConvGRUClassifier (SpatialReductionNeck -> ConvGRU -> Dual Attention -> FC Head)
-        -> Logits phân loại buồn ngủ.
+
     """
 
     def __init__(
@@ -45,22 +30,7 @@ class DrowsyClassifier(nn.Module):
             prior_prob: float = 0.5,
     ):
         """
-        Khởi tạo DrowsyClassifier End-to-End.
 
-        Args:
-            num_classes (int): Số lớp phân loại (mặc định 2: Tỉnh táo / Buồn ngủ).
-            chunk_size (int): Kích thước mini-chunk khi trích xuất qua Backbone/PAFPN (mặc định 32 frames).
-                              Giúp khống chế đỉnh VRAM ở O(chunk_size) thay vì O(B*T).
-            backbone_w (Tuple[int, ...]): Độ rộng các kênh của Backbone (mặc định (16, 32, 64, 128, 256)).
-            backbone_n (Tuple[int, ...]): Số lượng khối lặp lại trong từng tầng Backbone.
-            neck_n (int): Số lượng khối lặp lại trong PAFPN.
-            input_dim (int): Số kênh nén không gian đầu vào của ConvGRU (mặc định 64).
-            hidden_dim (Union[int, Tuple, List]): Số kênh ẩn trong các tầng ConvGRU.
-            target_size (Tuple[int, int]): Kích thước lưới không gian hội tụ (mặc định (14, 14)).
-            supervision_mode (str): 'attention_pooling' (clip-level) hoặc 'sequence' (frame-level).
-            gradient_checkpointing (bool): Bật checkpointing cho Backbone/PAFPN để tiết kiệm VRAM khi train.
-            freeze_bn (bool): Khóa thống kê running mean/var của BatchNorm trong Backbone/PAFPN (mặc định True).
-            prior_prob (float): Xác suất prior khởi tạo bias cho head phân loại để phá vỡ đối xứng (mặc định 0.5).
         """
         super().__init__()
         self.num_classes = int(num_classes)
@@ -103,11 +73,7 @@ class DrowsyClassifier(nn.Module):
 
     def _init_weights(self, prior_prob: float = 0.5) -> None:
         """
-        Khởi tạo trọng số chuyên nghiệp phá vỡ hoàn toàn tính đối xứng cho DrowsyClassifier:
-          - Conv2d: Kaiming Normal (mode='fan_out', nonlinearity='relu') phù hợp với SiLU.
-          - BatchNorm2d: weight=1.0, bias=0.0.
-          - Linear: Xavier Uniform cho các tầng ẩn.
-          - Head Classifier (fc_out): Khởi tạo Prior Bias để loại bỏ đối xứng xác suất 50/50 ban đầu.
+
         """
         import math
         for name, m in self.named_modules():
@@ -169,17 +135,7 @@ class DrowsyClassifier(nn.Module):
             valid_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Lan truyền qua Backbone và PAFPN theo cơ chế Mini-Chunking.
 
-        Đảm bảo 4 tiêu chí cốt lõi:
-        1. Bảo toàn tích tụ Gradient (Gradient Accumulation): Kết quả ghép qua torch.cat,
-           Autograd tự động cộng dồn chính xác dL/dW vào các trọng số dùng chung.
-        2. Xử lý Padding an toàn (Padding-Aware Masking): Khung hình zero-padding được lọc
-           bỏ trước khi qua Backbone, không sinh đạo hàm và phục hồi (scatter) zero chuẩn xác.
-        3. Bảo vệ thống kê BatchNorm: Khung hình padding không bao giờ đi vào BatchNorm.
-           Khi freeze_bn=True, BN ở eval mode hoạt động như phép biến đổi affine cố định.
-        4. Tối ưu hóa Gradient Checkpointing: Checkpoint độc lập trên từng chunk, giải phóng
-           activation ngay sau backward của chunk đó.
         """
         total_frames = flat_frames.shape[0]
         if total_frames == 0:

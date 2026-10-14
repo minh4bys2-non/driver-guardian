@@ -70,7 +70,7 @@ model:
   # [DÀNH RIÊNG DrowsyClassifier/train1.py] Bật gradient checkpointing cho Backbone/Neck tiết kiệm VRAM
   gradient_checkpointing: true
   # [DÀNH RIÊNG DrowsyClassifier/train1.py] Khóa running mean/var của BatchNorm trong Backbone/Neck
-  freeze_bn: false
+  freeze_bn: true
 
   # === THAM SỐ DÀNH RIÊNG CHO CONVGRU TÁCH RỜI (src/models.py & src/train.py) ===
   # [DÀNH RIÊNG ConvGRUClassifier] Kênh đặc trưng của các tầng (p3, p4, p5) từ NMSFreeDetector PAFPN
@@ -129,9 +129,9 @@ logging:
   # [DÙNG CHUNG] Số lượng checkpoint định kỳ tối đa giữ lại (null = giữ toàn bộ)
   ckpt_keep_last: null
   # [DÙNG CHUNG] Bật/tắt tiếp tục huấn luyện từ checkpoint
-  enable_resume: true
+  enable_resume: false
   # [DÙNG CHUNG] Đường dẫn file checkpoint hoặc bí danh ('last', 'best') để resume
-  resume: "D:/Project/DATN/driver-guardian/ai/LSTM/checkpoints/experiments/deepgru_raw_nmsfree/epoch_6.pt"
+  resume: ""
 
   # [DÙNG CHUNG] Cấu hình Giám sát Phân giải cao theo từng Step (Per-Step Metrics)
   enable_step_logging: true

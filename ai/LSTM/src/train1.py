@@ -155,10 +155,12 @@ class Trainer:
         input_dim = getattr(self.cfg, "convgru_in_dim", getattr(self.cfg, "input_dim", 64))
         hidden_dim = getattr(self.cfg, "convgru_hidden_dim", getattr(self.cfg, "hidden_dim", 64))
         gradient_checkpointing = getattr(self.cfg, "gradient_checkpointing", True)
-        freeze_bn = getattr(self.cfg, "freeze_bn", False)
+        freeze_bn = getattr(self.cfg, "freeze_bn", True)
+        chunk_size = getattr(self.cfg, "chunk_size", 32)
 
         self.model = DrowsyClassifier(
             num_classes=num_classes,
+            chunk_size=chunk_size,
             backbone_w=backbone_w,
             backbone_n=backbone_n,
             neck_n=neck_n,

@@ -113,7 +113,7 @@ class TrainConfig:
     # [DÀNH RIÊNG DrowsyClassifier/train1.py] Bật gradient checkpointing cho Backbone/Neck tiết kiệm VRAM
     gradient_checkpointing: bool = True
     # [DÀNH RIÊNG DrowsyClassifier/train1.py] Khóa running mean/var của BatchNorm trong Backbone/Neck
-    freeze_bn: bool = False
+    freeze_bn: bool = True
 
     # ---- THAM SỐ DÀNH RIÊNG CHO CONVGRU TÁCH RỜI (src/models.py & src/train.py) ----
     # [DÀNH RIÊNG ConvGRUClassifier] Kênh thực tế của (p3, p4, p5) từ Backbone PAFPN ngoài

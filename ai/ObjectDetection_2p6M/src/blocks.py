@@ -151,7 +151,9 @@ class Attention(nn.Module):
         )
         q, k, v = qkv.permute(1, 0, 2, 4, 3).contiguous().unbind(0)
         v_spatial = v.transpose(-2, -1).reshape(B, C, H, W)
+
         out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0)
+
         out = out.transpose(-2, -1).reshape(B, C, H, W)
         out = self.proj(out + self.pe(v_spatial))
 

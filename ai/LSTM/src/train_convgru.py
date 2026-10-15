@@ -1,22 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Script Huấn luyện Mô hình SpatioTemporal ConvGRUClassifier (Driver Guardian AI)
-Phiên bản: 2.0 (Đã gia cố toàn diện theo tiêu chuẩn Code Review & Quality Gates)
-
-Đặc tính kỹ thuật đã nâng cấp:
-1. Chuẩn hóa hàm mất mát (Loss) và nhãn dự đoán cho cả Binary BCE và Multi-class CE,
-   triệt tiêu hoàn toàn lỗi không nhận gradient của kênh 0.
-2. Tách biệt hoàn toàn việc lưu checkpoint last.pt khỏi điều kiện validation,
-   ngăn ngừa mất mát dữ liệu khi val_interval_epochs > 1.
-3. Bảo toàn trạng thái AMP GradScaler khi lưu và nạp checkpoint (Resumable AMP).
-4. Đồng bộ cơ chế bắt lỗi CUDA Out Of Memory (OOM) cho cả vòng lặp Train và Val,
-   giải phóng triệt để traceback frame để tránh OOM lặp lại.
-5. Khắc phục sai lệch gradient tích lũy (Gradient Accumulation) ở batch cuối epoch.
-6. Tích hợp Early Stopping và tự động ghi nhật ký huấn luyện ra file training_history.csv.
-7. Hỗ trợ phân giải bí danh checkpoint ('last', 'best') và cấu hình val_batch_size/val_num_workers riêng.
-"""
-
 import os
 import sys
 import time
@@ -41,7 +22,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 # Import các thành phần dự án
 from configs.config import load_config, TrainConfig
-from src.models import ConvGRUClassifier
+from src.models_convgru import ConvGRUClassifier
 from src.dataset import build_raw_video_dataloaders, ChunkedBackboneNeckExtractor
 
 

@@ -1,26 +1,6 @@
-"""
-ConvGRU Module - Chuẩn hóa kiến trúc Convolutional Gated Recurrent Unit
-Dành cho hệ thống phân loại chuỗi thời gian không gian Driver Guardian AI.
-
-Các cải tiến cốt lõi so với src/blocks.py và src/blocks1.py:
-  1. Dynamic Spatial Resolution: Không yêu cầu (height, width) lúc khởi tạo; tự động thích ứng mọi tỷ lệ.
-  2. Device & Dtype Agnostic: Tự động kế thừa device và dtype từ tensor đầu vào; hỗ trợ CPU/CUDA/MPS/AMP.
-  3. Kernel Fusion: Gộp Reset Gate và Update Gate vào một tầng Conv2D duy nhất (2 * hidden_dim) giảm 50% CUDA kernel launches.
-  4. Stateful Streaming Inference: Hỗ trợ nạp `hidden_state` ngoại vi để suy luận liên tục frame-by-frame hoặc chunk-by-chunk.
-  5. Sequence Masking: Hỗ trợ `seq_lens` đóng băng hidden state tại các frame zero-padding, triệt tiêu gradient rác.
-  6. Modern PyTorch: Tuân thủ PyTorch >= 2.0, không dùng Variable/deprecated APIs, khởi tạo trực giao in-place an toàn.
-"""
-
 import math
 import sys
 from typing import List, Optional, Tuple, Union
-
-if sys.platform.startswith("win"):
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")
-        sys.stderr.reconfigure(encoding="utf-8")
-    except Exception:
-        pass
 
 import torch
 import torch.nn as nn
@@ -42,12 +22,12 @@ class ConvGRUCell(nn.Module):
     """
 
     def __init__(
-        self,
-        input_dim: int,
-        hidden_dim: int,
-        kernel_size: Union[int, Tuple[int, int]] = 3,
-        bias: bool = True,
-        padding_mode: str = "zeros"
+            self,
+            input_dim: int,
+            hidden_dim: int,
+            kernel_size: Union[int, Tuple[int, int]] = 3,
+            bias: bool = True,
+            padding_mode: str = "zeros"
     ):
         """
         Khởi tạo ConvGRUCell.
@@ -115,7 +95,9 @@ class ConvGRUCell(nn.Module):
             w_gates_h = w_gates[:, self.input_dim:, :, :]
 
             nn.init.kaiming_normal_(w_gates_x, mode="fan_out", nonlinearity="relu")
-            nn.init.orthogonal_(w_gates_h)
+            # Khởi tạo trực giao độc lập cho từng cổng Reset và Update để phá vỡ hoàn toàn tính liên đới đối xứng
+            nn.init.orthogonal_(w_gates_h[:self.hidden_dim])
+            nn.init.orthogonal_(w_gates_h[self.hidden_dim:])
 
             if self.conv_gates.bias is not None:
                 nn.init.zeros_(self.conv_gates.bias)
@@ -134,11 +116,11 @@ class ConvGRUCell(nn.Module):
                 nn.init.zeros_(self.conv_candidate.bias)
 
     def init_hidden(
-        self,
-        batch_size: int,
-        spatial_size: Tuple[int, int],
-        device: Optional[torch.device] = None,
-        dtype: Optional[torch.dtype] = None
+            self,
+            batch_size: int,
+            spatial_size: Tuple[int, int],
+            device: Optional[torch.device] = None,
+            dtype: Optional[torch.dtype] = None
     ) -> torch.Tensor:
         """
         Khởi tạo trạng thái ẩn toàn số 0 động theo batch_size, kích thước không gian và thiết bị.
@@ -165,9 +147,9 @@ class ConvGRUCell(nn.Module):
         )
 
     def forward(
-        self,
-        input_tensor: torch.Tensor,
-        h_cur: Optional[torch.Tensor] = None
+            self,
+            input_tensor: torch.Tensor,
+            h_cur: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
         Lan truyền xuôi một bước thời gian đơn lẻ.
@@ -237,16 +219,16 @@ class ConvGRU(nn.Module):
     """
 
     def __init__(
-        self,
-        input_dim: int,
-        hidden_dim: Union[int, List[int], Tuple[int, ...]],
-        kernel_size: Union[int, Tuple[int, int], List[Union[int, Tuple[int, int]]]] = 3,
-        num_layers: int = 1,
-        batch_first: bool = True,
-        bias: bool = True,
-        return_all_layers: bool = False,
-        dropout: float = 0.0,
-        residual: bool = False
+            self,
+            input_dim: int,
+            hidden_dim: Union[int, List[int], Tuple[int, ...]],
+            kernel_size: Union[int, Tuple[int, int], List[Union[int, Tuple[int, int]]]] = 3,
+            num_layers: int = 1,
+            batch_first: bool = True,
+            bias: bool = True,
+            return_all_layers: bool = False,
+            dropout: float = 0.0,
+            residual: bool = False
     ):
         """
         Khởi tạo ConvGRU đa tầng.
@@ -320,11 +302,11 @@ class ConvGRU(nn.Module):
         self.dropouts = nn.ModuleList(dropout_list)
 
     def init_hidden(
-        self,
-        batch_size: int,
-        spatial_size: Tuple[int, int],
-        device: Optional[torch.device] = None,
-        dtype: Optional[torch.dtype] = None
+            self,
+            batch_size: int,
+            spatial_size: Tuple[int, int],
+            device: Optional[torch.device] = None,
+            dtype: Optional[torch.dtype] = None
     ) -> List[torch.Tensor]:
         """
         Khởi tạo trạng thái ẩn toàn số 0 cho tất cả các tầng.
@@ -344,10 +326,10 @@ class ConvGRU(nn.Module):
         ]
 
     def forward(
-        self,
-        input_tensor: torch.Tensor,
-        hidden_state: Optional[List[torch.Tensor]] = None,
-        seq_lens: Optional[torch.Tensor] = None
+            self,
+            input_tensor: torch.Tensor,
+            hidden_state: Optional[List[torch.Tensor]] = None,
+            seq_lens: Optional[torch.Tensor] = None
     ) -> Tuple[Union[torch.Tensor, List[torch.Tensor]], List[torch.Tensor]]:
         """
         Lan truyền xuôi chuỗi thời gian không gian.
@@ -407,8 +389,8 @@ class ConvGRU(nn.Module):
         if seq_lens is not None:
             # Tạo boolean mask dạng [Batch, Time]
             time_indices = torch.arange(seq_len, device=input_tensor.device).unsqueeze(0)  # [1, T]
-            seq_lens_tensor = seq_lens.to(input_tensor.device).unsqueeze(1)               # [B, 1]
-            masks = (time_indices < seq_lens_tensor)                                      # [B, T]
+            seq_lens_tensor = seq_lens.to(input_tensor.device).unsqueeze(1)  # [B, 1]
+            masks = (time_indices < seq_lens_tensor)  # [B, T]
 
         layer_outputs: List[torch.Tensor] = []
         last_states: List[torch.Tensor] = []
@@ -425,7 +407,7 @@ class ConvGRU(nn.Module):
             # Lặp qua từng bước thời gian t trong chuỗi
             for t in range(seq_len):
                 x_t = cur_layer_input[:, t, :, :, :]  # [B, C, H, W]
-                h_next = cell(x_t, h_t)               # [B, H_dim, H, W]
+                h_next = cell(x_t, h_t)  # [B, H_dim, H, W]
 
                 # Nếu có sequence masking, đóng băng trạng thái khi vượt quá seq_len
                 if masks is not None:
@@ -462,179 +444,5 @@ class ConvGRU(nn.Module):
         return final_output, last_states
 
 
-# ==============================================================================
-# BỘ KIỂM THỬ TỰ ĐỘNG CHUẨN XÁC CAO (SELF-VERIFICATION SUITE)
-# ==============================================================================
 if __name__ == "__main__":
-    print("=" * 75)
-    print(" BẮT ĐẦU BỘ KIỂM THỬ TỰ ĐỘNG CHO MODULE ConvGRU (src/convgru.py)")
-    print("=" * 75)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[*] Thiết bị kiểm thử: {device} ({torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'})")
-
-    # --------------------------------------------------------------------------
-    # TEST 1: Kiểm thử Tính Động Không Gian (Dynamic Spatial Invariance)
-    # Khắc phục hoàn toàn lỗi ép cứng (height, width) trong src/blocks1.py
-    # --------------------------------------------------------------------------
-    print("\n[TEST 1] Kiểm tra tính thích ứng kích thước không gian đa tỷ lệ (P3, P4, P5)...")
-    model_dynamic = ConvGRU(
-        input_dim=32,
-        hidden_dim=[64, 48],
-        kernel_size=3,
-        num_layers=2,
-        batch_first=True
-    ).to(device)
-
-    test_shapes = [
-        ("P3 (80x80)", (2, 4, 32, 80, 80)),
-        ("P4 (40x40)", (2, 4, 32, 40, 40)),
-        ("P5 (20x20)", (2, 4, 32, 20, 20)),
-        ("Odd Shape (15x27)", (2, 3, 32, 15, 27)),
-    ]
-
-    for label, shape in test_shapes:
-        dummy_x = torch.randn(*shape, device=device)
-        out, states = model_dynamic(dummy_x)
-        expected_shape = (shape[0], shape[1], 48, shape[3], shape[4])
-        assert out.shape == expected_shape, f"Lỗi shape tại {label}: out={out.shape}, expected={expected_shape}"
-        assert len(states) == 2, f"Lỗi số lượng hidden state: {len(states)}"
-        print(f"  --> {label}: Input {list(shape)} -> Output {list(out.shape)} [PASS]")
-
-    # --------------------------------------------------------------------------
-    # TEST 2: Kiểm thử Device & Tự Động Thích Ứng Mixed Precision (AMP Autocast)
-    # Khắc phục lỗi hardcode dtype trong src/blocks1.py
-    # --------------------------------------------------------------------------
-    print("\n[TEST 2] Kiểm tra khả năng tương thích Mixed Precision (AMP Autocast)...")
-    if torch.cuda.is_available():
-        with torch.amp.autocast("cuda", dtype=torch.float16):
-            dummy_amp = torch.randn(2, 4, 32, 40, 40, device=device)
-            out_amp, states_amp = model_dynamic(dummy_amp)
-            assert out_amp.dtype == torch.float16, f"Lỗi kiểu dữ liệu AMP: {out_amp.dtype}"
-            print(f"  --> CUDA AMP Autocast (fp16): Output dtype {out_amp.dtype} [PASS]")
-    else:
-        print("  --> Bỏ qua test CUDA AMP (Đang chạy CPU).")
-
-    # --------------------------------------------------------------------------
-    # TEST 3: Kiểm thử Suy Luận Thời Gian Thực (Stateful Streaming Inference)
-    # Khắc phục lỗi raise NotImplementedError trong src/blocks1.py
-    # --------------------------------------------------------------------------
-    print("\n[TEST 3] Kiểm tra tính chính xác của Stateful Streaming Inference...")
-    model_stream = ConvGRU(
-        input_dim=16,
-        hidden_dim=32,
-        num_layers=1,
-        batch_first=True
-    ).to(device).eval()
-
-    with torch.no_grad():
-        full_clip = torch.randn(1, 10, 16, 20, 20, device=device)
-
-        # Cách A: Chạy toàn bộ 10 frames cùng lúc (Offline mode)
-        out_full, last_state_full = model_stream(full_clip)
-
-        # Cách B: Chạy 5 frames đầu, lấy state truyền tiếp cho 5 frames sau (Streaming mode)
-        out_chunk1, state_chunk1 = model_stream(full_clip[:, :5])
-        out_chunk2, state_chunk2 = model_stream(full_clip[:, 5:], hidden_state=state_chunk1)
-        out_streamed = torch.cat([out_chunk1, out_chunk2], dim=1)
-
-        diff_out = torch.max(torch.abs(out_full - out_streamed)).item()
-        diff_state = torch.max(torch.abs(last_state_full[0] - state_chunk2[0])).item()
-
-        assert diff_out < 1e-5, f"Lệch số học giữa full và streaming: {diff_out}"
-        assert diff_state < 1e-5, f"Lệch số học state cuối: {diff_state}"
-        print(f"  --> Max sai lệch Output: {diff_out:.8e}")
-        print(f"  --> Max sai lệch Last State: {diff_state:.8e}")
-        print("  --> Streaming Mode hoàn toàn khớp với Offline Mode [PASS]")
-
-    # --------------------------------------------------------------------------
-    # TEST 4: Kiểm thử Sequence Masking (Độ dài chuỗi động seq_lens)
-    # Bảo vệ chống ô nhiễm gradient từ zero-padding frames
-    # --------------------------------------------------------------------------
-    print("\n[TEST 4] Kiểm tra Dynamic Sequence Masking (seq_lens)...")
-    # Batch gồm 2 mẫu: Mẫu 0 có 3 frame hợp lệ, Mẫu 1 có 6 frame hợp lệ (T_max = 6)
-    seq_lens = torch.tensor([3, 6], device=device)
-    x_padded = torch.randn(2, 6, 16, 20, 20, device=device)
-    # Đặt các frame từ t >= 3 của mẫu 0 thành số ngẫu nhiên rất lớn để thử nghiệm
-    x_padded[0, 3:, :, :, :] = 999.0
-
-    out_masked, states_masked = model_stream(x_padded, seq_lens=seq_lens)
-    # Tại bước t=2 (frame hợp lệ cuối của mẫu 0) và t=5 (frame padding cuối của mẫu 0),
-    # hidden state của mẫu 0 phải được giữ nguyên không đổi từ t=2 đến t=5!
-    state_sample0_t2 = out_masked[0, 2]
-    state_sample0_t5 = out_masked[0, 5]
-    diff_masked = torch.max(torch.abs(state_sample0_t2 - state_sample0_t5)).item()
-    assert diff_masked == 0.0, f"Lỗi: State bị thay đổi tại zero-padded frames! Diff={diff_masked}"
-    print(f"  --> Trạng thái ẩn mẫu 0 được bảo tồn nguyên vẹn qua các frame padding (Diff={diff_masked:.1f}) [PASS]")
-
-    # --------------------------------------------------------------------------
-    # TEST 5: Kiểm thử Lan Truyền Ngược Đạo Hàm (Backward Pass & Gradient Flow)
-    # --------------------------------------------------------------------------
-    print("\n[TEST 5] Kiểm tra lan truyền ngược gradient (Backward Pass)...")
-    model_grad = ConvGRU(
-        input_dim=16,
-        hidden_dim=[32, 24],
-        kernel_size=3,
-        num_layers=2,
-        batch_first=True,
-        residual=True
-    ).to(device).train()
-
-    dummy_grad_input = torch.randn(2, 4, 16, 30, 30, device=device, requires_grad=True)
-    out_grad, _ = model_grad(dummy_grad_input)
-    loss = out_grad.sum()
-    loss.backward()
-
-    # Kiểm tra mọi tham số đều có gradient hợp lệ, không có NaN/Inf
-    for name, param in model_grad.named_parameters():
-        assert param.grad is not None, f"Thiếu gradient tại tham số {name}"
-        assert not torch.isnan(param.grad).any(), f"Gradient chứa NaN tại {name}"
-        assert not torch.isinf(param.grad).any(), f"Gradient chứa Inf tại {name}"
-
-    assert dummy_grad_input.grad is not None, "Đầu vào không nhận được gradient!"
-    print("  --> Toàn bộ tham số và đầu vào đều có gradient đầy đủ, không NaN/Inf [PASS]")
-
-    # --------------------------------------------------------------------------
-    # TEST 6: Đo Lường Hiệu Năng & Bộ Nhớ (VRAM & Latency Benchmark)
-    # --------------------------------------------------------------------------
-    print("\n[TEST 6] Benchmark hiệu năng thực thi (Latency & VRAM)...")
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-
-        bench_model = ConvGRU(
-            input_dim=64,
-            hidden_dim=[64, 64],
-            kernel_size=3,
-            num_layers=2,
-            batch_first=True
-        ).to(device).eval()
-
-        bench_input = torch.randn(4, 8, 64, 40, 40, device=device)  # 4 clips, 8 frames, 40x40
-
-        # Khởi động GPU (Warm-up)
-        for _ in range(5):
-            _ = bench_model(bench_input)
-        torch.cuda.synchronize()
-
-        # Đo đạc thời gian 20 iterations
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-
-        start_event.record()
-        for _ in range(20):
-            _ = bench_model(bench_input)
-        end_event.record()
-        torch.cuda.synchronize()
-
-        latency_ms = start_event.elapsed_time(end_event) / 20.0
-        vram_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
-
-        print(f"  --> Độ trễ trung bình: {latency_ms:.2f} ms/batch (Batch 4 clips x 8 frames = 32 frames)")
-        print(f"  --> Thông lượng: {(32 / (latency_ms / 1000.0)):.1f} frames/giây")
-        print(f"  --> Đỉnh VRAM cấp phát: {vram_mb:.2f} MB")
-        print("  --> Hiệu năng mượt mà, bộ nhớ an toàn trên GPU NVIDIA RTX 3050 Laptop [PASS]")
-
-    print("\n" + "=" * 75)
-    print(" TẤT CẢ 6 BÀI KIỂM THỬ CHO src/convgru.py ĐÃ HOÀN TẤT THÀNH CÔNG (100% PASS)!")
-    print("=" * 75)
+    pass

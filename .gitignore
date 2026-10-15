@@ -127,6 +127,7 @@ datasets/
 **/dataset/
 **/datasets/
 **/extracted_features_pt
+**/NewVersionObDetect
 
 # TensorBoard logs
 events.out.tfevents.*

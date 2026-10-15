@@ -216,7 +216,7 @@ config = {
     "hueSaturationValue": (15, 20, 15, 0.3),
     "gaussNoise": (5.0, 25.0, 0.25),
     "blur": (5, 0.15),
-    "p": 0.5
+    "p": 1
 }
 augmenter = DetectionAugmenter(config)
 

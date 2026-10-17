@@ -3,6 +3,9 @@ from collections import deque
 import numpy as np
 
 
+from ai.PhysicalBranch.config import DEFAULT_CONFIG
+
+
 def positive_seconds(value):
     if isinstance(value, bool) or not np.isfinite(value) or value <= 0:
         raise ValueError("Time parameters must be finite and positive")
@@ -11,9 +14,13 @@ def positive_seconds(value):
 
 class StateMachine:
 
-    def __init__(self, mode="eye", fps=30, window_size_sec=60,
-                 min_duration_ms=None, max_duration_ms=None, max_gap_sec=0.25):
-        limits = {"eye": (100, 2000), "mouth": (3500, 7500), "pitch": (800, 3500)}
+    def __init__(self, mode="eye", fps=None, window_size_sec=None,
+                 min_duration_ms=None, max_duration_ms=None, max_gap_sec=None, *, config=DEFAULT_CONFIG):
+        fps = config.fps if fps is None else fps
+        window_size_sec = config.window_sec if window_size_sec is None else window_size_sec
+        max_gap_sec = config.max_gap_sec if max_gap_sec is None else max_gap_sec
+        limits = {"eye": config.blink_duration_ms, "mouth": config.yawn_duration_ms,
+                  "pitch": config.nod_duration_ms}
         if mode not in limits:
             raise ValueError("Invalid FSM configuration")
         self.mode = mode
@@ -75,7 +82,9 @@ class StateMachine:
 
 
 class WindowRatio:
-    def __init__(self, window_sec=60, max_gap_sec=0.25):
+    def __init__(self, window_sec=None, max_gap_sec=None, *, config=DEFAULT_CONFIG):
+        window_sec = config.window_sec if window_sec is None else window_sec
+        max_gap_sec = config.max_gap_sec if max_gap_sec is None else max_gap_sec
         self.window = positive_seconds(window_sec)
         self.max_gap = positive_seconds(max_gap_sec)
         self.reset()
@@ -108,7 +117,10 @@ class WindowRatio:
 class HeadMotionWindow:
     """Thống kê pitch tương đối; FFT chỉ dùng cửa sổ đầy, liên tục."""
 
-    def __init__(self, window_sec=20, max_gap_sec=0.25, min_amplitude_deg=0.1):
+    def __init__(self, window_sec=None, max_gap_sec=None, min_amplitude_deg=None, *, config=DEFAULT_CONFIG):
+        window_sec = config.window_sec if window_sec is None else window_sec
+        max_gap_sec = config.max_gap_sec if max_gap_sec is None else max_gap_sec
+        min_amplitude_deg = config.head_motion_min_amplitude_deg if min_amplitude_deg is None else min_amplitude_deg
         self.window = positive_seconds(window_sec)
         self.max_gap = positive_seconds(max_gap_sec)
         if not np.isfinite(min_amplitude_deg) or min_amplitude_deg < 0:
@@ -164,6 +176,7 @@ class HeadMotionWindow:
         dt = observed / (count - 1)
         result["head_motion_resolution_hz"] = 1 / (count * dt)
         if np.ptp(signal) <= self.min_amplitude:
+            result["head_motion_frequency_hz"] = 0.0
             return result
         spectrum = np.abs(np.fft.rfft((signal - signal.mean()) * np.hanning(count))) ** 2
         peak = int(np.argmax(spectrum[1:])) + 1

@@ -9,6 +9,7 @@ Nhánh này đo tín hiệu mắt, miệng và đầu; không tự kết luận 
 ```text
 ai/PhysicalBranch/
 ├── Structure.md
+├── config.py
 ├── camera_metrics.py
 ├── adaptive_hmm_fsm.py
 ├── temporal_metrics.py
@@ -23,6 +24,7 @@ ai/PhysicalBranch/
 
 | File | Trách nhiệm |
 | --- | --- |
+| [config.py](config.py) | `PhysicalConfig`: cấu hình camera, HMM, FSM, PERCLOS, FFT, landmark/góc đầu và thang chuẩn hóa |
 | [camera_metrics.py](camera_metrics.py) | `FaceTracker`, `CameraMetrics`, HUD, camera/video và log TensorBoard |
 | [adaptive_hmm_fsm.py](adaptive_hmm_fsm.py) | `AdaptiveHMM` phân loại hai trạng thái; `AdaptiveHMM_FSM` ghép HMM với thống kê thời gian |
 | [temporal_metrics.py](temporal_metrics.py) | `StateMachine` đếm sự kiện, `WindowRatio` tính tỷ lệ thời gian, `HeadMotionWindow` tính trung bình và FFT pitch |
@@ -48,6 +50,43 @@ Frame BGR → FaceTracker → landmark pixel
                                      ↓
                        JSON / callback / HUD / TensorBoard
 ```
+
+## Cấu hình chung và kế thừa
+
+Chỉnh giá trị mặc định tại [config.py](config.py). Các bộ đo dùng chung
+`PhysicalConfig`; không cần sửa ngưỡng trong từng file xử lý.
+Các hằng số số học và bố cục HUD vẫn nằm trong mã xử lý/hiển thị.
+
+`PhysicalConfig` cũng chứa `camera_source`, `display`, `logdir`,
+`output_interval_sec`, `max_frames`, `use_video_time`: `CameraMetrics.run()`
+và CLI dùng các giá trị này khi không có ghi đè. Truyền `logdir=None` để tắt
+TensorBoard hoặc `max_frames=None` để bỏ giới hạn frame cho một lần chạy.
+`camera_matrix=None` mặc định suy ra nội tại camera từ kích thước ảnh;
+đặt ma trận 3×3 trong config khi có kết quả hiệu chuẩn camera.
+`min_adapt_state_weight` đặt tổng trọng số posterior tối thiểu cho mỗi trạng thái
+để HMM cập nhật online. Thang chuẩn hóa nằm tại `DEFAULT_SCALES` trong cùng file.
+
+```python
+from dataclasses import replace
+from ai.PhysicalBranch.config import DEFAULT_CONFIG
+from ai.PhysicalBranch.camera_metrics import CameraMetrics
+
+config = replace(DEFAULT_CONFIG, nod_pitch_deg=16, nod_release_deg=9,
+                 windows={"perclos": 60, "head_motion": 30})
+camera = CameraMetrics(config=config)
+```
+
+`CameraMetrics` truyền cấu hình xuống FaceTracker, HMM/FSM, bộ tính tỷ lệ,
+FFT và ước lượng đầu. `eye_options`/`mouth_options` trong config ghi đè riêng
+tham số detector tương ứng. Các keyword truyền trực tiếp vào constructor
+ghi đè config; `windows` được gộp theo tên metric. Reset giữ cấu hình đã chọn.
+Ngoài `fps` và `window_sec`, các tùy chọn camera được truyền bằng keyword.
+
+[DataSystem/config.py](../OptimalAlgorithsm/DataSystem/config.py) định nghĩa
+`DataSystemConfig(PhysicalConfig)`, kế thừa giá trị vật lý và thêm cấu hình
+lấy mẫu mạng, lọc chất lượng, tổng hợp thời lượng và đường dẫn dữ liệu/checkpoint. Muốn thay
+đổi riêng DataSystem, ghi đè tại file này. `DEFAULT_SCALES` của nhánh vật lý là thang tham khảo riêng; DataSystem dùng
+`physical_v1` theo miền bộ đo, xem [NORMALIZATION.md](../OptimalAlgorithsm/DataSystem/NORMALIZATION.md).
 
 ## 2. Điều chỉnh cửa sổ thời gian
 
@@ -154,7 +193,7 @@ hay kết luận buồn ngủ từ các mốc 0.05/0.2 Hz trong tài liệu.
 | Tham số | Giá trị |
 | --- | --- |
 | Thời lượng nháy mắt hợp lệ | 100–2000 ms |
-| Thời lượng ngáp hợp lệ | 3500–7500 ms |
+| Thời lượng ngáp hợp lệ | 4000–7500 ms |
 | Thời lượng gật hợp lệ | 800–3500 ms |
 | Ngưỡng gật / nhả | 14° / 8° |
 | Giới hạn pitch / yaw / roll | 20° / 25° / 20° |
@@ -166,6 +205,13 @@ Các dải thời lượng là cấu hình vận hành kế thừa, không phả
 được tài liệu mới quy định. Có thể đổi qua `eye_options`, `mouth_options`,
 `nod_duration_ms`; các ngưỡng gật và giới hạn góc cũng là tham số constructor.
 Ngưỡng phân nhóm thời lượng 400/800 ms khác với giới hạn xác nhận sự kiện.
+
+Mặc định được đồng bộ với `OptimalAlgorithsm/DataSystem`: 30 FPS, cửa sổ
+60 giây, ngáp tối thiểu 4 giây và gật tối thiểu 0,8 giây. Khởi tạo HMM
+5 giây thay cho 15 giây giúp dành khoảng 55/60 giây đầu cho số đo mắt/miệng,
+đủ điều kiện coverage 80% nếu tín hiệu liên tục. FFT vẫn cần đủ 60 giây
+liên tục sau hiệu chuẩn đầu; giảm thời gian HMM không bỏ điều kiện này.
+Đây là cấu hình vận hành, chưa phải kết quả tối ưu hóa trên dữ liệu gán nhãn.
 
 ### Thuộc tính cấu hình ảnh hưởng đến độ chính xác
 
@@ -197,7 +243,7 @@ Nguồn: [StateMachine](temporal_metrics.py), [CameraMetrics](camera_metrics.py)
 
 | Thuộc tính | Mặc định | Ảnh hưởng |
 | --- | --- | --- |
-| `min_duration_ms` | Mắt: 100 ms; miệng: 3500 ms | Thời lượng tối thiểu để đếm sự kiện; tăng sẽ loại sự kiện ngắn nhưng có thể bỏ sót sự kiện thật. |
+| `min_duration_ms` | Mắt: 100 ms; miệng: 4000 ms | Thời lượng tối thiểu để đếm sự kiện; tăng sẽ loại sự kiện ngắn nhưng có thể bỏ sót sự kiện thật. |
 | `max_duration_ms` | Mắt: 2000 ms; miệng: 7500 ms | Thời lượng tối đa để đếm sự kiện; vượt giới hạn sẽ không được tính vào bộ đếm. |
 | `nod_duration_ms` | `(800, 3500)` ms | Cặp thời lượng tối thiểu/tối đa cho gật đầu, truyền trực tiếp vào `CameraMetrics`. |
 | `max_gap_sec` | 0.25 giây | Khoảng cách tối đa giữa hai mẫu; vượt ngưỡng ngắt sự kiện, loại khoảng trống khỏi tỷ lệ và xóa chuỗi FFT liên tục. |
@@ -220,7 +266,7 @@ Cửa sổ ngắn phản ứng nhanh nhưng dao động nhiều; cửa sổ dài
 nhưng phản ánh thay đổi chậm hơn. Tần suất dùng toàn bộ chiều dài cửa sổ
 làm mẫu số ngay từ đầu, nên lúc mới chạy có thể thấp hơn nhịp sự kiện thực tế.
 `head_motion` mặc định 60 giây khi dùng `CameraMetrics`; lớp
-`HeadMotionWindow` dùng độc lập mặc định 20 giây.
+`HeadMotionWindow` dùng độc lập cũng mặc định 60 giây.
 
 #### Hiệu chuẩn và chuyển động đầu
 

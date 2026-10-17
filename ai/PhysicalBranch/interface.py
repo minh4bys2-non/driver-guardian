@@ -3,12 +3,15 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field, fields
 
 
+from ai.PhysicalBranch.config import DEFAULT_CONFIG
+
+
 @dataclass(frozen=True)
 class AIResult:
     """Chỉ số thô: giây, ms, độ, %, lần/phút và Hz theo tên trường."""
 
     timestamp_sec: float
-    window_sec: float = 60.0
+    window_sec: float = DEFAULT_CONFIG.window_sec
     windows_sec: dict[str, float] = field(default_factory=dict)
     face_detected: bool = False
     eye_ready: bool = False

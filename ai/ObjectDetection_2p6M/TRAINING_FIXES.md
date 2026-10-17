@@ -133,7 +133,7 @@ Chạy từ thư mục gốc dự án, sau khi cấu hình đường dẫn dữ 
 
 ```bash
 python -m train_.training
-python -m finetune_.finetune_engine
+python -m finetune.finetune_engine
 ```
 
 `FineTuneConfig` kế thừa nguyên các tham số model từ `TrainConfig`, giảm LR và

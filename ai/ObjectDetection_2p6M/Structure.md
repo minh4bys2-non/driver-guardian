@@ -150,7 +150,7 @@ Nếu bạn tải trực tiếp các file ONNX đã được convert sẵn:
 
 Sau khi đã tải và đặt các file vào đúng vị trí, hãy kiểm tra và chỉnh sửa đường dẫn trong các file sau trước khi chạy:
 
-### 5.1. Chạy Fine-tuning (`finetune_/finetune_config.py`)
+### 5.1. Chạy Fine-tuning (`finetune`)
 Mở [finetune_config.py](file:///home/tranmanhduy/Workspace/ptithcm/driver-guardian/ai/ObjectDetection_2p6M/finetune_/finetune_config.py) và cấu hình lại:
 ```python
 # Đường dẫn checkpoint pretrained (kèm architecture.json và categories.json cùng thư mục)
@@ -163,7 +163,7 @@ index_cache_dir: str = "/path/to/your/cache"
 ```
 Chạy lệnh:
 ```bash
-python -m ai.ObjectDetection_2p6M.finetune_.finetune_engine
+python -m ai.ObjectDetection_2p6M.finetune.finetune_engine
 ```
 
 ### 5.2. Chạy Inference PyTorch (`inference/infer.py`)

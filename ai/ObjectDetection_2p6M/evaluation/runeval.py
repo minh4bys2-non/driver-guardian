@@ -8,11 +8,12 @@ import torch
 import ultralytics
 from torch.utils.data import DataLoader
 
-from ai.ObjectDetection_2p6M.evaluation.ultralytics_evaluation import compute_map_metrics
-from ai.ObjectDetection_2p6M.src.config import TrainConfig
-from ai.ObjectDetection_2p6M.src.model import NMSFreeDetector
-from ai.ObjectDetection_2p6M.train_.dataloader_ import build_split_dataset, collate_fn, load_categories
-from ai.ObjectDetection_2p6M.utils.artifacts import validate_metadata
+from evaluation.ultralytics_evaluation import compute_map_metrics
+from src.config import TrainConfig
+from src.model import NMSFreeDetector
+from train.dataloader_ import build_split_dataset, collate_fn, load_categories
+from utils.artifacts import validate_metadata
+
 
 def run_evaluation(checkpoint_path, cfg, *, img_size=None, use_ema=True,
                    score_thres=0.001, max_det=300, output_path=None):

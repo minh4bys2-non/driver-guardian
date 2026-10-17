@@ -1,21 +1,34 @@
 import json
+import sys
 import time
 from contextlib import ExitStack
+from dataclasses import replace
 
 import cv2
 import numpy as np
 
+from ai.PhysicalBranch.config import DEFAULT_CONFIG
 from ai.PhysicalBranch.adaptive_hmm_fsm import AdaptiveHMM_FSM
 from ai.PhysicalBranch.head_pose_estimation import HeadPoseEstimator
 from ai.PhysicalBranch.temporal_metrics import HeadMotionWindow, StateMachine, WindowRatio, positive_seconds
 
+_UNSET = object()
+
 class FaceTracker:
-    def __init__(self, detection_confidence=0.6, tracking_confidence=0.6):
-        import mediapipe as mp
+    def __init__(self, detection_confidence=None, tracking_confidence=None, *, config=DEFAULT_CONFIG):
+        # FaceMesh không dùng audio; tránh PortAudio dò thiết bị và treo lúc import.
+        skip_audio = "sounddevice" not in sys.modules
+        if skip_audio:
+            sys.modules["sounddevice"] = None
+        try:
+            import mediapipe as mp
+        finally:
+            if skip_audio:
+                sys.modules.pop("sounddevice", None)
         self.mesh = mp.solutions.face_mesh.FaceMesh(
-            max_num_faces=1, refine_landmarks=True,
-            min_detection_confidence=detection_confidence,
-            min_tracking_confidence=tracking_confidence)
+            max_num_faces=config.max_num_faces, refine_landmarks=config.refine_landmarks,
+            min_detection_confidence=config.detection_confidence if detection_confidence is None else detection_confidence,
+            min_tracking_confidence=config.tracking_confidence if tracking_confidence is None else tracking_confidence)
 
     def process(self, frame):
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -49,35 +62,47 @@ class TensorBoardLogger:
 
 
 class CameraMetrics:
-    LEFT_EYE = [362, 385, 387, 263, 373, 380]
-    RIGHT_EYE = [33, 160, 158, 133, 153, 144]
-    MOUTH = [61, 37, 267, 291, 314, 84]
+    LEFT_EYE = list(DEFAULT_CONFIG.left_eye)
+    RIGHT_EYE = list(DEFAULT_CONFIG.right_eye)
+    MOUTH = list(DEFAULT_CONFIG.mouth)
 
-    def __init__(self, fps=30, window_sec=60, calibration_frames=30,
-                 eye_options=None, mouth_options=None, angle_limits=(20, 25, 20),
-                 nod_pitch_deg=14, nod_release_deg=8, nod_direction=None,
-                 nod_duration_ms=(800, 3500), max_gap_sec=0.25,
-                 detection_confidence=0.6, tracking_confidence=0.6,
-                 windows=None, head_motion_min_amplitude_deg=0.1):
-        if calibration_frames < 1 or nod_direction not in (None, -1, 1):
+    def __init__(self, fps=None, window_sec=None, *, config=DEFAULT_CONFIG,
+                 eye_options=None, mouth_options=None, windows=None, **overrides):
+        self.config = cfg = replace(
+            config, fps=config.fps if fps is None else fps,
+            window_sec=config.window_sec if window_sec is None else window_sec, **overrides)
+        fps, window_sec, max_gap_sec = cfg.fps, cfg.window_sec, cfg.max_gap_sec
+        calibration_frames, nod_direction = cfg.calibration_frames, cfg.nod_direction
+        detection_confidence, tracking_confidence = cfg.detection_confidence, cfg.tracking_confidence
+        nod_duration_ms = cfg.nod_duration_ms
+        nod_release_deg, nod_pitch_deg = cfg.nod_release_deg, cfg.nod_pitch_deg
+        angle_limits = cfg.angle_limits
+        self.LEFT_EYE, self.RIGHT_EYE, self.MOUTH = map(list, (cfg.left_eye, cfg.right_eye, cfg.mouth))
+        if (type(calibration_frames) is not int or calibration_frames < 1
+                or isinstance(nod_direction, bool) or nod_direction not in (None, -1, 1)):
             raise ValueError("Invalid calibration or nod direction")
+        if (not np.isfinite([detection_confidence, tracking_confidence]).all()
+                or not 0 <= detection_confidence <= 1 or not 0 <= tracking_confidence <= 1):
+            raise ValueError("Detection and tracking confidence must be finite and in [0, 1]")
+        if np.shape(nod_duration_ms) != (2,):
+            raise ValueError("Nod duration limits must contain a minimum and maximum")
         if not np.isfinite([nod_release_deg, nod_pitch_deg]).all() or not 0 <= nod_release_deg < nod_pitch_deg:
             raise ValueError("Nod release must be below the pitch threshold")
         self.angle_limits = np.asarray(angle_limits, dtype=float)
         if self.angle_limits.shape != (3,) or not np.isfinite(self.angle_limits).all() or (self.angle_limits <= 0).any():
             raise ValueError("Angle limits must contain three positive finite values")
-        common = dict(fps=fps, window_size_sec=window_sec, max_gap_sec=max_gap_sec)
-        self.eye = AdaptiveHMM_FSM("eye", **(common | (eye_options or {})))
-        self.mouth = AdaptiveHMM_FSM("mouth", **(common | (mouth_options or {})))
+        common = dict(fps=fps, window_size_sec=window_sec, max_gap_sec=max_gap_sec, config=cfg)
+        self.eye = AdaptiveHMM_FSM("eye", **(common | cfg.eye_options | (eye_options or {})))
+        self.mouth = AdaptiveHMM_FSM("mouth", **(common | cfg.mouth_options | (mouth_options or {})))
         self.nod = StateMachine("pitch", min_duration_ms=nod_duration_ms[0],
                                 max_duration_ms=nod_duration_ms[1], **common)
-        self.over_angle_ratio = WindowRatio(window_sec, max_gap_sec)
-        self.head_motion = HeadMotionWindow(window_sec, max_gap_sec, head_motion_min_amplitude_deg)
+        self.over_angle_ratio = WindowRatio(window_sec, max_gap_sec, config=cfg)
+        self.head_motion = HeadMotionWindow(window_sec, max_gap_sec, config=cfg)
         self._windows = dict(blink=self.eye.fsm, perclos=self.eye.ratio,
                              yawn=self.mouth.fsm, pom=self.mouth.ratio,
                              nod=self.nod, over_angle=self.over_angle_ratio, head_motion=self.head_motion)
         self.window_sec = positive_seconds(window_sec)
-        self.set_windows(**(windows or {}))
+        self.set_windows(**(cfg.windows | (windows or {})))
         self.calibration_frames = calibration_frames
         self.nod_pitch, self.nod_release, self.nod_direction = nod_pitch_deg, nod_release_deg, nod_direction
         self.confidence = detection_confidence, tracking_confidence
@@ -140,7 +165,7 @@ class CameraMetrics:
             self.neutral_samples.clear()
         self.timestamp = timestamp
         if self.shape != tuple(image_size):
-            self.estimator = HeadPoseEstimator(*image_size)
+            self.estimator = HeadPoseEstimator(*image_size, config=self.config)
             self.shape = tuple(image_size)
             self._reset_head()
         if points is not None:
@@ -233,7 +258,7 @@ class CameraMetrics:
 
     def process(self, frame, timestamp=None):
         if self.tracker is None:
-            self.tracker = FaceTracker(*self.confidence)
+            self.tracker = FaceTracker(*self.confidence, config=self.config)
         timestamp = time.monotonic() if timestamp is None else timestamp
         return self.process_landmarks(self.tracker.process(frame), frame.shape[1::-1], timestamp)
 
@@ -303,9 +328,17 @@ class CameraMetrics:
             self.tracker.close()
             self.tracker = None
 
-    def run(self, source=0, display=True, logdir=None, output_interval_sec=1,
-            max_frames=None, use_video_time=False, on_metrics=None):
-        if output_interval_sec < 0 or (max_frames is not None and max_frames < 1):
+    def run(self, source=None, display=None, logdir=_UNSET, output_interval_sec=None,
+            max_frames=_UNSET, use_video_time=None, on_metrics=None):
+        cfg = self.config
+        source = cfg.camera_source if source is None else source
+        display = cfg.display if display is None else display
+        logdir = cfg.logdir if logdir is _UNSET else logdir
+        output_interval_sec = cfg.output_interval_sec if output_interval_sec is None else output_interval_sec
+        max_frames = cfg.max_frames if max_frames is _UNSET else max_frames
+        use_video_time = cfg.use_video_time if use_video_time is None else use_video_time
+        if (not np.isfinite(output_interval_sec) or output_interval_sec < 0
+                or (max_frames is not None and (type(max_frames) is not int or max_frames < 1))):
             raise ValueError("Invalid output interval or frame limit")
         self.reset()
         with ExitStack() as stack:
@@ -359,12 +392,12 @@ if __name__ == '__main__':
     import argparse
 
     parser = argparse.ArgumentParser(description="Physical metrics from camera/video")
-    parser.add_argument("--source", default="0", help="Camera index or video path")
-    parser.add_argument("--window-sec", type=float, default=60)
+    parser.add_argument("--source", default=str(DEFAULT_CONFIG.camera_source), help="Camera index or video path")
+    parser.add_argument("--window-sec", type=float, default=DEFAULT_CONFIG.window_sec)
     parser.add_argument("--metric-window", action="append", default=[], metavar="NAME=SECONDS",
                         help="Override blink/perclos/yawn/pom/nod/over_angle/head_motion; repeatable")
-    parser.add_argument("--no-display", action="store_true")
-    parser.add_argument("--video-time", action="store_true")
+    parser.add_argument("--no-display", action="store_false", dest="display", default=DEFAULT_CONFIG.display)
+    parser.add_argument("--video-time", action="store_true", default=DEFAULT_CONFIG.use_video_time)
     args = parser.parse_args()
     try:
         windows = {name: float(value) for name, value in
@@ -373,4 +406,4 @@ if __name__ == '__main__':
     except (TypeError, ValueError) as exc:
         parser.error(str(exc))
     source = int(args.source) if args.source.isdecimal() else args.source
-    monitor.run(source=source, display=not args.no_display, use_video_time=args.video_time)
+    monitor.run(source=source, display=args.display, use_video_time=args.video_time)

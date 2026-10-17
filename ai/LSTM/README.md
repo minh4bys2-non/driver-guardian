@@ -1,98 +1,110 @@
-# Driver Guardian — Hệ Thống Nhận Diện Tài Xế Buồn Ngủ (Deep LSTM & GRU Pipeline)
+# Driver Guardian — ConvGRU
 
-Dự án nghiên cứu và phát triển mô hình học sâu hai giai đoạn (Two-Stage Decoupled Pipeline) nhằm phát hiện sớm trạng thái buồn ngủ của người lái xe, kết hợp giữa mạng tích chập trích xuất đặc trưng không gian (CNN Backbone + PAFPN Neck qua ONNX) và mạng nơ-ron hồi quy chuỗi thời gian (Spatial Feature Adapter + Deep LSTM / Deep GRU).
+Video RGB → backbone/PAFPN P4 → ConvGRU → spatial attention → temporal mean → hai logits (0: alert, 1: drowsy).
 
----
+## Cấu hình và chạy
 
-## 1. Cấu Trúc Thư Mục Chuẩn Hóa
+Toàn bộ giá trị mặc định nằm trong `src/config.py`. Sửa `DEFAULT_CONFIG` hoặc các giá trị mặc định của `TrainConfig` tại đó. Không dùng preset YAML cũ.
 
-Cấu trúc dự án tuân thủ nghiêm ngặt quy chuẩn kiến trúc AI/ML Pipeline được quy định trong [`AGENTS.md`](AGENTS.md):
+- `backbone_mode="scratch"`, `backbone_checkpoint=None`: train backbone/neck từ đầu và ConvGRU; BatchNorm cập nhật thống kê.
+- `backbone_mode="frozen"`, `backbone_checkpoint="/path/to/detector_or_landmark.pt"`: nạp backbone/neck (ưu tiên EMA), giữ nguyên weights và BatchNorm ở eval; chỉ train adapter, ConvGRU, spatial attention và classifier.
+
+`backbone_mode` chỉ nhận `scratch` hoặc `frozen`; `frozenv1` là tên thư mục run trong `save_dir`, không phải mode. Mặc định hiện tại là `frozen`; khi chuyển sang `scratch`, cần đặt cả `backbone_checkpoint=None`.
+
+Mặc định dùng checkpoint `landmark_finetune2/best.pt` đã có trong repository và lưu run mới tại `ai/LSTM/checkpoints/head_landmarkv1`. Backbone/neck luôn ở `eval()`, kể cả khi gọi `model.train()`, và chạy không có gradient. Phần phía sau được khởi tạo mới để học trên cùng cách trích xuất đặc trưng lúc inference. Không resume run `scratchv1` để chuyển chế độ; resume luôn giữ cấu hình của run cũ.
+
+Có thể truyền tham số trực tiếp trong Python hoặc notebook:
+
+```python
+from ai.LSTM.src.config import load_config
+from ai.LSTM.src.training import train
+
+cfg = load_config()
+# Sửa cfg.backbone_checkpoint nếu checkpoint nằm ở đường dẫn khác.
+cfg.save_dir = "ai/LSTM/checkpoints/head_landmarkv1"
+model, metrics = train(cfg)
+```
+
+Mỗi thử nghiệm cần `save_dir` riêng. Thư mục có sẵn dữ liệu sẽ bị từ chối trừ khi resume. Cấu hình kiến trúc backbone của chế độ frozen được đọc từ checkpoint pretrained.
+
+```bash
+python -m ai.LSTM.src.training
+python -m ai.LSTM.src.training --config path/to/config.json
+python -m ai.LSTM.src.training --resume ai/LSTM/checkpoints/frozenv1/last.pt
+```
+
+Resume khôi phục weights, optimizer, scheduler, AMP scaler, best weights và RNG tại cuối epoch. Giữ nguyên tổng số epochs và các tham số huấn luyện để không đổi lịch LR. CLI resume lấy cấu hình từ checkpoint, không cần file pretrained gốc. Không hỗ trợ resume giữa epoch; epoch chưa lưu hoàn chỉnh sẽ được chạy lại. Muốn tái lập chính xác cần giữ nguyên môi trường, thiết bị và số worker; kernel GPU có thể không xác định hoàn toàn.
+
+Dataset dùng `dataset_merged_split.csv` với các cột `processed_path`, `binary_label`, `clip_id`, `split`, `subject_id`, hoặc thư mục `train|val|test/0_alert|1_drowsy/*.mp4`. Manifest trên máy chủ cũng được hỗ trợ với các cột `rel_path`, `label`, `video_id`, `split` và tùy chọn `subject_id`, `orig_path`. `rel_path` trỏ tới clip đã xử lý, tương đối với `dataset_dir`; `orig_path` dùng làm định danh video gốc để kiểm tra leakage, không dùng để mở clip. Đường dẫn Windows được đổi dấu phân cách khi đọc trên Linux. Train/val/test phải khác subject. Video quá ngắn hoặc FPS thấp bị loại trước khi train; lỗi decode khi đọc sẽ dừng run và ghi traceback vào log.
+
+Mặc định lấy cửa sổ 10 giây ở 5 FPS (50 frame), RGB uint8, letterbox 224 px rồi chia 255 trong model. Train chọn cửa sổ ngẫu nhiên thiên về cuối video; val/test lấy cửa sổ giữa cố định. Augmentation nhất quán giữa các frame, chỉ dùng cho train.
+
+Gradient accumulation chuẩn hóa theo số mẫu thực tế, kể cả batch cuối nhỏ hơn. `gradient_checkpointing` không dùng khi scratch vì recompute sẽ cập nhật BatchNorm lần thứ hai; frozen không cần giữ đồ thị backbone. `chunk_size` giới hạn số frame đi qua backbone trong mỗi lượt forward.
+
+## Artifacts của một run
 
 ```text
-LSTM/
-│
-├── notebooks/                       # Sổ tay Jupyter theo thứ tự thực thi pipeline
-│   ├── 01_train_lstm.ipynb          # Pipeline huấn luyện mô hình Deep LSTM
-│   ├── 02_train_gru.ipynb           # Pipeline huấn luyện mô hình Deep GRU
-│   ├── 03_train_experiments.ipynb   # Thử nghiệm mở rộng & siêu tham số
-│   ├── 04_evaluate_lstm.ipynb       # Đánh giá toàn diện mô hình LSTM (Confusion matrix, ROC, F1)
-│   └── 05_evaluate_gru.ipynb        # Đánh giá toàn diện mô hình GRU
-│
-├── docs/                            # Tài liệu nghiên cứu, phân tích và kiến trúc
-│   ├── images/
-│   │   └── img.png                  # Sơ đồ và hình ảnh minh họa
-│   ├── analysis_data_processed.md   # Phân tích tập dữ liệu chuẩn hóa 5,072 clips
-│   ├── struct_dataset.md            # Cấu trúc lưu trữ dữ liệu thực tế
-│   ├── analsys_folder_structure.md  # Báo cáo phân tích hiện trạng thư mục (Bước 1)
-│   └── plan_folder_structure.md     # Kế hoạch chi tiết tái cấu trúc thư mục (Bước 2)
-│
-├── src/                             # Mã nguồn Python module hóa
-│   ├── __init__.py                  # Khởi tạo package
-│   ├── models.py                    # SpatialFeatureAdapter, DeepLSTMClassifier, DeepGRUClassifier
-│   ├── loss.py                      # DrowsinessLoss (CrossEntropy) & DrowsinessBCELoss
-│   ├── augment.py                   # Data Augmentation pipeline (Albumentations)
-│   └── evaluate.py                  # Đo lường & kiểm thử trích xuất đặc trưng qua ONNX Runtime
-│
-├── configs/                         # Cấu hình siêu tham số và đường dẫn
-│   ├── __init__.py
-│   ├── config.yaml                  # Cấu hình chuẩn định dạng YAML
-│   └── config.py                    # Dataclass TrainConfig hỗ trợ load từ YAML/JSON
-│
-├── checkpoints/                     # Trọng số mô hình (.onnx, .pt, .pth)
-│   ├── .gitkeep
-│   ├── backbone.onnx                # Trọng số CNN Backbone
-│   └── backbone_neck.onnx           # Trọng số CNN Backbone + Neck (PAFPN)
-│
-├── logs/                            # Nhật ký huấn luyện và TensorBoard runs
-│   └── .gitkeep
-│
-├── .gitignore                       # Loại trừ checkpoints lớn và cache
-├── requirements.txt                 # Danh sách thư viện phụ thuộc
-├── README.md                        # Giới thiệu và tài liệu dự án
-└── AGENTS.md                        # Nguyên tắc làm việc và quy chuẩn của Agent
+save_dir/
+├── config.json       # Cấu hình đã dùng
+├── train.log         # Cấu hình, kích thước tập, metrics 10 lần/epoch, lỗi và kết quả test
+├── last.pt           # Đầy đủ trạng thái để resume, bao gồm best weights
+├── best.pt           # Model tốt nhất theo val F1, hòa F1 thì chọn val loss thấp hơn
+├── tensorboard/      # Event files cho dashboard training
+├── test_metrics.json
+└── evaluation_test/  # Khi chạy script evaluation
 ```
 
----
+Checkpoint chứa phiên bản định dạng, kiến trúc thực tế, trọng số và cấu hình preprocessing. `last.pt` giữ thêm best weights để có thể tái tạo `best.pt` khi bị gián đoạn giữa hai lần ghi. Các file `.pt` được ghi tạm rồi thay thế nguyên tử; không ghi đè trực tiếp file đang dùng. `train.log` được append khi resume; có thể chứa thông báo của epoch bị gián đoạn, epoch trong `last.pt` mới là mốc khôi phục.
 
-## 2. Cài Đặt Môi Trường
+Checkpoint cũ thiếu metadata bị từ chối rõ ràng; cần chuyển đổi với kiến trúc/preprocessing gốc, không tự đoán cấu hình.
 
-Khuyến nghị sử dụng Python 3.10+ cùng môi trường ảo (Conda hoặc venv):
+```python
+from ai.LSTM.src.checkpoint import load_model
+
+model, checkpoint = load_model("ai/LSTM/checkpoints/frozenv1/best.pt", device="cpu")
+```
+
+## Đánh giá và export
+
+Evaluation mặc định đọc **test**, dùng kiến trúc và preprocessing đã lưu:
 
 ```bash
-# Cài đặt các thư viện phụ thuộc
-pip install -r requirements.txt
+python -m ai.LSTM.src.evaluation --checkpoint ai/LSTM/checkpoints/frozenv1/best.pt
 ```
 
----
+Có thể dùng `--dataset-dir`, `--device`, `--output-dir`; `--split val` chỉ dùng khi muốn đánh giá validation rõ ràng. Output gồm `evaluation.log`, `metrics.json` (có tên split) và `predictions.csv`.
 
-## 3. Hướng Dẫn Sử Dụng
-
-### 3.1. Nạp Cấu Hình
-```python
-from configs.config import load_config, TrainConfig
-
-# Nạp từ file YAML chuẩn
-cfg = load_config("configs/config.yaml")
-print(f"Batch size: {cfg.batch_size}, Epochs: {cfg.epochs}")
-```
-
-### 3.2. Khởi Tạo Mô Hình (Deep LSTM hoặc Deep GRU)
-```python
-import torch
-from src.models import DeepLSTMClassifier, DeepGRUClassifier, build_model
-
-# Cách 1: Khởi tạo từ config
-model = build_model(cfg, model_type="lstm")
-
-# Cách 2: Khởi tạo trực tiếp
-model_gru = DeepGRUClassifier(input_dim=256, hidden_dim=256, num_layers=3, num_classes=2)
-```
-
-### 3.3. Kiểm Thử Suy Luận ONNX
 ```bash
-python src/evaluate.py
+python -m ai.LSTM.export_vulkan --checkpoint ai/LSTM/checkpoints/frozenv1/best.pt
 ```
 
-### 3.4. Chạy Sổ Tay Huấn Luyện & Đánh Giá
-Mở Jupyter Notebook và thực thi các sổ tay theo thứ tự tại thư mục `notebooks/`:
+Export dùng cả backbone và ConvGRU trong cùng checkpoint; kích thước ảnh/cửa sổ được đọc từ cấu hình đã lưu. ExecuTorch/Vulkan là phụ thuộc tùy chọn; `--cpu` bỏ delegate Vulkan.
 
+Notebook 02/03/04 dùng chung `src/config.py` và `training.train()`. Trên Kaggle, mount toàn bộ repository (bao gồm `ai/ObjectDetection_2p6M`), đặt `DRIVER_GUARDIAN_ROOT` nếu cần và sửa đường dẫn dữ liệu/output trong config.
+
+## Kiểm tra
+
+```bash
+python -m pytest ai/LSTM/tests -q
+```
+
+Test bao gồm hai chế độ training, checkpoint tự chứa, resume sau gián đoạn, ghi checkpoint lỗi, gradient accumulation với batch cuối nhỏ và evaluation trên đúng split. Test nhỏ không thay thế việc đánh giá hội tụ trên dữ liệu thật.
+
+## TensorBoard
+
+Training ghi metric tích lũy vào `train.log` và flush TensorBoard 10 lần mỗi epoch, chia đều theo số batch (dưới 10 batch thì ghi mỗi batch). Validation và biểu đồ tổng kết ghi cuối epoch. Trục step TensorBoard dùng 10 bước/epoch; step 10 là cuối epoch 1.
+
+Training tự động ghi vào `<save_dir>/tensorboard`, dùng epoch làm trục bước:
+
+```bash
+tensorboard --logdir ai/LSTM/checkpoints --port 6006
+```
+
+Mở `http://localhost:6006`. Nếu đổi `save_dir`, trỏ `--logdir` vào thư mục run hoặc thư mục cha để so sánh nhiều run.
+
+- Scalars: loss, accuracy (`acc`), precision, recall, F1, số mẫu, ROC-AUC, average precision cho train/val/test; learning rate, AMP scale, gradient norm trước clip, thời gian và tốc độ mỗi lượt.
+- Images và PR Curves: confusion matrix, ROC, precision–recall theo ngưỡng. ROC/PR và AUC chỉ ghi khi split có đủ hai lớp.
+- Histograms: xác suất drowsy theo nhãn thật, trọng số trainable cuối epoch, gradient sau clip ở bước cập nhật cuối epoch. Gradient norm là trung bình các norm hữu hạn trước clip trong epoch.
+- Text: cấu hình run. Test chạy trên best checkpoint, được ghi ở bước `epochs + 1`; `test/checkpoint_epoch` chỉ epoch của checkpoint đó.
+
+Writer flush mỗi epoch và đóng kể cả khi training lỗi. Resume giữ cùng thư mục log, ẩn các bước sau epoch đã lưu bằng `purge_step` của [PyTorch SummaryWriter](https://docs.pytorch.org/docs/stable/tensorboard.html). Thu thập dự đoán chỉ giữ nhãn, xác suất và lớp dự đoán trên CPU; không giữ video hoặc đồ thị gradient.

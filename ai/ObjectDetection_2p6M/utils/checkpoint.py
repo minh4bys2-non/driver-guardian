@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from utils.artifacts import architecture, validate_metadata, write_metadata
+from ai.ObjectDetection_2p6M.utils.artifacts import architecture, validate_metadata, write_metadata
 
 
 def rng_state():

@@ -9,6 +9,7 @@ Nhánh này đo tín hiệu mắt, miệng và đầu; không tự kết luận 
 ```text
 ai/PhysicalBranch/
 ├── Structure.md
+├── config.py
 ├── camera_metrics.py
 ├── adaptive_hmm_fsm.py
 ├── temporal_metrics.py
@@ -23,6 +24,7 @@ ai/PhysicalBranch/
 
 | File | Trách nhiệm |
 | --- | --- |
+| [config.py](config.py) | `PhysicalConfig`: cấu hình camera, HMM, FSM, PERCLOS, FFT, landmark/góc đầu và thang chuẩn hóa |
 | [camera_metrics.py](camera_metrics.py) | `FaceTracker`, `CameraMetrics`, HUD, camera/video và log TensorBoard |
 | [adaptive_hmm_fsm.py](adaptive_hmm_fsm.py) | `AdaptiveHMM` phân loại hai trạng thái; `AdaptiveHMM_FSM` ghép HMM với thống kê thời gian |
 | [temporal_metrics.py](temporal_metrics.py) | `StateMachine` đếm sự kiện, `WindowRatio` tính tỷ lệ thời gian, `HeadMotionWindow` tính trung bình và FFT pitch |
@@ -48,6 +50,43 @@ Frame BGR → FaceTracker → landmark pixel
                                      ↓
                        JSON / callback / HUD / TensorBoard
 ```
+
+## Cấu hình chung và kế thừa
+
+Chỉnh giá trị mặc định tại [config.py](config.py). Các bộ đo dùng chung
+`PhysicalConfig`; không cần sửa ngưỡng trong từng file xử lý.
+Các hằng số số học và bố cục HUD vẫn nằm trong mã xử lý/hiển thị.
+
+`PhysicalConfig` cũng chứa `camera_source`, `display`, `logdir`,
+`output_interval_sec`, `max_frames`, `use_video_time`: `CameraMetrics.run()`
+và CLI dùng các giá trị này khi không có ghi đè. Truyền `logdir=None` để tắt
+TensorBoard hoặc `max_frames=None` để bỏ giới hạn frame cho một lần chạy.
+`camera_matrix=None` mặc định suy ra nội tại camera từ kích thước ảnh;
+đặt ma trận 3×3 trong config khi có kết quả hiệu chuẩn camera.
+`min_adapt_state_weight` đặt tổng trọng số posterior tối thiểu cho mỗi trạng thái
+để HMM cập nhật online. Thang chuẩn hóa nằm tại `DEFAULT_SCALES` trong cùng file.
+
+```python
+from dataclasses import replace
+from ai.PhysicalBranch.config import DEFAULT_CONFIG
+from ai.PhysicalBranch.camera_metrics import CameraMetrics
+
+config = replace(DEFAULT_CONFIG, nod_pitch_deg=16, nod_release_deg=9,
+                 windows={"perclos": 60, "head_motion": 30})
+camera = CameraMetrics(config=config)
+```
+
+`CameraMetrics` truyền cấu hình xuống FaceTracker, HMM/FSM, bộ tính tỷ lệ,
+FFT và ước lượng đầu. `eye_options`/`mouth_options` trong config ghi đè riêng
+tham số detector tương ứng. Các keyword truyền trực tiếp vào constructor
+ghi đè config; `windows` được gộp theo tên metric. Reset giữ cấu hình đã chọn.
+Ngoài `fps` và `window_sec`, các tùy chọn camera được truyền bằng keyword.
+
+[DataSystem/config.py](../OptimalAlgorithsm/DataSystem/config.py) định nghĩa
+`DataSystemConfig(PhysicalConfig)`, kế thừa giá trị vật lý và thêm cấu hình
+lấy mẫu mạng, lọc chất lượng, tổng hợp thời lượng và đường dẫn dữ liệu/checkpoint. Muốn thay
+đổi riêng DataSystem, ghi đè tại file này. `DEFAULT_SCALES` của nhánh vật lý là thang tham khảo riêng; DataSystem dùng
+`physical_v1` theo miền bộ đo, xem [NORMALIZATION.md](../OptimalAlgorithsm/DataSystem/NORMALIZATION.md).
 
 ## 2. Điều chỉnh cửa sổ thời gian
 

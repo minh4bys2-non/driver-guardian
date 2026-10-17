@@ -1,6 +1,6 @@
 import json
 import unittest
-from dataclasses import fields
+from dataclasses import fields, replace
 from unittest.mock import patch
 
 import cv2
@@ -9,9 +9,93 @@ import numpy as np
 from ai.PhysicalBranch.adaptive_hmm_fsm import AdaptiveHMM, AdaptiveHMM_FSM
 from ai.PhysicalBranch.brand import normalize_metrics
 from ai.PhysicalBranch.camera_metrics import CameraMetrics
+from ai.PhysicalBranch.config import DEFAULT_CONFIG, PhysicalConfig
 from ai.PhysicalBranch.head_pose_estimation import HeadPoseEstimator
 from ai.PhysicalBranch.interface import AIResult
 from ai.PhysicalBranch.temporal_metrics import HeadMotionWindow, StateMachine, WindowRatio
+
+
+class ConfigTests(unittest.TestCase):
+    def test_config_reaches_detectors_pose_and_independent_windows(self):
+        config = PhysicalConfig(
+            fps=10, window_sec=12, max_gap_sec=.15, init_duration_sec=.4,
+            blink_duration_ms=(200, 900), yawn_duration_ms=(1000, 3000),
+            nod_duration_ms=(300, 1200), head_motion_min_amplitude_deg=.4,
+            min_variance=.002, em_iterations=3, learning_rate=.02,
+            windows={"perclos": 8}, mouth_options={"adapt_interval": 20},
+            distortion_coeffs=(.01, 0, 0, 0),
+            camera_matrix=((500, 0, 320), (0, 500, 240), (0, 0, 1)),
+        )
+        camera = CameraMetrics(config=config, windows={"head_motion": 10})
+        self.assertEqual(camera.eye.init_frames, 4)
+        self.assertEqual(camera.eye.hmm.min_variance, .002)
+        self.assertEqual(camera.eye.hmm.em_iterations, 3)
+        self.assertEqual(camera.eye.hmm.learning_rate, .02)
+        self.assertEqual(camera.mouth.hmm.adapt_interval, 20)
+        self.assertEqual(camera.eye.fsm.minimum, 200)
+        self.assertEqual(camera.mouth.fsm.maximum, 3000)
+        self.assertEqual(camera.nod.minimum, 300)
+        self.assertEqual(camera.nod.max_gap, .15)
+        self.assertEqual(camera.eye.ratio.window, 8)
+        self.assertEqual(camera.head_motion.window, 10)
+        self.assertEqual(camera.head_motion.min_amplitude, .4)
+        camera.process_landmarks(None, (640, 480), 0)
+        np.testing.assert_array_equal(camera.estimator.distortion, config.distortion_coeffs)
+        np.testing.assert_array_equal(camera.estimator.camera_matrix, config.camera_matrix)
+        explicit = np.diag([600, 600, 1])
+        np.testing.assert_array_equal(
+            HeadPoseEstimator(640, 480, camera_matrix=explicit, config=config).camera_matrix, explicit)
+        camera.reset()
+        self.assertEqual(camera.eye.hmm.min_variance, .002)
+        self.assertEqual(config.windows, {"perclos": 8})
+        self.assertEqual(DEFAULT_CONFIG.windows, {})
+        self.assertEqual(CameraMetrics().eye.fsm.minimum, 100)
+
+    def test_config_changes_p80_and_fallback_without_mutating_defaults(self):
+        config = replace(DEFAULT_CONFIG, fps=10, init_duration_sec=.4,
+                         eye_closed_ratio=.1, perclos_closed_fraction=.9,
+                         resting_prior=(.98, .02))
+        eye = AdaptiveHMM_FSM(config=config)
+        for _ in range(2):
+            for i in range(4):
+                result = eye.process(.3, i / 10)
+            self.assertAlmostEqual(eye.event_reference, .03)
+            self.assertAlmostEqual(result['p80_threshold'], .057)
+            np.testing.assert_array_equal(eye.hmm.posterior, [.98, .02])
+            eye.reset()
+        self.assertEqual(DEFAULT_CONFIG.perclos_closed_fraction, .8)
+
+    def test_run_uses_config_and_allows_explicit_none_overrides(self):
+        config = replace(DEFAULT_CONFIG, camera_source='test.mp4', display=False,
+                         use_video_time=True, max_frames=1, logdir='runs/test', output_interval_sec=10)
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        with patch('cv2.VideoCapture') as capture, patch('cv2.imshow') as show, \
+                patch('ai.PhysicalBranch.camera_metrics.TensorBoardLogger') as logger, \
+                patch('builtins.print') as output:
+            cap = capture.return_value
+            cap.isOpened.return_value = True
+            cap.get.return_value = 30
+            for overrides, expected in (({}, 1), ({'max_frames': None, 'logdir': None}, 3)):
+                cap.read.side_effect = [(True, frame)] * 3 + [(False, None)]
+                camera = CameraMetrics(config=config)
+                received = []
+                with patch.object(camera, 'process', side_effect=lambda frame, t: {'timestamp_sec': t}):
+                    self.assertEqual(camera.run(on_metrics=received.append, **overrides), expected)
+                self.assertEqual([m['timestamp_sec'] for m in received], [i / 30 for i in range(expected)])
+            capture.assert_called_with('test.mp4')
+            logger.assert_called_once_with('runs/test')
+            logger.return_value.close.assert_called_once()
+            self.assertEqual(output.call_count, 2)
+            show.assert_not_called()
+
+    def test_hmm_adaptation_requires_configured_state_weight(self):
+        hmm = AdaptiveHMM(config=replace(DEFAULT_CONFIG, adapt_interval=4, min_adapt_state_weight=5))
+        hmm.fit_initial([.1, .1, .3, .3])
+        means = hmm.means.copy()
+        for value in (.1, .3, .1, .3):
+            self.assertFalse(hmm.update_online(value))
+        np.testing.assert_array_equal(hmm.means, means)
+        self.assertEqual(len(hmm.buffer), 0)
 
 
 class TemporalTests(unittest.TestCase):
@@ -97,7 +181,7 @@ class DetectorTests(unittest.TestCase):
         detector = AdaptiveHMM_FSM()
         for i in range(1800):
             result = detector.process(.3, i / 30)
-        self.assertEqual(detector.init_frames, 150)
+        self.assertEqual(detector.init_frames, 300)
         self.assertGreaterEqual(result['observed_seconds'], 60 * .8)
         self.assertEqual(result['perclos'], 0)
 
@@ -189,7 +273,7 @@ class MotionTests(unittest.TestCase):
         motion = HeadMotionWindow(1)
         for t in np.linspace(0, 1, 11):
             out = motion.process(15, t)
-        self.assertIsNone(out['head_motion_frequency_hz'])
+        self.assertEqual(out['head_motion_frequency_hz'], 0.0)
         self.assertAlmostEqual(out['pitch_mean_deg'], 15)
         self.assertIsNone(motion.process(None, 1.1)['pitch_mean_deg'])
         self.assertEqual(motion.process(10, 1.2)['head_motion_observed_sec'], 0)

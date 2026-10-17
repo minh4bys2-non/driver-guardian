@@ -58,7 +58,7 @@ class MetricAccumulator:
 
 @torch.no_grad()
 def compute_map_metrics(model, loader, device, nc, move_batch=None, **kwargs):
-    """Evaluate an already-loaded model on its device; restore its train_/eval mode.
+    """Evaluate an already-loaded model on its device; restore its train/eval mode.
 
     Returns map_50, map_50_95, precision, recall and per_class_ap (class-indexed).
     Optional move_batch and metric kwargs match the existing evaluator API.

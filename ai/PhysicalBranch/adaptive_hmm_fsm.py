@@ -2,20 +2,24 @@ from collections import deque
 
 import numpy as np
 
+from ai.PhysicalBranch.config import DEFAULT_CONFIG
 from ai.PhysicalBranch.temporal_metrics import StateMachine, WindowRatio, positive_seconds
-
-
 class AdaptiveHMM:
-
     def __init__(
         self,
         n_states=2,
-        learning_rate=0.01,
-        adapt_interval=300,
+        learning_rate=None,
+        adapt_interval=None,
         positive_state="low",
-        min_variance=1e-5,
-        em_iterations=20,
+        min_variance=None,
+        em_iterations=None,
+        *, config=DEFAULT_CONFIG,
     ):
+        self.config = config
+        learning_rate = config.learning_rate if learning_rate is None else learning_rate
+        adapt_interval = config.adapt_interval if adapt_interval is None else adapt_interval
+        min_variance = config.min_variance if min_variance is None else min_variance
+        em_iterations = config.em_iterations if em_iterations is None else em_iterations
         if positive_state not in ("low", "high"):
             raise ValueError("positive_state phải là 'low' hoặc 'high'")
 
@@ -23,7 +27,8 @@ class AdaptiveHMM:
             raise ValueError("HMM requires two states and 0 < learning_rate <= 1")
         if (type(adapt_interval) is not int or adapt_interval < 2
                 or type(em_iterations) is not int or em_iterations < 1
-                or not np.isfinite(min_variance) or min_variance <= 0):
+                or not np.isfinite(min_variance) or min_variance <= 0
+                or not np.isfinite(config.min_adapt_state_weight) or config.min_adapt_state_weight < 0):
             raise ValueError("Invalid adaptation parameters")
         self.n_states = int(n_states)
         self.learning_rate = float(learning_rate)
@@ -48,6 +53,7 @@ class AdaptiveHMM:
             positive_state=self.positive_state,
             min_variance=self.min_variance,
             em_iterations=self.em_iterations,
+            config=self.config,
         )
 
     def fit_initial(self, data):
@@ -88,7 +94,7 @@ class AdaptiveHMM:
 
         x = np.asarray(self.buffer, dtype=float)
         gamma, xi = self._forward_backward(x)
-        if np.min(gamma.sum(axis=0)) < 2:
+        if np.min(gamma.sum(axis=0)) < self.config.min_adapt_state_weight:
             self.buffer.clear()
             return False
         self._m_step(x, gamma, xi, alpha=self.learning_rate)
@@ -105,7 +111,8 @@ class AdaptiveHMM:
             raise ValueError("Dữ liệu chứa NaN hoặc inf")
         return x
 
-    def _kmeans_1d(self, x, iterations=25):
+    def _kmeans_1d(self, x, iterations=None):
+        iterations = self.config.kmeans_iterations if iterations is None else iterations
         centers = np.percentile(x, np.linspace(0, 100, self.n_states + 2)[1:-1])
         if np.unique(centers).size < self.n_states:
             centers = np.linspace(x.min(), x.max(), self.n_states)
@@ -123,7 +130,7 @@ class AdaptiveHMM:
         return labels
 
     def _estimate_from_labels(self, x, labels):
-        eps = 1e-3
+        eps = self.config.transition_smoothing
         counts = np.bincount(labels, minlength=self.n_states).astype(float) + eps
         self.pi = counts / counts.sum()
 
@@ -204,9 +211,14 @@ class AdaptiveHMM:
 
 class AdaptiveHMM_FSM:
 
-    def __init__(self, mode="eye", fps=30, init_duration_sec=5, window_size_sec=60,
-                 min_duration_ms=None, max_duration_ms=None, max_gap_sec=0.25,
-                 learning_rate=0.01, adapt_interval=300, ratio_window_sec=None):
+    def __init__(self, mode="eye", fps=None, init_duration_sec=None, window_size_sec=None,
+                 min_duration_ms=None, max_duration_ms=None, max_gap_sec=None,
+                 learning_rate=None, adapt_interval=None, ratio_window_sec=None, *, config=DEFAULT_CONFIG):
+        self.config = config
+        fps = config.fps if fps is None else fps
+        init_duration_sec = config.init_duration_sec if init_duration_sec is None else init_duration_sec
+        window_size_sec = config.window_sec if window_size_sec is None else window_size_sec
+        max_gap_sec = config.max_gap_sec if max_gap_sec is None else max_gap_sec
         if mode not in ("eye", "mouth", "pitch"):
             raise ValueError("Invalid detector configuration")
         fps = positive_seconds(fps)
@@ -214,10 +226,10 @@ class AdaptiveHMM_FSM:
         self.mode, self.fps = mode, fps
         self.init_frames = max(4, round(fps * init_duration_sec))
         self.hmm = AdaptiveHMM(positive_state="low" if mode == "eye" else "high",
-                               learning_rate=learning_rate, adapt_interval=adapt_interval)
+                               learning_rate=learning_rate, adapt_interval=adapt_interval, config=config)
         self.fsm = StateMachine(mode, fps, window_size_sec, min_duration_ms,
-                                max_duration_ms, max_gap_sec)
-        self.ratio = WindowRatio(window_size_sec if ratio_window_sec is None else ratio_window_sec, max_gap_sec)
+                                max_duration_ms, max_gap_sec, config=config)
+        self.ratio = WindowRatio(window_size_sec if ratio_window_sec is None else ratio_window_sec, max_gap_sec, config=config)
         self.reset()
 
     def reset(self):
@@ -230,20 +242,23 @@ class AdaptiveHMM_FSM:
 
     def _initialize(self):
         data = np.asarray(self.samples)
-        low, high = np.percentile(data, [5, 95])
-        separation = {"eye": 0.06, "mouth": 0.15, "pitch": 10}[self.mode]
-        self.normal = float(np.percentile(data, 80 if self.mode == "eye" else 20))
-        distinct = low < self.normal * 0.65 if self.mode == "eye" else high > self.normal + separation
+        cfg = self.config
+        low, high = np.percentile(data, cfg.init_percentiles)
+        separation = {"eye": cfg.eye_separation, "mouth": cfg.mouth_separation,
+                      "pitch": cfg.pitch_separation}[self.mode]
+        percentile = cfg.eye_baseline_percentile if self.mode == "eye" else cfg.other_baseline_percentile
+        self.normal = float(np.percentile(data, percentile))
+        distinct = low < self.normal * cfg.eye_distinct_ratio if self.mode == "eye" else high > self.normal + separation
         if high - low >= separation and distinct:
             self.hmm.fit_initial(data)
         else:
             normal = self.normal
-            event = normal * 0.2 if self.mode == "eye" else normal + separation * 2
+            event = normal * cfg.eye_closed_ratio if self.mode == "eye" else normal + separation * cfg.event_separation_multiplier
             self.hmm.means = np.array([normal, event])
-            sigma = max(abs(normal - event) / 4, 0.01)
+            sigma = max(abs(normal - event) / cfg.fallback_sigma_divisor, cfg.fallback_min_sigma)
             self.hmm.vars[:] = sigma ** 2
-            self.hmm.A = np.array([[0.97, 0.03], [0.1, 0.9]])
-            self.hmm.pi = np.array([0.99, 0.01])
+            self.hmm.A = np.array(cfg.fallback_transition, dtype=float)
+            self.hmm.pi = np.array(cfg.resting_prior, dtype=float)
             self.hmm.initialized = True
         self.event_reference = float(self.hmm.means[1])
         self.initialized = True
@@ -270,9 +285,9 @@ class AdaptiveHMM_FSM:
                     self._initialize()
             if self.initialized:
                 state, posterior = self.hmm.predict(value)
-                if self.mode == "eye" and value >= self.normal * 0.75:
+                if self.mode == "eye" and value >= self.normal * self.config.eye_open_ratio:
                     state = 0
-                    posterior = self.hmm.posterior = np.array([0.99, 0.01])
+                    posterior = self.hmm.posterior = np.array(self.config.resting_prior, dtype=float)
                 updated = self.hmm.update_online(value)
         else:
             self.hmm.posterior = None
@@ -282,7 +297,7 @@ class AdaptiveHMM_FSM:
         threshold = None
         if self.mode == "eye" and self.initialized:
             opened, closed = self.normal, self.event_reference
-            threshold = float(opened - 0.8 * (opened - closed))
+            threshold = float(opened - self.config.perclos_closed_fraction * (opened - closed))
         if self.mode == "eye":
             active = None if value is None or threshold is None else value <= threshold
         else:

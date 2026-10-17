@@ -1,10 +1,11 @@
 from dataclasses import dataclass
 
-from ai.ObjectDetection_2p6M.src.config import TrainConfig
+from src.config import TrainConfig
 
 
 @dataclass
 class FineTuneConfig(TrainConfig):
+    img_size: int = 224
     nc: int = 80  # Đặt bằng số categories của dataset đích; head được tạo lại khi mapping đổi.
     labels_root: str = "/run/media/tranmanhduy/Data/MSCOCO/labels"
     images_root_dir: str = "/run/media/tranmanhduy/Data/MSCOCO/images"
@@ -17,12 +18,12 @@ class FineTuneConfig(TrainConfig):
     warmup_epochs: float = 1.0
     class_sampling_path: str = "/run/media/tranmanhduy/Data/MSCOCO/labels/train/class_sampling.jsonl"  # id phải khớp categories đích.
 
-    tfl_pretrained_pth: str = "/home/tranmanhduy/Workspace/ptithcm/TTTN/NewVersionObDetect/checkpoints/2bfb6cc36ef5ab822a944006c746e5d348d67e387501c9027df5b957cf124031/d9afe7f332a0080b29fdd068bbb94f32147807d062bc8dbfeb01f8b968f5ad22/train_/best.pt"  # Đường dẫn .pt cùng thư mục architecture.json/categories.json.
+    tfl_pretrained_pth: str = "/home/tranmanhduy/Workspace/ptithcm/TTTN/NewVersionObDetect/checkpoints/2bfb6cc36ef5ab822a944006c746e5d348d67e387501c9027df5b957cf124031/d9afe7f332a0080b29fdd068bbb94f32147807d062bc8dbfeb01f8b968f5ad22/train/best.pt"  # Đường dẫn .pt cùng thư mục architecture.json/categories.json.
     resume: str = ""  # Rỗng: bắt đầu từ pretrained; tiếp tục fine-tune: đặt đường dẫn checkpoint fine-tune.
 
-    run_name: str = "finetune_"
-    tb_log_dir: str = "runs/finetune_"
-    log_dir: str = "logs/finetune_"
+    run_name: str = "finetune"
+    tb_log_dir: str = "runs/finetune"
+    log_dir: str = "logs/finetune"
     def __post_init__(self):
         super().__post_init__()
         if not isinstance(self.head_only_epochs, int) or not 0 < self.head_only_epochs < self.epochs:

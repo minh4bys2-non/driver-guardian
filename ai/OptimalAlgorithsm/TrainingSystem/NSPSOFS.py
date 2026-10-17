@@ -178,8 +178,9 @@ class NSPSOFS:
 
 
 if __name__ == "__main__":
+    from ai.OptimalAlgorithsm.DataSystem.config import OUTPUT_JSONL as DATA_PATH
+
     BASE_DIR = Path(__file__).resolve().parent
-    DATA_PATH = BASE_DIR.parent / "drowsiness_risk_10.jsonl"
     OUTPUT_DIR = BASE_DIR / "output" / "nspsofs"
     FITNESS_METHOD = "cooccurrence"
     CONFIG = NSPSOFSConfig(

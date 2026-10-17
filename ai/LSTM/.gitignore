@@ -20,11 +20,15 @@ checkpoints/*
 *.onnx
 *.pkl
 *.bin
+*.pte
+*.zip
+
+# Local datasets
+data/
 
 # Training logs
 logs/*
 !logs/.gitkeep
-./docs
 
 # OS specific files
 .DS_Store

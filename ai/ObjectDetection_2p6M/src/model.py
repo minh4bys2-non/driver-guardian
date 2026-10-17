@@ -6,7 +6,7 @@ from typing import Union, Optional, Dict, Any, Tuple
 import torch
 import torch.nn as nn
 
-from utils.artifacts import validate_metadata
+from ai.ObjectDetection_2p6M.utils.artifacts import validate_metadata
 
 try:
     from ai.ObjectDetection_2p6M.src.backbone_neck import Backbone, PAFPN

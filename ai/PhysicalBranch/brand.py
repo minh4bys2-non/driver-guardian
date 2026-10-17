@@ -5,19 +5,7 @@ from math import isfinite
 from ai.PhysicalBranch.interface import AIResult
 
 
-# Các mốc tham khảo từ Metric_revised.md; cần hiệu chỉnh theo người/camera/cửa sổ.
-DEFAULT_SCALES = dict.fromkeys((
-    "ear", "blink_rate_per_min", "mar", "mouth_open_duration_ms", "yawn_duration_ms",
-    "yawning_frequency_per_min", "pom_pct", "nod_duration_ms", "nod_event_duration_ms",
-    "nodding_frequency_per_min", "pitch_mean_amplitude_deg", "head_motion_frequency_hz",
-    "over_angle_pct",
-))
-DEFAULT_SCALES.update(
-    eye_closure_duration_ms=((400, 0), (800, 1)),
-    blink_duration_ms=((400, 0), (800, 1)),
-    perclos_pct=((0, 0), (15, 1)),
-    pitch_amplitude_deg=((8, 0), (20, 1)),
-)
+from ai.PhysicalBranch.config import DEFAULT_SCALES
 
 
 def normalize_metrics(

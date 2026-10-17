@@ -2,12 +2,12 @@ import time
 import cv2
 import numpy as np
 from ai.PhysicalBranch.camera_metrics import CameraMetrics
-
+from ai.OptimalAlgorithsm.DataSystem.config import DEFAULT_CONFIG
 
 class VideoMetrics:
-    def __init__(self, fps=30, window_sec=60, **options):
-        self.fps = fps
-        self.camera = CameraMetrics(fps=fps, window_sec=window_sec, **options)
+    def __init__(self, fps=None, window_sec=None, *, config=DEFAULT_CONFIG, **options):
+        self.fps = config.fps if fps is None else fps
+        self.camera = CameraMetrics(fps=self.fps, window_sec=window_sec, config=config, **options)
 
     def process(self, frames):
         """frames: iterable of (RGB uint8 [3,H,W], timestamp_sec)."""

@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from dataclasses import replace
 from unittest.mock import patch
 
 import cv2
@@ -9,6 +10,8 @@ import numpy as np
 import torch
 
 from ai.OptimalAlgorithsm.DataSystem import engine, loadvideo2handle
+from ai.OptimalAlgorithsm.DataSystem.config import DataSystemConfig, DEFAULT_CONFIG, MODEL_IMAGE_SIZE
+from ai.OptimalAlgorithsm.DataSystem.normalization import PhysicalNormalizer, FEATURE_ENCODING
 from ai.OptimalAlgorithsm.DataSystem.neuralnetwork import NeuralNetwork, letterbox
 
 
@@ -36,10 +39,113 @@ class Capture:
 
 
 class DataSystemTests(unittest.TestCase):
+    def test_default_image_size_is_224(self):
+        self.assertEqual(MODEL_IMAGE_SIZE, 224)
+        self.assertEqual(DataSystemConfig().neural_size, 224)
+        self.assertEqual(DEFAULT_CONFIG.neural_size, 224)
+        self.assertEqual(self.make_engine().neural_size, 224)
+
+    def test_default_letterbox_preserves_aspect_ratio_channels_and_dtype(self):
+        for height, width in ((100, 200), (200, 100), (224, 224)):
+            for dtype in (np.uint8, np.float32):
+                for chw in (False, True):
+                    with self.subTest(shape=(height, width), dtype=dtype, chw=chw):
+                        color = np.array([51, 102, 204], dtype=dtype)
+                        if dtype == np.float32:
+                            color /= 255
+                        frame = np.broadcast_to(color, (height, width, 3)).copy()
+                        result = letterbox(frame.transpose(2, 0, 1) if chw else frame)
+                        self.assertEqual(result.dtype, dtype)
+                        self.assertEqual(result.shape, (3, 224, 224) if chw else (224, 224, 3))
+                        result = result.transpose(1, 2, 0) if chw else result
+                        expected = np.full((224, 224, 3), 114 if dtype == np.uint8 else 114 / 255, dtype=dtype)
+                        if width > height:
+                            expected[56:168] = color
+                        elif height > width:
+                            expected[:, 56:168] = color
+                        else:
+                            expected[:] = color
+                        np.testing.assert_allclose(result, expected, atol=1e-7)
+
+    def test_engine_passes_default_224_rgb_frames_to_neural(self):
+        model = self.make_engine(fps=5, window_sec=2, stride_sec=2, neural_sec=1)
+        frames = ((np.full((3, 4, 8), i, np.uint8), i / 5) for i in range(10))
+        with patch.object(engine, "CameraMetrics") as camera, patch.object(
+            engine, "read_video", return_value=frames
+        ):
+            camera.return_value.process.return_value = self.metrics(
+                window=2, head_motion_resolution_hz=.5
+            )
+            rows = list(model.process_video("video.mp4", 0))
+        self.assertEqual(len(rows), 1)
+        model.neural.assert_called_once()
+        batch = model.neural.call_args.args[0]
+        self.assertEqual(batch.shape, (5, 3, 224, 224))
+        self.assertEqual(batch.dtype, np.uint8)
+        np.testing.assert_array_equal(batch[:, 0, 112, 112], [5, 6, 7, 8, 9])
+        self.assertTrue(np.all(batch[:, :, :56] == 114))
+        self.assertTrue(np.all(batch[:, :, 168:] == 114))
+        self.assertEqual(rows[0]["neuralnetwork_score"], .7)
+        camera.return_value.close.assert_called_once()
+
+    def test_30fps_timeline_samples_last_ten_seconds_at_5fps(self):
+        model = self.make_engine()
+        frames = ((np.full((3, 4, 8), (i // 6) % 256, np.uint8), i / 30)
+                  for i in range(1800))
+        with patch.object(engine, "CameraMetrics") as camera, patch.object(
+            engine, "read_video", return_value=frames
+        ):
+            camera.return_value.process.return_value = self.metrics()
+            rows = list(model.process_video("video.mp4", 0))
+        self.assertEqual(len(rows), 1)
+        model.neural.assert_called_once()
+        batch = model.neural.call_args.args[0]
+        self.assertEqual(batch.shape, (50, 3, 224, 224))
+        np.testing.assert_array_equal(batch[:, 0, 112, 112], np.arange(250, 300) % 256)
+
+    def test_inherited_config_reaches_camera_and_neural_pipeline(self):
+        config = DataSystemConfig(
+            fps=20, window_sec=30, stride_sec=30, neural_sec=4, neural_fps=5,
+            chunk_size=8, init_duration_sec=2, calibration_frames=12,
+            nod_pitch_deg=16, nod_release_deg=9, nod_direction=1,
+            yawn_duration_ms=(2000, 6000), nod_duration_ms=(500, 2500),
+            blink_duration_ms=(120, 1500), min_variance=.002,
+            head_motion_min_amplitude_deg=.3, windows={"head_motion": 20},
+        )
+        with patch.object(engine, "NeuralNetwork") as neural:
+            model = engine.Engine(".", config=config)
+        self.assertEqual(model.window, 600)
+        self.assertEqual(model.stride, 600)
+        self.assertEqual(model.neural_count, 20)
+        self.assertEqual(neural.call_args.kwargs['chunk_size'], 8)
+        self.assertEqual(neural.call_args.kwargs['config'], model.config)
+        with patch.object(engine, "CameraMetrics") as factory, patch.object(
+            engine, "read_video", return_value=[]
+        ):
+            list(model.process_video("video.mp4", 0))
+        camera = engine.CameraMetrics(**factory.call_args.kwargs)
+        self.assertEqual(camera.eye.init_frames, 40)
+        self.assertEqual(camera.eye.fsm.minimum, 120)
+        self.assertEqual(camera.eye.hmm.min_variance, .002)
+        self.assertEqual(camera.mouth.fsm.minimum, 2000)
+        self.assertEqual(camera.mouth.fsm.maximum, 6000)
+        self.assertEqual(camera.nod.minimum, 500)
+        self.assertEqual(camera.nod.maximum, 2500)
+        self.assertEqual(camera.nod_pitch, 16)
+        self.assertEqual(camera.nod_release, 9)
+        self.assertEqual(camera.nod_direction, 1)
+        self.assertEqual(camera.head_motion.window, 20)
+        self.assertEqual(camera.head_motion.min_amplitude, .3)
+        self.assertEqual(camera.calibration_frames, 12)
+        self.assertEqual(config.windows, {"head_motion": 20})
+        self.assertEqual(DEFAULT_CONFIG.windows, {})
+        self.assertEqual(model.normalizer.scales['blink_duration'], 1500)
+        self.assertEqual(model.normalizer.scales['nod_duration'], 2.5)
+
     def resample(self, times, source_fps, target_fps):
         cap = Capture(times, source_fps)
         with patch.object(loadvideo2handle.cv2, "VideoCapture", return_value=cap):
-            result = list(loadvideo2handle.read_video("video", target_fps))
+            result = list(loadvideo2handle.read_video("video", target_fps, target_luma=0))
         self.assertTrue(cap.released)
         return result
 
@@ -120,13 +226,15 @@ class DataSystemTests(unittest.TestCase):
             src, dst = Path(tmp) / "input.jsonl", Path(tmp) / "output.jsonl"
             src.write_text('{"video_path":"video.mp4","label":0}\n')
             model = self.make_engine()
-            row = {k: 0.0 for k in engine.DEFAULT_RISK_CONFIG if k != "window_sec"}
+            row = dict.fromkeys(model.normalizer.scales, 0.0)
             row.update(
                 source_video="video.mp4",
                 label=0,
                 start_second=0,
                 end_second=60,
-                feature_encoding="risk_v2",
+                feature_encoding=FEATURE_ENCODING,
+                normalization_id=model.normalizer.id,
+                normalization_scales=model.normalizer.scales,
             )
             second = row | {"start_second": 60, "end_second": 120}
             original = json.dumps(row)
@@ -141,7 +249,13 @@ class DataSystemTests(unittest.TestCase):
             )
             for bad in (
                 '{"broken":',
-                json.dumps(row | {"feature_encoding": "risk_v1"}),
+                json.dumps(row | {"feature_encoding": "risk_v2"}),
+                json.dumps(row | {"normalization_id": "old"}),
+                json.dumps(row | {"normalization_scales": {}}),
+                json.dumps(row | {"perclos": True}),
+                json.dumps(row | {"perclos": [0.0]}),
+                json.dumps(row | {"start_second": False}),
+                json.dumps(row | {"normalization_scales": model.normalizer.scales | {"perclos": True}}),
                 json.dumps(row),
                 json.dumps(row | {"label": 1}),
                 json.dumps(row | {"start_second": 10, "end_second": 70}),
@@ -206,52 +320,6 @@ class DataSystemTests(unittest.TestCase):
             [(r["start_second"], r["end_second"]) for r in rows], [(0, 60), (60, 120)]
         )
 
-    def test_neural_preprocessing_and_binary_output(self):
-        class Backbone(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.anchor = torch.nn.Parameter(torch.zeros(1))
-
-            def forward(self, x):
-                self.frames = x
-                return (x[:, :1, :1, :1],) * 3
-
-        class Neck(torch.nn.Module):
-            def forward(self, *features):
-                return features
-
-        class Classifier(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.logits = torch.tensor([[0.0, 1.0]])
-
-            def forward(self, features, seq_lens):
-                self.seq_lens = seq_lens
-                return self.logits
-
-        cnn = torch.nn.Module()
-        cnn.backbone, cnn.neck = Backbone(), Neck()
-        classifier = Classifier()
-        model = NeuralNetwork(cnn_model=cnn, conv_gru_model=classifier, device="cpu")
-        for dtype in (torch.uint8, torch.float16, torch.float32, torch.bfloat16):
-            frames = torch.ones((2, 3, 4, 8), dtype=dtype)
-            if dtype == torch.uint8:
-                frames *= 255
-            self.assertAlmostEqual(
-                model(frames), torch.sigmoid(torch.tensor(1.0)).item()
-            )
-            self.assertEqual(tuple(cnn.backbone.frames.shape), (2, 3, 640, 640))
-            self.assertAlmostEqual(
-                cnn.backbone.frames[0, 0, 0, 0].item(), 114 / 255, places=6
-            )
-            self.assertEqual(classifier.seq_lens.tolist(), [2])
-        for value in (float("nan"), -1.0, 2.0):
-            with self.assertRaises(ValueError):
-                model(torch.full((2, 3, 4, 8), value))
-        classifier.logits = torch.zeros((1, 3))
-        with self.assertRaises(ValueError):
-            model(torch.zeros((2, 3, 4, 8), dtype=torch.uint8))
-
     def make_engine(self, **options):
         with patch.object(engine, "NeuralNetwork"):
             model = engine.Engine(".", **options)
@@ -281,117 +349,67 @@ class DataSystemTests(unittest.TestCase):
             | overrides
         )
 
-    def test_risk_mapping_breakpoints_and_interpolation(self):
-        model = self.make_engine()
-        cases = {
-            "blink_frequency": (
-                (0, 1),
-                (4, 1),
-                (9.5, 0.5),
-                (15, 0),
-                (20, 0),
-                (27.5, 0.5),
-                (35, 1),
-            ),
-            "blink_duration": ((0, 0), (400, 0), (600, 0.5), (800, 1), (2000, 1)),
-            "perclos": ((0, 0), (0.05, 0), (0.1, 0.5), (0.15, 1), (1, 1)),
-            "yawn_frequency": ((0, 0), (1, 0.5), (2, 1), (3, 1)),
-            "nod_duration": ((0, 0), (0.5, 0), (1.25, 0.5), (2, 1), (3.5, 1)),
-            "nod_frequency": ((0, 0), (1.5, 0.5), (3, 1), (4, 1)),
-            "dominant_head_motion_frequency": (
-                (0, 1),
-                (0.025, 0.5),
-                (0.05, 0),
-                (0.1, 0),
-                (0.2, 0),
-                (0.4, 0.5),
-                (0.6, 1),
-                (1, 1),
-            ),
-            "cnn_lstm_score": ((0, 0), (0.5, 0.5), (1, 1)),
-        }
-        for key, points in cases.items():
-            for value, expected in points:
-                with self.subTest(key=key, value=value):
-                    self.assertAlmostEqual(model._norm(key, value), expected)
-
-    def test_risk_mapping_rejects_missing_and_nonfinite_values(self):
-        model = self.make_engine()
-        for value in (None, float("nan"), float("inf"), -1):
+    def test_normalization_preserves_magnitude_and_endpoints(self):
+        normalizer = PhysicalNormalizer(DEFAULT_CONFIG)
+        for fraction in (0, .1, .5, 1):
+            raw = {key: upper * fraction for key, upper in normalizer.scales.items()}
+            for value in normalizer.transform(raw).values():
+                self.assertAlmostEqual(value, fraction)
+        raw = dict.fromkeys(normalizer.scales, 0.)
+        for value in (None, True, float('nan'), float('inf'), -1,
+                      normalizer.scales['blink_frequency'] + 1):
             with self.subTest(value=value), self.assertRaises(ValueError):
-                model._norm("blink_frequency", value)
+                normalizer.transform(raw | {'blink_frequency': value})
 
-    def test_risk_config_validation_and_copy(self):
-        config = {"perclos": {"safe": 0, "danger": 0.2}}
-        model = self.make_engine(risk_config=config)
-        self.assertAlmostEqual(model._norm("perclos", 0.1), 0.5)
-        config["perclos"]["danger"] = 0.5
-        self.assertAlmostEqual(model._norm("perclos", 0.1), 0.5)
-        invalid = (
-            {"perclos": {"safe": 0.2, "danger": 0.1}},
-            {"perclos": {"danger": 15}},
-            {"blink_duration": {"unit": "sec"}},
-            {"blink_duration": {"aggregation": "mean"}},
-            {"window_sec": 0},
-            {"blink_frequency": {"normal": (15, 15)}},
-            {"blink_frequency": {"high_danger": float("nan")}},
-            {"yawn_frequency": {"min_event_sec": 7.5}},
-            {"nod_frequency": {"min_event_sec": -1}},
-            {"dominant_head_motion_frequency": {"method": "other"}},
-            {"dominant_head_motion_frequency": {"require_reliable_motion": "yes"}},
-            {"unknown": {}},
-            {"perclos": {"unknown": 1}},
-        )
-        for config in invalid:
-            with self.subTest(config=config), self.assertRaises(ValueError):
-                self.make_engine(risk_config=config)
-        with self.assertRaises(ValueError):
-            self.make_engine(window_sec=30)
+    def test_normalization_uses_effective_detector_options_and_windows(self):
+        cfg = replace(DEFAULT_CONFIG, windows={'blink': 10, 'yawn': 15},
+                      eye_options={'min_duration_ms': 200, 'max_duration_ms': 900},
+                      mouth_options={'min_duration_ms': 500, 'max_duration_ms': 2000})
+        normalizer = PhysicalNormalizer(cfg)
+        self.assertEqual(normalizer.scales['blink_duration'], 900)
+        self.assertEqual(normalizer.scales['dominant_head_motion_frequency'], 15)
+        self.assertNotEqual(normalizer.id, PhysicalNormalizer(DEFAULT_CONFIG).id)
+        self.assertEqual(normalizer.id, PhysicalNormalizer(cfg).id)
+        for mode, window, minimum, key in (
+            ('eye', 10, 200, 'blink_frequency'), ('mouth', 15, 500, 'yawn_frequency')
+        ):
+            from ai.PhysicalBranch.temporal_metrics import StateMachine
+            fsm = StateMachine(mode, window_size_sec=window, min_duration_ms=minimum, config=cfg)
+            fsm.process(0, 0)
+            duration_frames = round(minimum * cfg.fps / 1000)
+            for i in range(1, round((window + 2) * cfg.fps)):
+                state = int(i % (duration_frames + 1) != 0)
+                result = fsm.process(state, i / cfg.fps)
+                self.assertLessEqual(result['rate_per_minute'], normalizer.scales[key])
 
-    def test_aggregation_unit_conversion_and_eye_gate(self):
+    def test_aggregation_units_and_no_cross_feature_gate(self):
         model = self.make_engine()
         frames = [np.zeros((3, 8, 8), np.uint8)]
-        blink = [(1, 100), (2, 200), (3, 800)]  # P90 = 680 ms, not the mean.
-        nod = [(1, 900), (2, 1500)]  # Maximum = 1.5 seconds.
-        metrics = self.metrics(
-            yawning_frequency_per_min=1, nodding_frequency_per_min=1.5
-        )
-        row = model._features(metrics, blink, nod, frames, "video", 0, 1)
-        for key, expected in dict(
-            blink_duration=0.7,
-            nod_duration=0.6667,
-            perclos=0.5,
-            blink_frequency=0.7,
-            yawn_frequency=0.5,
-            nod_frequency=0.5,
-            cnn_lstm_score=0.7,
-        ).items():
-            self.assertEqual(row[key], expected)
-        self.assertEqual(row["feature_encoding"], "risk_v2")
-        for frequency, perclos, expected in (
-            (4, 5, 0),
-            (4, 10, 0.5),
-            (4, 15, 1),
-            (15, 15, 0),
-            (35, 5, 1),
-        ):
-            row = model._features(
-                self.metrics(blink_rate_per_min=frequency, perclos_pct=perclos),
-                [],
-                [],
-                frames,
-                "video",
-                0,
-                1,
-            )
-            self.assertEqual(row["blink_frequency"], expected)
-        model = self.make_engine(
-            risk_config={"blink_frequency": {"gate_low_with_eye_metrics": False}}
-        )
-        row = model._features(
-            self.metrics(perclos_pct=5), [], [], frames, "video", 0, 1
-        )
-        self.assertEqual(row["blink_frequency"], 1)
+        row = model._features(self.metrics(yawning_frequency_per_min=1, nodding_frequency_per_min=1.5),
+                              [(1, 100), (2, 200), (3, 800)], [(1, 900), (2, 1500)], frames, 'video', 0, 1)
+        self.assertAlmostEqual(row['blink_duration'], 680 / 2000)
+        self.assertAlmostEqual(row['nod_duration'], 1.5 / 3.5)
+        self.assertEqual(row['perclos'], .1)
+        self.assertEqual(row['neuralnetwork_score'], .7)
+        self.assertEqual(row['raw_features']['blink_duration'], 680)
+        self.assertEqual(row['feature_encoding'], FEATURE_ENCODING)
+        for perclos in (0, 5, 10, 15, 100):
+            other = model._features(self.metrics(perclos_pct=perclos), [], [], frames, 'video', 0, 1)
+            self.assertEqual(row['blink_frequency'], other['blink_frequency'])
+            self.assertEqual(other['perclos'], perclos / 100)
+
+    def test_fft_bound_covers_fractional_frame_windows(self):
+        from ai.PhysicalBranch.temporal_metrics import HeadMotionWindow
+
+        cfg = replace(DEFAULT_CONFIG, windows={'head_motion': .165})
+        normalizer = PhysicalNormalizer(cfg)
+        motion = HeadMotionWindow(.165, config=cfg)
+        for i in range(30):
+            result = motion.process(5 * (-1) ** i, i / cfg.fps)
+            frequency = result['head_motion_frequency_hz']
+            if frequency is not None:
+                self.assertLessEqual(frequency, normalizer.scales['dominant_head_motion_frequency'])
+        self.assertIsNotNone(result['head_motion_frequency_hz'])
 
     def test_motion_reliability_and_configured_window(self):
         from ai.PhysicalBranch.temporal_metrics import HeadMotionWindow
@@ -400,7 +418,7 @@ class DataSystemTests(unittest.TestCase):
         frames = [np.zeros((3, 8, 8), np.uint8)]
         for change in (
             {"head_motion_frequency_hz": None},
-            {"head_motion_frequency_hz": 0},
+            {"head_motion_frequency_hz": -0.1},
             {"head_motion_frequency_hz": float("nan")},
             {"head_motion_resolution_hz": None},
             {"head_motion_observed_sec": 59.9},
@@ -418,23 +436,13 @@ class DataSystemTests(unittest.TestCase):
             self.assertIsNotNone(row)
             self.assertAlmostEqual(
                 row["dominant_head_motion_frequency"],
-                0 if frequency == 0.1 else 0.5,
-                delta=0.02,
+                frequency / (model.fps / 2),
+                delta=0.001,
             )
             lost = motion.process(None, 60.05)
             self.assertIsNone(
                 model._features(self.metrics(**lost), [], [], frames, "video", 0, 1)
             )
-        model = self.make_engine(
-            risk_config={
-                "dominant_head_motion_frequency": {"require_reliable_motion": False}
-            }
-        )
-        row = model._features(
-            self.metrics(head_motion_frequency_hz=None), [], [], frames, "video", 0, 1
-        )
-        self.assertEqual(row["dominant_head_motion_frequency"], 0)
-
     def test_minimum_event_durations_reach_physical_detector(self):
         model = self.make_engine()
         with patch.object(engine, "CameraMetrics") as factory, patch.object(
@@ -480,10 +488,7 @@ class DataSystemTests(unittest.TestCase):
                 stride_sec=1,
                 neural_sec=1,
                 neural_size=8,
-                risk_config={
-                    "window_sec": 2,
-                    "dominant_head_motion_frequency": {"window_sec": 2},
-                },
+                window_sec=2,
             )
             rows = list(model.process_video("video.mp4", 1))
             self.assertEqual(
@@ -492,10 +497,10 @@ class DataSystemTests(unittest.TestCase):
             batch = model.neural.call_args.args[0]
             self.assertEqual(batch.shape, (5, 3, 8, 8))
             self.assertEqual(batch[:, 0, 3, 3].tolist(), [20, 22, 24, 26, 28])
-            self.assertEqual(rows[0]["perclos"], 0.5)
-            self.assertEqual(rows[0]["blink_frequency"], 0.5)
-            self.assertEqual(rows[0]["feature_encoding"], "risk_v2")
-            self.assertEqual(rows[0]["dominant_head_motion_frequency"], 0.75)
+            self.assertEqual(rows[0]["perclos"], 0.1)
+            self.assertEqual(rows[0]["blink_frequency"], 0)
+            self.assertEqual(rows[0]["feature_encoding"], FEATURE_ENCODING)
+            self.assertEqual(rows[0]["dominant_head_motion_frequency"], 0.1)
             camera.return_value.close.assert_called_once()
             model.neural.reset_mock()
             with patch.object(engine, "read_video", return_value=iter(frames)):
@@ -507,7 +512,7 @@ class DataSystemTests(unittest.TestCase):
             )
             self.assertEqual(camera.return_value.process.call_count, 60)
             model.neural.assert_called_once()
-            for perclos, expected in ((0, 0), (5, 0), (10, 0.5), (15, 1)):
+            for perclos in (0, 5, 10, 15):
                 sample = model._features(
                     metrics | {"blink_rate_per_min": 4, "perclos_pct": perclos},
                     [],
@@ -517,7 +522,7 @@ class DataSystemTests(unittest.TestCase):
                     0,
                     1,
                 )
-                self.assertEqual(sample["blink_frequency"], expected)
+                self.assertEqual(sample["blink_frequency"], 4 / model.normalizer.scales["blink_frequency"])
             for missing in (
                 {"eye_ready": False},
                 {"eye_observed_sec": 0},

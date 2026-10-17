@@ -35,6 +35,14 @@ def split_dataset(records, y, seed=42, group_by="subject"):
             and video.parent.name.isdigit()
             else None
         )
+        uldd_subject = (
+            video.parent.parent.name
+            if video.parent.name in ("A", "D")
+            and re.fullmatch(r"[A-Z]", video.parent.parent.name)
+            and re.fullmatch(
+                rf"{video.parent.parent.name}_(IR|L3D|R3D)_{video.parent.name}", video.stem
+            ) else None
+        )
         if group_by == "video":
             group = str(video)
         elif subject is not None:
@@ -48,15 +56,19 @@ def split_dataset(records, y, seed=42, group_by="subject"):
         elif uta_subject is not None:
             # UTA-RLDD subject IDs are global across fold/part directories.
             group = uta_subject
+        elif uldd_subject is not None:
+            group = uldd_subject
         else:
             raise ValueError(
-                "Provide subject_id for non-UTA paths, or explicitly use group_by='video'"
+                "Provide subject_id for paths outside UTA/ULDD, or explicitly use group_by='video'"
             )
         if group_by == "subject":
             if group.isdecimal():
                 group = str(int(group)).zfill(2)
             if uta_subject is not None and group != str(int(uta_subject)).zfill(2):
                 raise ValueError(f"subject_id disagrees with UTA video path: {video}")
+            if uldd_subject is not None and group != uldd_subject:
+                raise ValueError(f"subject_id disagrees with ULDD video path: {video}")
         if str(video) in video_groups and video_groups[str(video)] != group:
             raise ValueError(f"Conflicting subject IDs for video: {video}")
         video_groups[str(video)] = group
@@ -141,6 +153,7 @@ def run_experiment(
     manifest = {
         "data_path": str(data_path),
         "sha256": metadata["sha256"],
+        "input_schema": metadata["input_schema"],
         "n_samples": len(y),
         "group_by": group_by,
         "split_seed": split_seed,
@@ -168,6 +181,7 @@ def run_experiment(
             "evaluation_scope": "train optimization; validation model selection; held-out test",
             "n_samples_total": len(y),
             "split_manifest": "split.json",
+            "input_schema": metadata["input_schema"],
             "selection_rule": "validation balanced_accuracy, then f1, then fewer features; includes constant baselines",
         }
     )
@@ -193,6 +207,8 @@ def run_experiment(
         (r for r in results if r["model"] != "candidate"), key=selection_key
     )
     report = {
+        "fitness_method": method,
+        "input_schema": metadata["input_schema"],
         "selected_model": {k: v for k, v in selected.items() if k != "metrics"},
         "validation_metrics": selected["metrics"],
         "validation_beats_constant_baseline": selection_key(selected)

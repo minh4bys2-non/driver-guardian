@@ -50,6 +50,28 @@ ALGORITHMS = (
 
 
 class FitnessTests(unittest.TestCase):
+    def test_neuralnetwork_score_loads_and_drives_predictions(self):
+        values = dict(blink_frequency=0., blink_duration=0., perclos=0.,
+                      yawn_frequency=0., nod_duration=0., nod_frequency=0.,
+                      dominant_head_motion_frequency=0., neuralnetwork_score=0.)
+        schema = dict(feature_encoding="physical_v1", normalization_id="a" * 64,
+                      normalization_scales=dict.fromkeys(values, 1.))
+        rows = [values | schema | dict(neuralnetwork_score=score, label=label)
+                for score, label in ((.1, 0), (.9, 1))]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "drowsiness_physical_60.jsonl"
+            path.write_text("\n".join(json.dumps(row) for row in rows))
+            X, y, metadata = load_jsonl(path, include_metadata=True)
+            np.testing.assert_allclose(X[:, 7], [.1, .9])
+            self.assertEqual(metadata["input_schema"]["features"][7], "neuralnetwork_score")
+            candidate = np.zeros(9)
+            candidate[7:] = [1., .5]
+            for method in ("weighted_mean", "noisy_or", "cooccurrence"):
+                with self.subTest(method=method):
+                    result = score_candidates([candidate], Fitness(X), y, method)[0]
+                    self.assertEqual(result["selected_features"], ["neuralnetwork_score"])
+                    self.assertEqual(result["metrics"]["accuracy"], 1.)
+
     def test_metrics_expose_constant_predictions(self):
         metrics = classification_metrics([0, 0, 1, 1, 1], [1, 1, 1, 1, 1])
         self.assertEqual(
@@ -168,6 +190,38 @@ class FitnessTests(unittest.TestCase):
             ):
                 path.write_text("\n".join(json.dumps(row) for row in records))
                 with self.subTest(records=records), self.assertRaises(ValueError):
+                    load_jsonl(path)
+
+    def test_physical_encoding_requires_consistent_normalization(self):
+        row = dict.fromkeys(FEATURES, .25) | {
+            "label": 1, "feature_encoding": "physical_v1",
+            "normalization_id": "a" * 64,
+            "normalization_scales": dict.fromkeys(FEATURES, 1.),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "data.jsonl"
+            path.write_text(json.dumps(row) + "\n")
+            _, labels, metadata = load_jsonl(path, include_metadata=True)
+            self.assertEqual(labels.tolist(), [1])
+            self.assertEqual(metadata['input_schema'], {
+                'features': FEATURES, 'feature_encoding': 'physical_v1',
+                'normalization_id': row['normalization_id'],
+                'normalization_scales': row['normalization_scales'],
+            })
+            for change in (
+                {"feature_encoding": "risk_v2"},
+                {"normalization_id": "b" * 64},
+                {"normalization_id": None},
+                {"normalization_scales": dict.fromkeys(FEATURES, 2.)},
+                {"normalization_scales": {}},
+                {"normalization_scales": dict.fromkeys(FEATURES, True)},
+                {"normalization_scales": dict.fromkeys(FEATURES, [1.])},
+                {"normalization_scales": dict.fromkeys(FEATURES, "1")},
+                {"perclos": True},
+                {"perclos": "0.25"},
+            ):
+                path.write_text(json.dumps(row) + "\n" + json.dumps(row | change))
+                with self.subTest(change=change), self.assertRaises(ValueError):
                     load_jsonl(path)
 
 
@@ -417,6 +471,12 @@ class ExperimentTests(unittest.TestCase):
 
     def test_all_entrypoint_pipelines_report_held_out_metrics(self):
         records = self.records()
+        schema = {
+            'feature_encoding': 'physical_v1',
+            'normalization_id': 'a' * 64,
+            'normalization_scales': dict.fromkeys(FEATURES, 1.),
+        }
+        records = [row | schema for row in records]
         with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(
             io.StringIO()
         ):
@@ -432,15 +492,22 @@ class ExperimentTests(unittest.TestCase):
                         config_type(population_size=6, generations=4, archive_size=8),
                         path,
                         tmp,
+                        method='cooccurrence',
                     )
                 run_dir = Path(report["output_dir"])
                 manifest = json.loads((run_dir / "split.json").read_text())
                 self.assertEqual(len(manifest["sha256"]), 64)
+                expected_schema = schema | {'features': FEATURES}
+                self.assertEqual(manifest['input_schema'], expected_schema)
+                self.assertEqual(report['input_schema'], expected_schema)
+                self.assertEqual(report['fitness_method'], 'cooccurrence')
+                config = json.loads((run_dir / 'config.json').read_text())
+                self.assertEqual(config['input_schema'], expected_schema)
                 X, y = load_jsonl(path)
                 test = manifest["splits"]["test"]["sample_indices"]
                 selected = report["selected_model"]
                 pred = (
-                    Fitness(X[test]).predict(selected["candidate"], "noisy_or")
+                    Fitness(X[test]).predict(selected["candidate"], report['fitness_method'])
                     if selected["model"] == "candidate"
                     else np.full(len(test), selected["constant_label"])
                 )
@@ -491,6 +558,89 @@ class ExperimentTests(unittest.TestCase):
             reports[0]["validation_metrics"], reports[1]["validation_metrics"]
         )
         self.assertNotEqual(reports[0]["test_metrics"], reports[1]["test_metrics"])
+
+
+class TrainingRegressionTests(unittest.TestCase):
+    def test_uldd_views_and_labels_of_one_driver_stay_together(self):
+        records = [
+            {'source_video': f'{subject}/{state}/{subject}_{view}_{state}.mp4'}
+            for subject in 'ABCDEFGHIJ'
+            for state in ('A', 'D')
+            for view in ('IR', 'L3D', 'R3D')
+        ]
+        labels = [int('/D/' in r['source_video']) for r in records]
+        splits, groups = split_dataset(records, labels)
+        self.assertEqual(len(set(groups)), 10)
+        self.assertEqual(sum(map(len, splits.values())), 60)
+        for subject in 'ABCDEFGHIJ':
+            self.assertEqual(sum(subject in groups[idx] for idx in splits.values()), 1)
+        records[0]['subject_id'] = 'B'
+        with self.assertRaisesRegex(ValueError, 'disagrees with ULDD'):
+            split_dataset(records, labels)
+
+    def test_invalid_jsonl_is_reported_and_never_silently_skipped(self):
+        row = dict.fromkeys(FEATURES, .5) | {'label': 0}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'data.jsonl'
+            for bad in ('{broken', json.dumps(row | {'perclos': None}), 'null'):
+                path.write_text(json.dumps(row) + '\n\n' + bad + '\n' + json.dumps(row))
+                with self.assertRaisesRegex(ValueError, 'line 3'):
+                    load_jsonl(path)
+
+    def test_all_optimizers_evaluate_every_training_row(self):
+        class RecordingFitness(Fitness):
+            def predict(self, candidate, method='weighted_mean'):
+                prediction = super().predict(candidate, method)
+                self.asserted_sizes.append(len(prediction))
+                return prediction
+
+        rng = np.random.default_rng(32)
+        X = rng.random((37, 8))
+        y = np.arange(37) % 2
+        for optimizer_type, config_type, logger_type in ALGORITHMS:
+            with self.subTest(algorithm=optimizer_type.__name__), tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()), patch.object(logger_type, 'save_plots'):
+                fitness = RecordingFitness(X)
+                fitness.asserted_sizes = []
+                logger = logger_type(tmp)
+                optimizer = optimizer_type(fitness, y, 'cooccurrence', config_type(population_size=6, generations=3), logger)
+                optimizer.run()
+                self.assertTrue(fitness.asserted_sizes)
+                self.assertEqual(set(fitness.asserted_sizes), {37})
+                population = [json.loads(line) for line in logger.population_log.read_text().splitlines()]
+                self.assertEqual(len(population), 18)
+                self.assertEqual([sum(row['generation'] == g for row in population) for g in range(3)], [6, 6, 6])
+                self.assertEqual([row['generation'] for row in logger.history], [0, 1, 2])
+
+    def test_single_generation_logs_initial_population_and_writes_real_plots(self):
+        for optimizer_type, config_type, logger_type in ALGORITHMS:
+            with self.subTest(algorithm=optimizer_type.__name__), tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
+                logger = logger_type(tmp)
+                optimizer = optimizer_type(Fitness(np.zeros((4, 8))), [0, 1, 0, 1], 'noisy_or',
+                                           config_type(population_size=3, generations=1), logger)
+                archive = optimizer.run()
+                self.assertEqual(optimizer.evaluations, 3)
+                self.assertEqual(len(logger.history), 1)
+                self.assertGreater(len(archive), 0)
+                plots = list(Path(tmp).glob('*.png'))
+                self.assertEqual(len(plots), 6)
+                for path in plots:
+                    self.assertTrue(path.read_bytes().startswith(b'\x89PNG\r\n\x1a\n'))
+
+    def test_empty_candidate_archive_still_selects_valid_baseline(self):
+        results = score_candidates(np.empty((0, 9)), Fitness(np.zeros((4, 8))), [0, 0, 1, 1], 'noisy_or')
+        self.assertEqual(len(results), 2)
+        self.assertEqual(max(results, key=selection_key)['model'], 'constant_1')
+
+    def test_random_pareto_order_never_places_dominated_point_before_dominator(self):
+        rng = np.random.default_rng(7)
+        objectives = rng.random((50, 3))
+        order = pareto_order(objectives)
+        self.assertEqual(sorted(order.tolist()), list(range(50)))
+        rank = np.argsort(order)
+        for i, a in enumerate(objectives):
+            for j, b in enumerate(objectives):
+                if dominates(a, b):
+                    self.assertLess(rank[i], rank[j])
 
 
 if __name__ == "__main__":

@@ -11,7 +11,7 @@ FEATURES = [
     "nod_duration",
     "nod_frequency",
     "dominant_head_motion_frequency",
-    "cnn_lstm_score",
+    "neuralnetwork_score",
 ]
 
 def validate_labels(values, n_samples=None):
@@ -30,6 +30,7 @@ def load_jsonl(path, include_metadata=False):
     X, y = [], []
     records = []
     encoding = None
+    normalization = None
     content = Path(path).read_bytes()
     for line_number, line in enumerate(content.decode("utf-8").splitlines(), 1):
         if not line.strip():
@@ -43,11 +44,26 @@ def load_jsonl(path, include_metadata=False):
             ):
                 raise ValueError("Each record requires an integer label 0 or 1")
             row_encoding = row.get("feature_encoding", "scale_v1")
-            if row_encoding not in ("scale_v1", "risk_v1", "risk_v2"):
+            if row_encoding not in ("scale_v1", "risk_v1", "risk_v2", "physical_v1"):
                 raise ValueError("Unknown feature encoding")
             if encoding is not None and row_encoding != encoding:
                 raise ValueError("Cannot mix feature encodings in one dataset")
             encoding = row_encoding
+            if row_encoding == "physical_v1":
+                identity = row["normalization_id"]
+                scales = row["normalization_scales"]
+                if (not isinstance(identity, str) or len(identity) != 64
+                        or any(c not in "0123456789abcdef" for c in identity)
+                        or not isinstance(scales, dict) or set(scales) != set(FEATURES)
+                        or any(type(v) not in (int, float) or not np.isfinite(v) or v <= 0
+                               for v in scales.values())):
+                    raise ValueError("Invalid physical normalization metadata")
+                current = (identity, scales)
+                if normalization is not None and current != normalization:
+                    raise ValueError("Cannot mix physical normalization configurations")
+                normalization = current
+            if any(type(row[name]) not in (int, float) for name in FEATURES):
+                raise ValueError("Features must be numeric scalars, not bool or strings")
             values = np.asarray([row[name] for name in FEATURES], dtype=np.float64)
             if (
                 values.shape != (8,)
@@ -68,6 +84,12 @@ def load_jsonl(path, include_metadata=False):
         return *result, {
             "records": records,
             "sha256": hashlib.sha256(content).hexdigest(),
+            "input_schema": {
+                "features": FEATURES.copy(),
+                "feature_encoding": encoding,
+                "normalization_id": normalization[0] if normalization else None,
+                "normalization_scales": normalization[1] if normalization else None,
+            },
         }
     return result
 
@@ -131,36 +153,36 @@ class Fitness:
         mask = w >= 0.5
         return w, threshold, mask
 
-    def weighted_mean(self, candidate):
-        w, threshold, mask = self._candidate(candidate)
+    def score(self, candidate, method="weighted_mean"):
+        if method not in ("weighted_mean", "noisy_or", "cooccurrence"):
+            raise ValueError(f"Unknown fitness method: {method}")
+        w, _, mask = self._candidate(candidate)
         if not mask.any():
-            return np.zeros(len(self.X), dtype=np.int8)
-        score = (self.X[:, mask] * w[mask]).sum(axis=1) / w[mask].sum()
-        return (score >= threshold).astype(np.int8)
-
-    def noisy_or(self, candidate):
-        w, threshold, mask = self._candidate(candidate)
-        if not mask.any():
-            return np.zeros(len(self.X), dtype=np.int8)
+            return np.zeros(len(self.X), dtype=np.float32)
         z = self.X[:, mask] * w[mask]
-        score = 1.0 - np.prod(1.0 - z, axis=1)
-        return (score >= threshold).astype(np.int8)
-
-    def cooccurrence(self, candidate):
-        w, threshold, mask = self._candidate(candidate)
-        if not mask.any():
-            return np.zeros(len(self.X), dtype=np.int8)
-        z = np.sort(self.X[:, mask] * w[mask], axis=1)
+        if method == "weighted_mean":
+            return z.sum(axis=1) / w[mask].sum()
+        if method == "noisy_or":
+            return 1.0 - np.prod(1.0 - z, axis=1)
+        z = np.sort(z, axis=1)
         strongest = z[:, -1]
         # The strongest pair adds support without accumulating many weak signals.
         joint = strongest * z[:, -2] if z.shape[1] > 1 else 0.0
-        score = strongest + (1.0 - strongest) * joint
-        return (score >= threshold).astype(np.int8)
+        return strongest + (1.0 - strongest) * joint
+
+    def weighted_mean(self, candidate):
+        return self.predict(candidate, "weighted_mean")
+
+    def noisy_or(self, candidate):
+        return self.predict(candidate, "noisy_or")
+
+    def cooccurrence(self, candidate):
+        return self.predict(candidate, "cooccurrence")
 
     def predict(self, candidate, method="weighted_mean"):
-        if method not in ("weighted_mean", "noisy_or", "cooccurrence"):
-            raise ValueError(f"Unknown fitness method: {method}")
-        return getattr(self, method)(candidate)
+        score = self.score(candidate, method)
+        _, threshold, mask = self._candidate(candidate)
+        return (score >= threshold).astype(np.int8) if mask.any() else np.zeros(len(self.X), dtype=np.int8)
 
     @staticmethod
     def evaluate(candidate, y_pred, y_true):

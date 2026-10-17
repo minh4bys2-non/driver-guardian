@@ -504,12 +504,13 @@ class CMDPSOFS:
 
 
 if __name__ == "__main__":
+    from ai.OptimalAlgorithsm.DataSystem.config import OUTPUT_JSONL as DATA_PATH
+
     # ============================================================
     # Change experiment parameters directly here.
     # ============================================================
-    DATA_PATH = "/home/tranmanhduy/Workspace/ptithcm/driver-guardian/ai/OptimalAlgorithsm/drowsiness_risk_10.jsonl"
 
-    OUTPUT_DIR = "/home/tranmanhduy/Workspace/ptithcm/driver-guardian/ai/OptimalAlgorithsm/TrainingSystem/output/cmdpsofs"
+    OUTPUT_DIR = Path(__file__).resolve().parent / "output" / "cmdpsofs"
 
     # Must match a method implemented in Fitness.
     FITNESS_METHOD = "cooccurrence"

@@ -1,11 +1,38 @@
+import sys
+from pathlib import Path
+
 import cv2
 import numpy as np
 
+
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+from ai.OptimalAlgorithsm.DataSystem.config import DEFAULT_CONFIG, VIDEO_ROOT
+
+
+def balance_brightness(frame, target_luma=DEFAULT_CONFIG.target_luma):
+    """Nâng sáng BGR uint8 trên kênh Y; giữ chroma và giới hạn khuếch đại vùng tối."""
+    if not np.isfinite(target_luma) or not 0 <= target_luma <= 255:
+        raise ValueError("target_luma must be finite and in [0,255]")
+    if target_luma == 0:
+        return frame
+    ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
+    mean = float(ycrcb[:, :, 0].mean())
+    if mean == 0 or mean >= target_luma:
+        return frame
+    gamma = max(0.5, np.log(target_luma / 255) / np.log(mean / 255))
+    lut = np.rint(255 * (np.arange(256) / 255) ** gamma).astype(np.uint8)
+    ycrcb[:, :, 0] = cv2.LUT(ycrcb[:, :, 0], lut)
+    return cv2.cvtColor(ycrcb, cv2.COLOR_YCrCb2BGR)
+
+
 # [Frame: RGB, shape: [3, H, W], dtype: uint8, range: [0, 255], timeline = 30FPS]
 # (frame: np.ndarray, timestamp: float)
-def read_video(path, target_fps=30):
+def read_video(path, target_fps=DEFAULT_CONFIG.fps, *, target_luma=DEFAULT_CONFIG.target_luma):
     if not np.isfinite(target_fps) or target_fps <= 0:
         raise ValueError("target_fps must be finite and positive")
+    if not np.isfinite(target_luma) or not 0 <= target_luma <= 255:
+        raise ValueError("target_luma must be finite and in [0,255]")
     cap = cv2.VideoCapture(path)
     previous = None
     previous_t = origin = None
@@ -28,8 +55,13 @@ def read_video(path, target_fps=30):
             if index == 1:
                 use_frame_index = origin == 0 and t == 0
             t = index / source_fps if use_frame_index else t - origin
-            if not np.isfinite(t) or t < 0 or (previous_t is not None and t <= previous_t):
+            if (
+                not np.isfinite(t)
+                or t < 0
+                or (previous_t is not None and t <= previous_t)
+            ):
                 raise ValueError(f"Invalid video timestamp: {path}")
+            frame = balance_brightness(frame, target_luma)
             frame = np.transpose(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), (2, 0, 1))
             if previous is not None:
                 while output_index / target_fps < t - 1e-9:
@@ -47,8 +79,9 @@ def read_video(path, target_fps=30):
     finally:
         cap.release()
 
+
 if __name__ == "__main__":
-    path = "/home/tranmanhduy/Workspace/ptithcm/driver-guardian/ai/OptimalAlgorithsm/UTA-RLDD/Fold1_part1/01/10.MOV"
+    path = str(VIDEO_ROOT / "Fold1_part1/01/10.MOV")
     for frame, timestamp in read_video(path):
         print(frame.shape, timestamp)
         image = np.transpose(frame, (1, 2, 0))

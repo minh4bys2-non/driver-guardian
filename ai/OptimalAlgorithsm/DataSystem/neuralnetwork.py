@@ -1,208 +1,104 @@
-import math
-import sys
 from pathlib import Path
-from typing import List, Optional, Tuple, Union
-
-# Đảm bảo đường dẫn gốc (thư mục cha chứa 'ai') và các gói con có mặt trong sys.path
-_CURRENT_DIR = Path(__file__).resolve().parent
-for _p in _CURRENT_DIR.parents:
-    if (_p / "ai").is_dir():
-        if str(_p) not in sys.path:
-            sys.path.insert(0, str(_p))
-        _ai_dir = _p / "ai"
-        for _sub in ("ObjectDetection_2p6M", "LSTM"):
-            _sub_dir = str(_ai_dir / _sub)
-            if _sub_dir not in sys.path:
-                sys.path.insert(0, _sub_dir)
-        break
+import sys
+from time import perf_counter
+from typing import Tuple
 
 import cv2
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
+from torch import nn
 
-from ai.LSTM.src import ConvGRUClassifier
-from ai.ObjectDetection_2p6M.src.model import NMSFreeDetector
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
-
-def _resolve_checkpoint(user_path: Optional[Union[str, Path]], relative_fallback: str) -> Path:
-    """Tự động phân giải đường dẫn checkpoint hợp lệ trong dự án."""
-    if user_path is not None:
-        p = Path(user_path).expanduser().resolve()
-        if p.exists():
-            return p
-        raise FileNotFoundError(f"Checkpoint không tồn tại: {user_path}")
-
-    # Tìm kiếm các vị trí mặc định trong cây thư mục project
-    for parent in _CURRENT_DIR.parents:
-        cand1 = parent / "ai" / "checkpoints" / relative_fallback
-        if cand1.exists():
-            return cand1
-        cand2 = parent / "checkpoints" / relative_fallback
-        if cand2.exists():
-            return cand2
-        cand3 = parent / relative_fallback
-        if cand3.exists():
-            return cand3
-
-    cwd = Path.cwd()
-    cand_cwd1 = cwd / "ai" / "checkpoints" / relative_fallback
-    if cand_cwd1.exists():
-        return cand_cwd1
-    cand_cwd2 = cwd / "checkpoints" / relative_fallback
-    if cand_cwd2.exists():
-        return cand_cwd2
-
-    raise FileNotFoundError(f"Không tìm thấy checkpoint mặc định: {relative_fallback}")
+from ai.LSTM.src.checkpoint import load_model
+from ai.LSTM.src.model import DrowsyClassifier
+from ai.OptimalAlgorithsm.DataSystem.config import (
+    BENCHMARK_RUNS, BENCHMARK_WARMUP, DEFAULT_CONFIG, LETTERBOX_COLOR, MODEL_IMAGE_SIZE,
+)
 
 
 class NeuralNetwork(nn.Module):
-    def __init__(
-            self,
-            cnn_model: Optional[NMSFreeDetector] = None,
-            conv_gru_model: Optional[ConvGRUClassifier] = None,
-            chunk_size: int = 32,
-            cnn_path: Optional[Union[str, Path]] = None,
-            conv_gru_path: Optional[Union[str, Path]] = None,
-            device: Optional[Union[str, torch.device]] = None,
-    ):
+    def __init__(self, checkpoint_path=None, device=None, chunk_size=None, *,
+                 config=DEFAULT_CONFIG, model: DrowsyClassifier | None = None):
         super().__init__()
-        if device is None:
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        else:
-            self.device = torch.device(device)
-
-        # Tự động nạp checkpoints tối ưu nếu chưa truyền model
-        if cnn_model is None:
-            resolved_cnn = _resolve_checkpoint(cnn_path, "model_cnn/best.pt")
-            cnn_model = NMSFreeDetector.from_checkpoint(resolved_cnn, map_location=self.device, eval_mode=True)
-
-        if conv_gru_model is None:
-            resolved_gru = _resolve_checkpoint(conv_gru_path, "model_convgru/best.pt")
-            conv_gru_model = ConvGRUClassifier.from_checkpoint(resolved_gru, map_location=str(self.device))
-
-        self.cnn_model: NMSFreeDetector = cnn_model
-        self.conv_gru: ConvGRUClassifier = conv_gru_model.eval()
-        self.cnn_backbone = self.cnn_model.backbone.eval()
-        self.cnn_neck = self.cnn_model.neck.eval()
-        self.chunk_size: int = max(1, int(chunk_size))
-        self.to(self.device)
+        device = config.device if device is None else device
+        self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        self.image_size = config.neural_size
+        if (not np.isfinite([config.neural_fps, config.neural_sec]).all()
+                or min(config.neural_fps, config.neural_sec) <= 0
+                or config.neural_count < 1
+                or abs(config.neural_count / config.neural_fps - config.neural_sec) > 1e-6):
+            raise ValueError("neural_sec must contain a positive integer number of neural frames")
+        self.frame_count = config.neural_count
+        self.fps = config.neural_fps
+        chunk_size = config.chunk_size if chunk_size is None else chunk_size
+        if type(chunk_size) is not int or chunk_size < 0:
+            raise ValueError("chunk_size must be a nonnegative integer")
+        if type(self.image_size) is not int or self.image_size < 1:
+            raise ValueError("neural_size must be a positive integer")
+        if model is None:
+            path = Path(checkpoint_path or config.checkpoint_path).expanduser()
+            model, state = load_model(path, self.device)
+            for key, expected in (("image_size", self.image_size),
+                                  ("target_fps", config.neural_fps),
+                                  ("window_sec", config.neural_sec)):
+                if state["config"].get(key) != expected:
+                    raise ValueError(f"Checkpoint {key}={state['config'].get(key)!r}, expected {expected}")
+        self.model = model.to(self.device).eval()
+        self.model.chunk_size = chunk_size
+        self.eval()
 
     @classmethod
-    def from_checkpoint(
-            cls,
-            cnn_path: Optional[Union[str, Path]] = None,
-            conv_gru_path: Optional[Union[str, Path]] = None,
-            device: Optional[Union[str, torch.device]] = None,
-            chunk_size: int = 32,
-    ):
-        """Khởi tạo NeuralNetwork trực tiếp từ các file checkpoint .pt"""
-        return cls(
-            cnn_path=cnn_path,
-            conv_gru_path=conv_gru_path,
-            device=device,
-            chunk_size=chunk_size,
-        )
+    def from_checkpoint(cls, checkpoint_path=None, **kwargs):
+        return cls(checkpoint_path=checkpoint_path, **kwargs)
 
-    def forward(self, x: Union[np.ndarray, torch.Tensor]) -> float:
+    @torch.inference_mode()
+    def forward(self, x) -> float:
+        """RGB [50,3,H,W] đã lấy mẫu 5 FPS/10s -> P(drowsy).
+
+        Engine lấy mỗi 6 frame từ read_video 30 FPS trước khi gọi mạng.
+        DrowsyClassifier tự chia uint8 cho 255; giữ nguyên thứ tự kênh RGB.
         """
-        Dự đoán mức độ buồn ngủ từ chuỗi khung hình video.
-
-        Args:
-            x: Chuỗi frame dạng np.ndarray hoặc torch.Tensor với shape [T, 3, H, W].
-               Dtype có thể là uint8 [0, 255] hoặc float [0.0, 1.0].
-               H và W có thể là 640 hoặc 224 (sẽ tự động điều chỉnh về 640x640).
-
-        Returns:
-            float: Điểm xác suất buồn ngủ trong khoảng [0.0, 1.0].
-        """
-        if self.cnn_backbone is None or self.cnn_neck is None or self.conv_gru is None:
-            raise RuntimeError("Model checkpoints are not loaded.")
-
-        device = next(self.cnn_backbone.parameters()).device
-
-        # Vấn đề 2: Chuyển đổi an toàn từ numpy ndarray sang torch.Tensor
         if isinstance(x, np.ndarray):
             x = torch.from_numpy(x)
-        elif not isinstance(x, torch.Tensor):
-            raise TypeError(f"Expected numpy.ndarray or torch.Tensor, got {type(x).__name__}")
-
-        if x.ndim != 4:
-            raise ValueError(f"Expected input with 4 dimensions [T, C, H, W], got shape {tuple(x.shape)}")
-
-        T, C, H, W = x.shape
-        if T == 0:
-            raise ValueError("Empty frame sequence (T = 0)")
-        if H == 0 or W == 0:
-            raise ValueError("Frame dimensions must be nonzero")
-        if C != 3:
-            raise ValueError(f"Expected 3 color channels (RGB), got C = {C}")
-
+        if not isinstance(x, torch.Tensor):
+            raise TypeError("Frames must be a numpy array or torch tensor")
+        if x.ndim != 4 or x.shape[1] != 3 or any(size == 0 for size in x.shape):
+            raise ValueError("Frames must have nonempty shape [T,3,H,W]")
+        if x.shape[0] != self.frame_count:
+            raise ValueError(f"Expected {self.frame_count} frames sampled at {self.fps:g} FPS, got {x.shape[0]}")
         if x.dtype != torch.uint8 and (
-                not x.is_floating_point() or not torch.isfinite(x).all()
-                or x.min() < 0 or x.max() > 1):
+            not x.is_floating_point() or not torch.isfinite(x).all()
+            or x.min() < 0 or x.max() > 1
+        ):
             raise ValueError("Frames must be uint8 [0,255] or finite float [0,1]")
-
-        # Vấn đề 3: Tự động điều chỉnh kích thước về 640x640 qua hàm letterbox nếu H != 640 hoặc W != 640
-        if H != 640 or W != 640:
-            x_cpu = x.detach().cpu()
-            x_np = (x_cpu if x_cpu.dtype == torch.uint8 else x_cpu.float()).numpy()
-
-            # Áp dụng hàm letterbox chuẩn hóa từng khung hình về [3, 640, 640]
-            x_lb = np.stack([letterbox(np.moveaxis(frame, 0, -1), new_size=640).transpose(2, 0, 1) for frame in x_np])
-            x = torch.from_numpy(x_lb)
-            H, W = 640, 640
-
-        p3_list, p4_list, p5_list = [], [], []
-
-        with torch.inference_mode():
-            for i in range(0, T, self.chunk_size):
-                chunk = x[i : i + self.chunk_size].to(device, non_blocking=True)
-
-                # Chuẩn hóa về [0.0, 1.0] float32
-                if chunk.dtype == torch.uint8:
-                    chunk = chunk.float() / 255.0
-                elif chunk.dtype != torch.float32:
-                    chunk = chunk.float()
-
-                out3, out4, out5 = self.cnn_backbone(chunk)
-                out3, out4, out5 = self.cnn_neck(out3, out4, out5)
-
-                p3_list.append(out3.float())
-                p4_list.append(out4.float())
-                p5_list.append(out5.float())
-
-            p3 = torch.cat(p3_list, dim=0).unsqueeze(0)
-            p4 = torch.cat(p4_list, dim=0).unsqueeze(0)
-            p5 = torch.cat(p5_list, dim=0).unsqueeze(0)
-
-            seq_lens = torch.tensor([T], dtype=torch.long, device=device)
-            logits = self.conv_gru((p3, p4, p5), seq_lens=seq_lens)
-
-            if logits.shape not in ((1, 1), (1, 2)):
-                raise ValueError(f"Expected binary clip logits [1,1] or [1,2], got {tuple(logits.shape)}")
-            # Tính điểm xác suất
-            if logits.shape[-1] == 1:
-                score = torch.sigmoid(logits).item()
-            else:
-                probs = F.softmax(logits, dim=-1)
-                score = probs[0, 1].item()
-
-        return float(score)
+        if x.shape[-2:] != (self.image_size, self.image_size):
+            frames = x.detach().cpu()
+            frames = (frames if frames.dtype == torch.uint8 else frames.float()).numpy()
+            x = torch.from_numpy(np.stack([letterbox(frame.transpose(1, 2, 0), self.image_size).transpose(2, 0, 1)
+                                           for frame in frames]))
+        if x.dtype != torch.uint8:
+            x = x.float()
+        x = x.unsqueeze(0).to(self.device)
+        self.model.eval()
+        logits = self.model(x, seq_lens=torch.tensor([x.shape[1]], device=self.device))
+        if logits.shape != (1, 2) or not torch.isfinite(logits).all():
+            raise ValueError("Expected finite binary clip logits [1,2]")
+        return logits.float().softmax(dim=-1)[0, 1].item()
 
 
 def letterbox(
-        image: np.ndarray,
-        new_size: int = 640,
-        color: Tuple[int, int, int] = (114, 114, 114)
+    image: np.ndarray,
+    new_size: int = MODEL_IMAGE_SIZE,
+    color: Tuple[int, int, int] = LETTERBOX_COLOR,
 ) -> np.ndarray:
     """
     Căn chỉnh kích thước ảnh về new_size x new_size giữ nguyên tỷ lệ khung hình
     và chèn viền màu (mặc định 114, 114, 114).
     Hỗ trợ linh hoạt cả định dạng HWC [H, W, 3] và CHW [3, H, W].
     """
-    is_chw = (image.ndim == 3 and image.shape[0] == 3 and image.shape[-1] != 3)
+    is_chw = image.ndim == 3 and image.shape[0] == 3 and image.shape[-1] != 3
     if is_chw:
         image = np.transpose(image, (1, 2, 0))
 
@@ -225,13 +121,51 @@ def letterbox(
 
 
 if __name__ == "__main__":
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Benchmark tốc độ suy luận NeuralNetwork")
+    parser.add_argument("--device", default=DEFAULT_CONFIG.device)
+    parser.add_argument("--frames", type=int, default=DEFAULT_CONFIG.neural_count)
+    parser.add_argument("--size", type=int, default=MODEL_IMAGE_SIZE)
+    parser.add_argument("--warmup", type=int, default=BENCHMARK_WARMUP)
+    parser.add_argument("--runs", type=int, default=BENCHMARK_RUNS)
+    parser.add_argument("--chunk-size", type=int, default=DEFAULT_CONFIG.chunk_size)
+    parser.add_argument("--checkpoint", default=str(DEFAULT_CONFIG.checkpoint_path))
+    args = parser.parse_args()
+    if min(args.frames, args.size, args.runs) < 1 or args.chunk_size < 0 or args.warmup < 0:
+        parser.error("frames, size, runs phải > 0; chunk-size, warmup phải >= 0")
+
+    if args.frames != DEFAULT_CONFIG.neural_count:
+        parser.error(f"frames phải bằng {DEFAULT_CONFIG.neural_count} theo cấu hình train")
+    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     print(f"[*] Khởi tạo NeuralNetwork trên device: {device}")
-    model = NeuralNetwork(device=device)
+    model = NeuralNetwork(
+        device=device, chunk_size=args.chunk_size,
+        checkpoint_path=args.checkpoint,
+    ).eval()
     print("[*] Nạp model thành công!")
 
-    # Test với dummy array 224x224 mô phỏng dữ liệu từ Engine
-    test_dummy = np.zeros((10, 3, 224, 224), dtype=np.uint8)
+    test_dummy = np.zeros((args.frames, 3, args.size, args.size), dtype=np.uint8)
+    print(f"[*] Input giả lập: {test_dummy.shape}, uint8; chunk_size={args.chunk_size}")
+    print(f"[*] Warm-up {args.warmup} lượt, đo {args.runs} lượt...")
+    for _ in range(args.warmup):
+        model(test_dummy)
 
-    score = model(test_dummy)
-    print(f"[*] Điểm dự đoán với mảng 224x224: {score:.4f}")
+    elapsed = []
+    for _ in range(args.runs):
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        start = perf_counter()
+        score = model(test_dummy)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        elapsed.append(perf_counter() - start)
+
+    latency_ms = np.asarray(elapsed) * 1000
+    print(f"[*] Điểm dự đoán: {score:.4f}")
+    print("[*] Thời gian gồm tiền xử lý, truyền dữ liệu và suy luận; không gồm nạp model.")
+    print(f"[*] Độ trễ/chuỗi: mean={latency_ms.mean():.2f} ms, "
+          f"P50={np.percentile(latency_ms, 50):.2f} ms, "
+          f"P95={np.percentile(latency_ms, 95):.2f} ms")
+    print(f"[*] Tốc độ: {args.runs / sum(elapsed):.2f} chuỗi/s, "
+          f"{args.frames * args.runs / sum(elapsed):.2f} frame/s")

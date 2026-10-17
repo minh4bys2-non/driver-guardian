@@ -21,7 +21,10 @@ from ai.OptimalAlgorithsm.TrainingSystem.cmdpsofs import (
     crowding_distance,
     dominates,
 )
-from ai.OptimalAlgorithsm.TrainingSystem.fitnessFunction import FEATURES, validate_labels
+from ai.OptimalAlgorithsm.TrainingSystem.fitnessFunction import (
+    FEATURES,
+    validate_labels,
+)
 
 
 @dataclass
@@ -35,12 +38,21 @@ class MOHHOConfig:
     seed: int = 42
 
     def __post_init__(self):
-        if any(type(v) is not int for v in (self.population_size, self.generations, self.archive_size)):
-            raise ValueError("population_size, generations and archive_size must be integers")
+        if any(
+            type(v) is not int
+            for v in (self.population_size, self.generations, self.archive_size)
+        ):
+            raise ValueError(
+                "population_size, generations and archive_size must be integers"
+            )
         if self.population_size < 1 or self.generations < 1 or self.archive_size < 1:
-            raise ValueError("population_size, generations and archive_size must be positive")
+            raise ValueError(
+                "population_size, generations and archive_size must be positive"
+            )
         if type(self.dimensions) is not int or self.dimensions != 9:
-            raise ValueError("Fitness requires 8 weights and 1 classification threshold")
+            raise ValueError(
+                "Fitness requires 8 weights and 1 classification threshold"
+            )
         if not 1 < self.levy_beta < 2:
             raise ValueError("levy_beta must be in (1, 2)")
         if not np.isfinite(self.levy_scale) or self.levy_scale < 0:
@@ -64,6 +76,7 @@ class MOHHOArchive(ParetoArchive):
         weights = np.maximum(distance, 1e-12)
         index = rng.choice(len(self), p=weights / weights.sum())
         return self.positions[index].copy()
+
 
 class MOHHOLogger(RunLogger):
     def save_config(self, config, data_path, fitness_method, n_samples):
@@ -103,7 +116,8 @@ class MOHHO:
         self.hawks = []
         beta = config.levy_beta
         self.levy_sigma = (
-            math.gamma(1 + beta) * math.sin(math.pi * beta / 2)
+            math.gamma(1 + beta)
+            * math.sin(math.pi * beta / 2)
             / (math.gamma((1 + beta) / 2) * beta * 2 ** ((beta - 1) / 2))
         ) ** (1 / beta)
 
@@ -151,7 +165,9 @@ class MOHHO:
         jump = 2.0 * (1.0 - self.rng.random())
         if escape >= 0.5:
             if abs(energy) >= 0.5:
-                new_position = rabbit - position - energy * np.abs(jump * rabbit - position)
+                new_position = (
+                    rabbit - position - energy * np.abs(jump * rabbit - position)
+                )
             else:
                 new_position = rabbit - energy * np.abs(rabbit - position)
             child = self._hawk(new_position)
@@ -163,8 +179,11 @@ class MOHHO:
         trials = [self._hawk(y), self._hawk(z)]
         candidates = [hawk] + trials
         front = [
-            h for h in candidates
-            if not any(dominates(other.objectives, h.objectives) for other in candidates)
+            h
+            for h in candidates
+            if not any(
+                dominates(other.objectives, h.objectives) for other in candidates
+            )
         ]
         return front[self.rng.integers(len(front))], trials
 
@@ -191,7 +210,11 @@ class MOHHO:
                 self._step(generation)
             self.logger.log_population(generation, self.hawks)
             self.logger.log_generation(
-                generation, self.hawks, self.archive, time.perf_counter() - start, self.evaluations
+                generation,
+                self.hawks,
+                self.archive,
+                time.perf_counter() - start,
+                self.evaluations,
             )
             self.logger.print_progress(self.cfg.generations)
 

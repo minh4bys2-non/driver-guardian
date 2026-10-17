@@ -9,7 +9,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from ai.OptimalAlgorithsm.TrainingSystem.fitnessFunction import (
-    FEATURES, classification_metrics, selection_key, validate_labels,
+    FEATURES,
+    classification_metrics,
+    selection_key,
+    validate_labels,
 )
 
 
@@ -55,12 +58,18 @@ class CMDPSOFSConfig:
     def __post_init__(self):
         sizes = (self.population_size, self.generations, self.archive_size)
         if any(type(v) is not int or v < 1 for v in sizes):
-            raise ValueError("population_size, generations and archive_size must be positive integers")
+            raise ValueError(
+                "population_size, generations and archive_size must be positive integers"
+            )
         if type(self.dimensions) is not int or self.dimensions != 9:
-            raise ValueError("Fitness requires 8 weights and 1 classification threshold")
+            raise ValueError(
+                "Fitness requires 8 weights and 1 classification threshold"
+            )
         coefficients = (self.inertia, self.cognitive, self.social, self.velocity_limit)
         if not np.isfinite(coefficients).all() or min(coefficients) < 0:
-            raise ValueError("PSO coefficients and velocity_limit must be finite and nonnegative")
+            raise ValueError(
+                "PSO coefficients and velocity_limit must be finite and nonnegative"
+            )
         if not np.isfinite(self.nonuniform_b) or self.nonuniform_b <= 0:
             raise ValueError("nonuniform_b must be finite and positive")
 
@@ -88,10 +97,16 @@ class ParetoArchive:
     def update(self, positions: np.ndarray, objectives: np.ndarray):
         positions = np.asarray(positions, dtype=np.float32)
         objectives = np.asarray(objectives, dtype=np.float32)
-        if (positions.ndim != 2 or positions.shape[1] != 9
-                or objectives.shape != (len(positions), 3)
-                or not np.isfinite(positions).all() or not np.isfinite(objectives).all()):
-            raise ValueError("Archive requires finite positions [N,9] and objectives [N,3]")
+        if (
+            positions.ndim != 2
+            or positions.shape[1] != 9
+            or objectives.shape != (len(positions), 3)
+            or not np.isfinite(positions).all()
+            or not np.isfinite(objectives).all()
+        ):
+            raise ValueError(
+                "Archive requires finite positions [N,9] and objectives [N,3]"
+            )
         if len(self) == 0:
             all_positions = positions
             all_objectives = objectives
@@ -162,7 +177,8 @@ class RunLogger:
             "num_features": int(mask.sum()),
             "selected_features": [FEATURES[j] for j in np.flatnonzero(mask)],
             "metrics": classification_metrics(
-                self.y_true, self.fitness.predict(candidate, self.method)),
+                self.y_true, self.fitness.predict(candidate, self.method)
+            ),
         }
 
     def print_progress(self, generations):
@@ -211,7 +227,9 @@ class RunLogger:
                 }
                 f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
-    def log_generation(self, generation, particles, archive, elapsed_seconds, evaluations):
+    def log_generation(
+        self, generation, particles, archive, elapsed_seconds, evaluations
+    ):
         pop_obj = np.vstack([p.objectives for p in particles])
         recall = 1.0 - archive.objectives[:, 0]
         precision = 1.0 - archive.objectives[:, 1]
@@ -229,7 +247,8 @@ class RunLogger:
                 "min_num_features": int(num_features.min()),
             },
             "representative": max(
-                (self.candidate_result(p) for p in archive.positions), key=selection_key),
+                (self.candidate_result(p) for p in archive.positions), key=selection_key
+            ),
             "best_ideal_distance": float(ideal_distance.min()),
             "population_mean_objectives": pop_obj.mean(axis=0).tolist(),
             "elapsed_seconds": float(elapsed_seconds),
@@ -240,7 +259,9 @@ class RunLogger:
 
     def save_archive(self, archive):
         results = [self.candidate_result(p) for p in archive.positions]
-        order = sorted(range(len(results)), key=lambda i: selection_key(results[i]), reverse=True)
+        order = sorted(
+            range(len(results)), key=lambda i: selection_key(results[i]), reverse=True
+        )
         with open(self.final_archive, "w", encoding="utf-8") as f:
             for idx in order:
                 candidate = archive.positions[idx]
@@ -264,16 +285,34 @@ class RunLogger:
         if not self.history:
             return
         generations = np.array([x["generation"] for x in self.history])
-        self._line_plot(generations, [x["representative"]["metrics"]["recall"] for x in self.history],
-                        "Train representative recall", "Recall", "convergence_recall.png")
-        self._line_plot(generations, [x["representative"]["metrics"]["precision"] for x in self.history],
-                        "Train representative precision", "Precision", "convergence_precision.png")
-        self._line_plot(generations, [x["representative"]["num_features"] for x in self.history],
-                        "Train representative selected features", "Number of features",
-                        "convergence_num_features.png")
-        self._line_plot(generations, [x["best_ideal_distance"] for x in self.history],
-                        "Distance to ideal objective point", "Euclidean distance",
-                        "convergence_ideal_distance.png")
+        self._line_plot(
+            generations,
+            [x["representative"]["metrics"]["recall"] for x in self.history],
+            "Train representative recall",
+            "Recall",
+            "convergence_recall.png",
+        )
+        self._line_plot(
+            generations,
+            [x["representative"]["metrics"]["precision"] for x in self.history],
+            "Train representative precision",
+            "Precision",
+            "convergence_precision.png",
+        )
+        self._line_plot(
+            generations,
+            [x["representative"]["num_features"] for x in self.history],
+            "Train representative selected features",
+            "Number of features",
+            "convergence_num_features.png",
+        )
+        self._line_plot(
+            generations,
+            [x["best_ideal_distance"] for x in self.history],
+            "Distance to ideal objective point",
+            "Euclidean distance",
+            "convergence_ideal_distance.png",
+        )
         self._pareto_plot(archive)
         self._feature_frequency_plot(archive)
 
@@ -356,20 +395,26 @@ class CMDPSOFS:
 
     def _initialize(self):
         cfg = self.cfg
-        positions = self.rng.uniform(0.0, 1.0,
-                                     size=(cfg.population_size, cfg.dimensions)).astype(np.float32)
-        velocities = self.rng.uniform(-cfg.velocity_limit, cfg.velocity_limit,
-                                      size=(cfg.population_size, cfg.dimensions)).astype(np.float32)
+        positions = self.rng.uniform(
+            0.0, 1.0, size=(cfg.population_size, cfg.dimensions)
+        ).astype(np.float32)
+        velocities = self.rng.uniform(
+            -cfg.velocity_limit,
+            cfg.velocity_limit,
+            size=(cfg.population_size, cfg.dimensions),
+        ).astype(np.float32)
         self.particles = []
         for position, velocity in zip(positions, velocities):
             objectives = self._evaluate(position)
-            self.particles.append(Particle(
-                position=position.copy(),
-                velocity=velocity.copy(),
-                objectives=objectives.copy(),
-                pbest_position=position.copy(),
-                pbest_objectives=objectives.copy(),
-            ))
+            self.particles.append(
+                Particle(
+                    position=position.copy(),
+                    velocity=velocity.copy(),
+                    objectives=objectives.copy(),
+                    pbest_position=position.copy(),
+                    pbest_objectives=objectives.copy(),
+                )
+            )
         self.archive.update(
             np.vstack([p.position for p in self.particles]),
             np.vstack([p.objectives for p in self.particles]),
@@ -389,10 +434,10 @@ class CMDPSOFS:
         r = self.rng.random()
         if self.rng.random() < 0.5:
             distance = 1.0 - child[dim]
-            child[dim] += distance * (1.0 - r ** exponent)
+            child[dim] += distance * (1.0 - r**exponent)
         else:
             distance = child[dim]
-            child[dim] -= distance * (1.0 - r ** exponent)
+            child[dim] -= distance * (1.0 - r**exponent)
         return np.clip(child, 0.0, 1.0)
 
     def _mutate(self, position, particle_index, generation):
@@ -457,13 +502,15 @@ class CMDPSOFS:
         self.logger.save_plots(self.archive)
         return self.archive
 
+
 if __name__ == "__main__":
+    from ai.OptimalAlgorithsm.DataSystem.config import OUTPUT_JSONL as DATA_PATH
+
     # ============================================================
     # Change experiment parameters directly here.
     # ============================================================
-    DATA_PATH = "/home/tranmanhduy/Workspace/ptithcm/driver-guardian/ai/OptimalAlgorithsm/drowsiness_risk_10.jsonl"
 
-    OUTPUT_DIR = ("/home/tranmanhduy/Workspace/ptithcm/driver-guardian/ai/OptimalAlgorithsm/TrainingSystem/output/cmdpsofs")
+    OUTPUT_DIR = Path(__file__).resolve().parent / "output" / "cmdpsofs"
 
     # Must match a method implemented in Fitness.
     FITNESS_METHOD = "cooccurrence"

@@ -21,7 +21,10 @@ from ai.OptimalAlgorithsm.TrainingSystem.cmdpsofs import (
     crowding_distance,
     dominates,
 )
-from ai.OptimalAlgorithsm.TrainingSystem.fitnessFunction import FEATURES, validate_labels
+from ai.OptimalAlgorithsm.TrainingSystem.fitnessFunction import (
+    FEATURES,
+    validate_labels,
+)
 
 
 @dataclass
@@ -38,17 +41,28 @@ class NSPSOFSConfig:
     seed: int = 42
 
     def __post_init__(self):
-        if any(type(v) is not int for v in (self.population_size, self.generations, self.archive_size)):
-            raise ValueError("population_size, generations and archive_size must be integers")
+        if any(
+            type(v) is not int
+            for v in (self.population_size, self.generations, self.archive_size)
+        ):
+            raise ValueError(
+                "population_size, generations and archive_size must be integers"
+            )
         if self.population_size < 1 or self.generations < 1 or self.archive_size < 1:
-            raise ValueError("population_size, generations and archive_size must be positive")
+            raise ValueError(
+                "population_size, generations and archive_size must be positive"
+            )
         if type(self.dimensions) is not int or self.dimensions != 9:
-            raise ValueError("Fitness requires 8 weights and 1 classification threshold")
+            raise ValueError(
+                "Fitness requires 8 weights and 1 classification threshold"
+            )
         if not 0 < self.leader_fraction <= 1:
             raise ValueError("leader_fraction must be in (0, 1]")
         coefficients = (self.inertia, self.cognitive, self.social, self.velocity_limit)
         if not np.all(np.isfinite(coefficients)) or min(coefficients) < 0:
-            raise ValueError("PSO coefficients and velocity_limit must be finite and nonnegative")
+            raise ValueError(
+                "PSO coefficients and velocity_limit must be finite and nonnegative"
+            )
 
 
 class NSPSOFSLogger(RunLogger):
@@ -103,24 +117,27 @@ class NSPSOFS:
 
     def _initialize(self):
         cfg = self.cfg
-        positions = self.rng.random((cfg.population_size, cfg.dimensions)).astype(np.float32)
+        positions = self.rng.random((cfg.population_size, cfg.dimensions)).astype(
+            np.float32
+        )
         velocities = self.rng.uniform(
             -cfg.velocity_limit, cfg.velocity_limit, size=positions.shape
         ).astype(np.float32)
         self.particles = []
         for position, velocity in zip(positions, velocities):
             objectives = self._evaluate(position)
-            self.particles.append(Particle(
-                position, velocity, objectives, position.copy(), objectives.copy()
-            ))
+            self.particles.append(
+                Particle(
+                    position, velocity, objectives, position.copy(), objectives.copy()
+                )
+            )
         self._update_archive(self.particles)
 
     def _leaders(self):
         objectives = np.vstack([p.objectives for p in self.particles])
-        domination = (
-            np.all(objectives[:, None] <= objectives[None, :], axis=2)
-            & np.any(objectives[:, None] < objectives[None, :], axis=2)
-        )
+        domination = np.all(
+            objectives[:, None] <= objectives[None, :], axis=2
+        ) & np.any(objectives[:, None] < objectives[None, :], axis=2)
         front = np.flatnonzero(~domination.any(axis=0))
         # Randomize ties so equally crowded extremes all have a chance to lead.
         front = self.rng.permutation(front)
@@ -137,7 +154,9 @@ class NSPSOFS:
             + cfg.cognitive * r1 * (parent.pbest_position - parent.position)
             + cfg.social * r2 * (leader - parent.position)
         )
-        velocity = np.clip(velocity, -cfg.velocity_limit, cfg.velocity_limit).astype(np.float32)
+        velocity = np.clip(velocity, -cfg.velocity_limit, cfg.velocity_limit).astype(
+            np.float32
+        )
         position = np.clip(parent.position + velocity, 0.0, 1.0).astype(np.float32)
         objectives = self._evaluate(position)
         improved = dominates(objectives, parent.pbest_objectives)
@@ -146,7 +165,9 @@ class NSPSOFS:
             velocity=velocity,
             objectives=objectives,
             pbest_position=(position if improved else parent.pbest_position).copy(),
-            pbest_objectives=(objectives if improved else parent.pbest_objectives).copy(),
+            pbest_objectives=(
+                objectives if improved else parent.pbest_objectives
+            ).copy(),
         )
 
     def _step(self):
@@ -158,7 +179,7 @@ class NSPSOFS:
         candidates = self.particles + children
         self._update_archive(candidates)
         order = pareto_order(np.vstack([p.objectives for p in candidates]))
-        self.particles = [candidates[i] for i in order[:self.cfg.population_size]]
+        self.particles = [candidates[i] for i in order[: self.cfg.population_size]]
 
     def run(self):
         start = time.perf_counter()
@@ -168,7 +189,11 @@ class NSPSOFS:
                 self._step()
             self.logger.log_population(generation, self.particles)
             self.logger.log_generation(
-                generation, self.particles, self.archive, time.perf_counter() - start, self.evaluations
+                generation,
+                self.particles,
+                self.archive,
+                time.perf_counter() - start,
+                self.evaluations,
             )
             self.logger.print_progress(self.cfg.generations)
 
@@ -197,4 +222,6 @@ if __name__ == "__main__":
 
     from ai.OptimalAlgorithsm.TrainingSystem.engine import run_experiment
 
-    run_experiment(NSPSOFS, NSPSOFSLogger, CONFIG, DATA_PATH, OUTPUT_DIR, FITNESS_METHOD)
+    run_experiment(
+        NSPSOFS, NSPSOFSLogger, CONFIG, DATA_PATH, OUTPUT_DIR, FITNESS_METHOD
+    )

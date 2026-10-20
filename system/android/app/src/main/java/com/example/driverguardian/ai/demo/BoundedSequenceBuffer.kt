@@ -29,7 +29,6 @@ class BoundedSequenceBuffer(
     private val lock = Any()
     private val buffer = ArrayDeque<FloatArray>(maxSequenceLength)
     private var lastSampleTimestampMs: Long = -1L
-    private var totalFramesSampled: Long = 0L
 
     val currentSize: Int
         get() = synchronized(lock) { buffer.size }
@@ -59,7 +58,6 @@ class BoundedSequenceBuffer(
         }
 
         lastSampleTimestampMs = timestampMs
-        totalFramesSampled++
 
         // Evict oldest if bounded capacity reached
         if (buffer.size >= maxSequenceLength) {

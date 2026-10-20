@@ -2,6 +2,7 @@ package com.example.driverguardian.ai.monitoring
 
 import com.example.driverguardian.ai.monitoring.device.*
 import com.example.driverguardian.ai.monitoring.model.CameraRuntimeState
+import com.example.driverguardian.ai.monitoring.model.SensorRuntimeState
 import com.example.driverguardian.ai.monitoring.time.*
 import com.example.driverguardian.ai.physical.model.*
 import com.example.driverguardian.ai.physical.pipeline.PhysicalBranch
@@ -73,6 +74,17 @@ class DriverMonitoringCoordinatorTest {
         verifyRealtime(c, 1, 1_130_000_000L)
         assertNotNull(c.snapshot.value!!.physical)
         assertNull(c.snapshot.value!!.deviceMotion)
+    }
+
+    @Test fun unavailableOptionalSensorDoesNotBlockCameraOrSurfaceGlobalError() {
+        val c = DriverMonitoringCoordinator(FakePhysical(), cameraTimestampSource = CameraTimestampSource.REALTIME)
+        c.startSession(1)
+        c.reportSensorUnavailable("No usable device-orientation sensor")
+        verifyRealtime(c, 1)
+
+        assertNotNull(c.snapshot.value?.physical)
+        assertEquals(SensorRuntimeState.UNAVAILABLE, c.runtimeState.value.sensor)
+        assertNull(c.runtimeState.value.message)
     }
 
     @Test fun ignoresResultFromPreviousGeneration() {

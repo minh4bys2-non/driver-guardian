@@ -43,7 +43,9 @@ class DriverMonitoringCoordinator(
         _runtimeState.value = MonitoringRuntimeState(
             camera = CameraRuntimeState.STARTING,
             face = FaceRuntimeState.INITIALIZING,
-            sensor = SensorRuntimeState.CALIBRATING,
+            // Device motion is optional and is not part of the production camera pipeline.
+            // It transitions out of IDLE only if an optional source supplies samples.
+            sensor = SensorRuntimeState.IDLE,
         )
         updateTimebaseDiagnostics()
     }
@@ -70,7 +72,7 @@ class DriverMonitoringCoordinator(
     }
 
     @Synchronized fun reportSensorUnavailable(message: String) {
-        _runtimeState.value = _runtimeState.value.copy(sensor = SensorRuntimeState.UNAVAILABLE, message = message)
+        _runtimeState.value = _runtimeState.value.copy(sensor = SensorRuntimeState.UNAVAILABLE)
     }
 
     @Synchronized fun reportCameraTimestampSource(source: CameraTimestampSource) {

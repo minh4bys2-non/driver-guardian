@@ -17,20 +17,16 @@ fun MonitoringDebugPanel(presentation: MonitoringPresentation, modifier: Modifie
             verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                Text("Realtime multi-sensor", style = MaterialTheme.typography.titleMedium)
+                Text("Giám sát tài xế thời gian thực", style = MaterialTheme.typography.titleMedium)
                 TextButton(onClick = { expanded = !expanded }) { Text(if (expanded) "Thu gọn" else "Mở") }
             }
             Text("Camera: ${presentation.cameraStatus} • Face: ${presentation.faceStatus}")
-            Text("Sensor: ${presentation.sensorStatus}")
             if (expanded) {
                 HorizontalDivider()
                 Text("PHYSICAL / FACE", style = MaterialTheme.typography.labelLarge)
                 Text("EAR ${presentation.ear} • MAR ${presentation.mar}")
+                Text("PERCLOS: ${presentation.perclos}")
                 Text("HEAD POSE: ${presentation.headPose}")
-                Text("DEVICE / VEHICLE ORIENTATION", style = MaterialTheme.typography.labelLarge)
-                Text("Raw: ${presentation.rawDeviceOrientation}")
-                Text("Delta: ${presentation.deviceOrientation}")
-                Text("Sensor age: ${presentation.sampleAge}")
                 Text("Timebase: ${presentation.timebaseStatus}")
                 Text("Performance: ${presentation.performance}")
                 presentation.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }

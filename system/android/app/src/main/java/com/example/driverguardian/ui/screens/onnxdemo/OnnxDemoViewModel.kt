@@ -5,7 +5,6 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.driverguardian.ai.contract.demo.EndToEndDemoModelContract
 import com.example.driverguardian.ai.contract.drowsiness.*
-import com.example.driverguardian.ai.demo.BoundedSequenceBuffer
 import com.example.driverguardian.ai.demo.DemoOnnxOutput
 import com.example.driverguardian.ai.demo.EndToEndDemoInferenceRunner
 import com.example.driverguardian.ai.demo.EndToEndDemoPreprocessor
@@ -223,7 +222,5 @@ class OnnxDemoViewModel(application: Application) : AndroidViewModel(application
 
     companion object {
         const val DEMO_MODEL_ASSET = "models/driver_guardian_end2end_demo.onnx"
-        const val LEGACY_MODEL_ASSET = "models/drowsiness_model.onnx"
-        const val MODEL_ASSET = DEMO_MODEL_ASSET
     }
 }

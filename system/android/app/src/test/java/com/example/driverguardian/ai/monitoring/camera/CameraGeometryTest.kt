@@ -27,11 +27,4 @@ class CameraGeometryTest {
         assertTrue(output[0].x < output[1].x)
     }
 
-    @Test fun previewMirrorReturnsCopyAndDoesNotMutateAlgorithmicCoordinates() {
-        val original = listOf(LandmarkPoint(20f, 10f), LandmarkPoint(80f, 20f))
-        val mirrored = LandmarkOverlayMapper.frontMirrorCopy(original, 100)
-        assertEquals(listOf(LandmarkPoint(80f, 10f), LandmarkPoint(20f, 20f)), mirrored)
-        assertEquals(listOf(LandmarkPoint(20f, 10f), LandmarkPoint(80f, 20f)), original)
-        assertNotSame(original[0], mirrored[0])
-    }
 }

@@ -6,13 +6,10 @@ import java.util.Locale
 data class MonitoringPresentation(
     val cameraStatus: String,
     val faceStatus: String,
-    val sensorStatus: String,
     val ear: String,
     val mar: String,
+    val perclos: String,
     val headPose: String,
-    val rawDeviceOrientation: String,
-    val deviceOrientation: String,
-    val sampleAge: String,
     val timebaseStatus: String,
     val performance: String,
     val error: String?,
@@ -21,7 +18,6 @@ data class MonitoringPresentation(
     companion object {
         fun from(snapshot: MonitoringSnapshot?, state: MonitoringRuntimeState, diagnostics: MonitoringDiagnostics): MonitoringPresentation {
             val physical = snapshot?.physical
-            val motion = snapshot?.deviceMotion
             return MonitoringPresentation(
                 cameraStatus = when (state.camera) {
                     CameraRuntimeState.IDLE -> "Chưa khởi động"
@@ -38,26 +34,15 @@ data class MonitoringPresentation(
                     FaceRuntimeState.FACE_DETECTED -> "Đã nhận diện khuôn mặt"
                     FaceRuntimeState.ERROR -> "Lỗi Face Landmarker"
                 },
-                sensorStatus = when (state.sensor) {
-                    SensorRuntimeState.IDLE -> "Chưa khởi động"
-                    SensorRuntimeState.CALIBRATING -> "Đang hiệu chuẩn"
-                    SensorRuntimeState.AVAILABLE -> "Sẵn sàng"
-                    SensorRuntimeState.UNAVAILABLE -> "Không có cảm biến"
-                    SensorRuntimeState.ERROR -> "Lỗi cảm biến"
-                },
                 ear = number(physical?.ear, 3),
                 mar = number(physical?.mar, 3),
+                perclos = physical?.perclosPct?.let { "${number(it, 1)}%" } ?: "—",
                 headPose = triple(physical?.pitchDeg, physical?.yawDeg, physical?.rollDeg),
-                rawDeviceOrientation = triple(motion?.rawPitchDeg, motion?.rawYawDeg, motion?.rawRollDeg),
-                deviceOrientation = triple(motion?.deltaPitchDeg, motion?.deltaYawDeg, motion?.deltaRollDeg),
-                sampleAge = motion?.sampleAgeMs?.let { "${number(it, 1)} ms" } ?: "—",
                 timebaseStatus = "${diagnostics.timebaseRelation} / offset ${diagnostics.timebaseOffsetNs?.let { "$it ns" } ?: "—"}",
                 performance = listOfNotNull(
                     diagnostics.cameraFps?.let { "Camera ${number(it, 1)} FPS" },
                     diagnostics.inferenceMs?.let { "MediaPipe ${number(it, 1)} ms" },
                     diagnostics.physicalProcessingMs?.let { "Physical ${number(it, 1)} ms" },
-                    diagnostics.sensorHz?.let { "Sensor ${number(it, 1)} Hz" },
-                    diagnostics.sensorProcessingMs?.let { "Sensor ${number(it, 2)} ms" },
                 ).joinToString(" • ").ifBlank { "—" },
                 error = state.message,
             )

@@ -11,7 +11,6 @@ object FaceLandmarkerConfiguration {
     const val MODEL_SHA256 = "64184e229b263107bc2b804c6625db1341ff2bb731874b0bcc2fe6544e0bc9ff"
     const val NUM_FACES = 1
     val RUNNING_MODE: RunningMode = RunningMode.LIVE_STREAM
-    val runtimeDownloadUrl: String? = null
 }
 
 data class FaceLandmarkerFrameResult(
@@ -52,13 +51,6 @@ class MonotonicTaskTimestamp {
 class CloseOnce(private val action: () -> Unit) : Closeable {
     private val closed = AtomicBoolean(false)
     override fun close() { if (closed.compareAndSet(false, true)) action() }
-}
-
-class SingleFrameAdmission {
-    private val inFlight = AtomicBoolean(false)
-    fun isAvailable(): Boolean = !inFlight.get()
-    fun tryAcquire(): Boolean = inFlight.compareAndSet(false, true)
-    fun release() { inFlight.set(false) }
 }
 
 class DeferredResourceClose(private val closeAction: () -> Unit) {

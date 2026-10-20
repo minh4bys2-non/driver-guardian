@@ -9,7 +9,6 @@ class FaceLandmarkerConfigTest {
         assertEquals("face_landmarker.task", FaceLandmarkerConfiguration.MODEL_ASSET_PATH)
         assertEquals(RunningMode.LIVE_STREAM, FaceLandmarkerConfiguration.RUNNING_MODE)
         assertEquals(1, FaceLandmarkerConfiguration.NUM_FACES)
-        assertNull(FaceLandmarkerConfiguration.runtimeDownloadUrl)
     }
 
     @Test fun taskMillisecondsAreStrictlyIncreasingWithoutChangingCameraNanoseconds() {
@@ -19,14 +18,6 @@ class FaceLandmarkerConfigTest {
         assertEquals(1002L, clock.fromCameraNanoseconds(999_000_000L))
         clock.reset()
         assertEquals(500L, clock.fromCameraNanoseconds(500_000_000L))
-    }
-
-    @Test fun liveStreamAdmissionAllowsOnlyOneFrameUntilCallbackReleasesIt() {
-        val admission = SingleFrameAdmission()
-        assertTrue(admission.tryAcquire())
-        assertFalse(admission.tryAcquire())
-        admission.release()
-        assertTrue(admission.tryAcquire())
     }
 
     @Test fun nativeResourceCloseIsDeferredUntilInFlightCallbackFinishes() {

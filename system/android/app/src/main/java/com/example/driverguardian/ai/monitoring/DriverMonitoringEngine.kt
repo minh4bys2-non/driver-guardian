@@ -1,14 +1,10 @@
 package com.example.driverguardian.ai.monitoring
 
 import android.content.Context
-import android.hardware.display.DisplayManager
-import android.view.Display
 import androidx.camera.core.Preview
 import androidx.lifecycle.LifecycleOwner
 import com.example.driverguardian.ai.monitoring.camera.CameraXFrameSource
 import com.example.driverguardian.ai.monitoring.camera.MediaPipeFaceLandmarkerClient
-import com.example.driverguardian.ai.monitoring.device.AndroidDeviceOrientationSource
-import com.example.driverguardian.ai.monitoring.device.SafeDisplayRotationProvider
 import com.example.driverguardian.ai.monitoring.model.MonitoringDiagnostics
 import com.example.driverguardian.ai.monitoring.model.MonitoringRuntimeState
 import com.example.driverguardian.ai.monitoring.model.MonitoringSnapshot
@@ -29,11 +25,6 @@ interface MonitoringEngineControl : AutoCloseable {
 
 class DriverMonitoringEngine(private val context: Context) : MonitoringEngineControl {
     private val coordinator = DriverMonitoringCoordinator(cameraTimestampSource = CameraTimestampSource.UNKNOWN)
-    private val sensorSource = AndroidDeviceOrientationSource(context)
-    private val displayRotation = SafeDisplayRotationProvider {
-        (context.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager)
-            .getDisplay(Display.DEFAULT_DISPLAY)?.rotation
-    }
     private var cameraSource: CameraXFrameSource? = null
     private var lifecycleOwner: LifecycleOwner? = null
     private var surfaceProvider: Preview.SurfaceProvider? = null
@@ -49,11 +40,6 @@ class DriverMonitoringEngine(private val context: Context) : MonitoringEngineCon
         if (activeSessionId != null) stopSession()
         activeSessionId = sessionId
         coordinator.startSession(sessionId.toLong())
-        val sensorStarted = sensorSource.start(
-            displayRotationProvider = displayRotation::rotation,
-            callback = coordinator::onSensorOrientation,
-        )
-        if (!sensorStarted) coordinator.reportSensorUnavailable("No usable device-orientation sensor")
         coordinator.updateCameraPermission(permission == CameraPermissionState.GRANTED)
         bindCameraIfReady()
     }
@@ -87,10 +73,10 @@ class DriverMonitoringEngine(private val context: Context) : MonitoringEngineCon
                     onError = coordinator::reportCameraError,
                 )
                 cameraSource = CameraXFrameSource(
-                    context,
-                    face,
-                    coordinator::reportCameraError,
-                    coordinator::reportCameraTimestampSource,
+                    context = context,
+                    faceLandmarker = face,
+                    onError = coordinator::reportCameraError,
+                    onTimestampSource = coordinator::reportCameraTimestampSource,
                 )
             }
             cameraSource!!.start(owner, surface, sessionId.toLong())
@@ -102,7 +88,6 @@ class DriverMonitoringEngine(private val context: Context) : MonitoringEngineCon
     override fun stopSession() {
         if (activeSessionId == null) return
         cameraSource?.stop()
-        sensorSource.stop()
         coordinator.stopSession()
         activeSessionId = null
     }
@@ -111,6 +96,5 @@ class DriverMonitoringEngine(private val context: Context) : MonitoringEngineCon
         stopSession()
         cameraSource?.close()
         cameraSource = null
-        sensorSource.close()
     }
 }

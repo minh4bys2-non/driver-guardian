@@ -22,6 +22,7 @@ import com.example.driverguardian.ai.monitoring.CameraPermissionState
 import com.example.driverguardian.ai.monitoring.model.MonitoringDiagnostics
 import com.example.driverguardian.ai.monitoring.model.MonitoringRuntimeState
 import com.example.driverguardian.ui.mock.DrivingUiState
+import com.example.driverguardian.ui.components.KeepScreenOn
 import com.example.driverguardian.ui.mock.MockData
 import com.example.driverguardian.ui.monitoring.*
 import com.example.driverguardian.ui.session.*
@@ -39,6 +40,7 @@ fun ActiveDrivingScreen(
     onFinishTrip: () -> Unit,
     onTripCompleted: () -> Unit,
 ) {
+    KeepScreenOn()
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val snapshot by monitoringViewModel.snapshot.collectAsStateWithLifecycle()

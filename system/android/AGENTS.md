@@ -155,6 +155,8 @@ package:
       qua.
 - **Tuyệt đối không hardcode:** những config liên quan tới xử lý liên quan tới AI của từng nhánh,
   package thì tập trung config ở một file ở nhánh, package đó
+- **Không dùng lệnh cmd tùy tiện** chỉ dùng lệnh cmd khi cần thiết, không được dùng cmd để thêm và
+  sửa file code và cấu hình
 
 ---
 

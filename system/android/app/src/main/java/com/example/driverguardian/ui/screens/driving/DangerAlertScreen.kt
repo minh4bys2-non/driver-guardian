@@ -28,6 +28,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import com.example.driverguardian.ui.session.DrivingSessionUiState
 import com.example.driverguardian.ui.session.AcknowledgementState
+import com.example.driverguardian.ui.components.KeepScreenOn
 import com.example.driverguardian.ui.theme.DangerRed
 import kotlinx.coroutines.launch
 
@@ -38,6 +39,7 @@ fun DangerAlertScreen(
     onAcknowledge: () -> Unit,
     onDismiss: () -> Unit
 ) {
+    KeepScreenOn()
     val scope = rememberCoroutineScope()
     val persistedEvent = sessionState.lastEvent
     BackHandler {

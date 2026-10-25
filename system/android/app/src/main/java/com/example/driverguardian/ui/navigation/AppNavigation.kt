@@ -276,32 +276,10 @@ private fun AppNavHost(
         modifier = modifier
     ) {
         composable(Screen.Login.route) {
-            // Auto bottom-sheet flow on screen launch (try authorized accounts -> fallback all accounts)
-            androidx.compose.runtime.LaunchedEffect(Unit) {
-                if (authUiState is AuthUiState.Initial || authUiState is AuthUiState.Unauthenticated) {
-                    val result = googleAuthManager.getGoogleIdTokenFromBottomSheet()
-                    result.onSuccess { idToken ->
-                        authViewModel.loginWithGoogle(idToken)
-                    }.onFailure {
-                        // Dismissal or no accounts for bottom sheet is handled gracefully;
-                        // user clicks the persistent "Tiếp tục với Google" button.
-                    }
-                }
-            }
-
             LoginScreen(
                 state = authUiState,
                 onLoginWithGoogle = {
-                    coroutineScope.launch {
-                        val result = googleAuthManager.getGoogleIdTokenFromButton()
-                        result.onSuccess { idToken ->
-                            authViewModel.loginWithGoogle(idToken)
-                        }.onFailure { error ->
-                            val msg = error.localizedMessage ?: "Đăng nhập Google thất bại"
-                            authViewModel.clearError()
-                            snackbarHostState.showSnackbar(msg)
-                        }
-                    }
+                    authViewModel.bypassLogin()
                 },
                 onLogout = { authViewModel.logout() },
                 onRetry = { authViewModel.clearError() }

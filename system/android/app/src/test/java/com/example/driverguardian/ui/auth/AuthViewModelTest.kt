@@ -136,4 +136,15 @@ class AuthViewModelTest {
         viewModel.clearError()
         assertEquals(AuthUiState.Unauthenticated, viewModel.uiState.value)
     }
+
+    @Test
+    fun `bypassLogin sets Authenticated state with mock driver profile`() = runTest {
+        viewModel.bypassLogin()
+        advanceUntilIdle()
+
+        assertTrue(viewModel.uiState.value is AuthUiState.Authenticated)
+        val state = viewModel.uiState.value as AuthUiState.Authenticated
+        assertEquals("Tài xế Demo", state.user.driver?.fullName)
+        assertEquals("DRV001", state.user.driver?.driverCode)
+    }
 }

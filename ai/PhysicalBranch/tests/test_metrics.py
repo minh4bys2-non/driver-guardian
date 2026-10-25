@@ -492,6 +492,45 @@ class PipelineTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 normalize_metrics(invalid)
 
+    def test_face_tracker_tasks_api_methods_and_output_format(self):
+        from ai.PhysicalBranch.camera_metrics import FaceTracker
+        from unittest.mock import MagicMock, patch
+
+        mock_detector = MagicMock()
+        mock_landmark = MagicMock()
+        mock_landmark.x = 0.5
+        mock_landmark.y = 0.25
+        mock_result = MagicMock()
+        mock_result.face_landmarks = [[mock_landmark] * 478]
+        mock_detector.detect.return_value = mock_result
+
+        with patch("mediapipe.tasks.python.vision.FaceLandmarker.create_from_options", return_value=mock_detector), \
+             patch("mediapipe.Image"):
+            tracker = FaceTracker()
+            self.assertEqual(tracker._mode, "tasks")
+            frame = np.zeros((480, 640, 3), dtype=np.uint8)
+            landmarks = tracker.process(frame)
+            self.assertIsNotNone(landmarks)
+            self.assertEqual(landmarks.shape, (478, 2))
+            np.testing.assert_allclose(landmarks[0], [320.0, 120.0])
+
+            # Test no face detected
+            mock_result.face_landmarks = []
+            self.assertIsNone(tracker.process(frame))
+
+            # Test close
+            tracker.close()
+            mock_detector.close.assert_called_once()
+            self.assertIsNone(tracker.detector)
+
+    def test_face_tracker_missing_model_raises_filenotfound(self):
+        from ai.PhysicalBranch.camera_metrics import FaceTracker
+        from ai.PhysicalBranch.config import PhysicalConfig
+        cfg = PhysicalConfig(face_landmarker_model_path="non_existent_model.task")
+        with patch("os.path.isfile", return_value=False):
+            with self.assertRaises(FileNotFoundError):
+                FaceTracker(config=cfg)
+
 
 if __name__ == '__main__':
     unittest.main()

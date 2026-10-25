@@ -8,9 +8,12 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 import json
+import os
 from pathlib import Path
 import sys
 import time
+
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -226,14 +229,18 @@ def run(args=CAMERA_CONFIG):
             output = Path(args.output).expanduser().open("a", encoding="utf-8")
         buffer = NeuralBuffer(config)
         blink, nod = deque(), deque()
-        origin = time.monotonic()
+        origin = time.perf_counter()
+        last_timestamp = None
         next_prediction = config.window_sec
         result = None
         status = "WARMING UP"
         frames = 0
         while True:
             ok, frame = capture.read()
-            timestamp = time.monotonic() - origin
+            timestamp = time.perf_counter() - origin
+            if last_timestamp is not None and timestamp <= last_timestamp:
+                timestamp = last_timestamp + 1e-4
+            last_timestamp = timestamp
             if not ok:
                 raise RuntimeError("Không đọc được frame từ camera")
             frame = balance_brightness(frame, config.target_luma)

@@ -297,6 +297,33 @@ class DrivingSessionViewModelTest {
         assertEquals("Y", viewModel.uiState.value.lastEvent?.acknowledged)
     }
 
+    @Test
+    fun `setupBypassPreparation enables canContinue with fallback vehicle and model`() = runTest(dispatcher) {
+        val viewModel = DrivingSessionViewModel(FakeRepository(drivers = emptyList()))
+        advanceUntilIdle()
+        assertFalse(viewModel.uiState.value.canContinue)
+
+        viewModel.setupBypassPreparation()
+        assertEquals(LoadState.Success, viewModel.uiState.value.loadState)
+        assertEquals(1, viewModel.uiState.value.vehicles.size)
+        assertEquals("51A-99999", viewModel.uiState.value.vehicles.first().plateNumber)
+        assertNotNull(viewModel.uiState.value.activeModel)
+        assertTrue(viewModel.uiState.value.canContinue)
+    }
+
+    @Test
+    fun `startBypassSession activates session for real-time monitoring`() = runTest(dispatcher) {
+        val viewModel = DrivingSessionViewModel(FakeRepository(drivers = emptyList()))
+        advanceUntilIdle()
+
+        viewModel.startBypassSession()
+        val session = viewModel.uiState.value.activeSession
+        assertNotNull(session)
+        assertEquals(1001, session?.id)
+        assertEquals("ACTIVE", session?.status)
+        assertEquals(SessionSubmissionState.Success, viewModel.uiState.value.sessionSubmissionState)
+    }
+
     private suspend fun TestScope.readyViewModel(repository: FakeRepository): DrivingSessionViewModel {
         val viewModel = DrivingSessionViewModel(repository)
         advanceUntilIdle()

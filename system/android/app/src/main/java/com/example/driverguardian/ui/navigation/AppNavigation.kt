@@ -326,6 +326,11 @@ private fun AppNavHost(
             )
         }
         composable(Screen.Selection.route) {
+            androidx.compose.runtime.LaunchedEffect(Unit) {
+                if (sessionUiState.vehicles.isEmpty() || sessionUiState.activeModel == null) {
+                    sessionViewModel.setupBypassPreparation()
+                }
+            }
             SelectionScreen(
                 state = sessionUiState,
                 onSelectDriver = sessionViewModel::selectDriver,
@@ -334,7 +339,10 @@ private fun AppNavHost(
                 onEditVehicle = sessionViewModel::updateVehicle,
                 onRetry = sessionViewModel::refresh,
                 onCancel = { navController.safeNavigate(Screen.Home.route) },
-                onContinue = { navController.safeNavigate(Screen.PreTripCheck.route) }
+                onContinue = {
+                    sessionViewModel.startBypassSession()
+                    navController.safeNavigate(Screen.ActiveDriving.route)
+                }
             )
         }
         composable(Screen.PreTripCheck.route) {

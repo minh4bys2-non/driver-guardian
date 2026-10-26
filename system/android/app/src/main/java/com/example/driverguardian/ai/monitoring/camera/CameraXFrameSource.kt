@@ -2,6 +2,7 @@ package com.example.driverguardian.ai.monitoring.camera
 
 import android.content.Context
 import android.hardware.camera2.CameraCharacteristics
+import android.os.Process
 import android.os.SystemClock
 import androidx.camera.camera2.interop.Camera2CameraInfo
 import androidx.camera.camera2.interop.ExperimentalCamera2Interop
@@ -12,6 +13,8 @@ import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
+import com.example.driverguardian.ai.monitoring.MonitoringConfig
+import com.example.driverguardian.ai.monitoring.ThreadDebugLogger
 import com.example.driverguardian.ai.monitoring.time.CameraTimestampSource
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -51,6 +54,7 @@ class CameraXFrameSource(
 
     private var originNs: Long? = null
     private var lastTimestampSec: Double? = null
+    private var ingestedFramesCount: Long = 0L
 
     var timestampSource: CameraTimestampSource = CameraTimestampSource.UNKNOWN
         private set
@@ -62,6 +66,7 @@ class CameraXFrameSource(
 
     fun setBalanceBrightness(enabled: Boolean) {
         brightnessBalancer.enabled.set(enabled)
+        ThreadDebugLogger.logIngest("BalanceBrightness updated -> enabled=$enabled (targetLuma=${MonitoringConfig.TARGET_LUMA})")
     }
 
     @Synchronized fun start(lifecycleOwner: LifecycleOwner, surfaceProvider: Preview.SurfaceProvider, generation: Long) {
@@ -69,9 +74,13 @@ class CameraXFrameSource(
         val startToken = startGate.newStart()
         originNs = null
         lastTimestampSec = null
+        ingestedFramesCount = 0L
 
         val localExecutor = Executors.newSingleThreadExecutor { runnable ->
-            Thread(runnable, "CameraIngestThread")
+            Thread({
+                runCatching { Process.setThreadPriority(MonitoringConfig.THREAD_PRIORITY_1A_INGEST) }
+                runnable.run()
+            }, MonitoringConfig.THREAD_NAME_1A_INGEST)
         }
         executor = localExecutor
 
@@ -99,6 +108,10 @@ class CameraXFrameSource(
                     val camera = cameraProvider.bindToLifecycle(lifecycleOwner, selector, preview, imageAnalysis)
                     timestampSource = readTimestampSource(camera.cameraInfo)
                     onTimestampSource(timestampSource)
+                    ThreadDebugLogger.logIngest(
+                        "CameraX bound: target=${MonitoringConfig.TARGET_WIDTH}x${MonitoringConfig.TARGET_HEIGHT} " +
+                            "RGBA_8888, front=$isFrontCamera, timestampSource=$timestampSource, generation=$generation"
+                    )
                 } catch (error: Exception) {
                     if (startGate.isCurrent(startToken)) {
                         onError(generation, "CameraX initialization failed: ${error.message ?: error.javaClass.simpleName}")
@@ -139,14 +152,41 @@ class CameraXFrameSource(
             var timestampSec = (cameraTimestampNs - originNs!!) / 1_000_000_000.0
             val last = lastTimestampSec
             if (last != null && timestampSec <= last) {
-                timestampSec = last + 1e-4
+                timestampSec = last + MonitoringConfig.MONOTONIC_TIMESTAMP_MIN_STEP_SEC
             }
             lastTimestampSec = timestampSec
+            ingestedFramesCount++
 
             // Tiền xử lý cân bằng sáng tùy chọn trên Luồng 1A (Zero-Conversion khi trời đủ sáng)
             brightnessBalancer.processInPlaceIfDark(dstBuffer, width, height)
 
             val ingestLatencyMs = (SystemClock.elapsedRealtimeNanos() - receiptElapsedNs) / 1_000_000.0
+            if (ingestLatencyMs >= MonitoringConfig.INGEST_SLOW_WARN_THRESHOLD_MS) {
+                ThreadDebugLogger.warnIngest(
+                    String.format(
+                        java.util.Locale.US,
+                        "Slow ingest frame #%d: t=%.3fs, ingestLatencyMs=%.2fms (balanceBrightness=%s)",
+                        ingestedFramesCount,
+                        timestampSec,
+                        ingestLatencyMs,
+                        brightnessBalancer.enabled.get(),
+                    )
+                )
+            } else if (ingestedFramesCount == 1L || ingestedFramesCount % MonitoringConfig.LOG_INGEST_EVERY_N_FRAMES == 0L) {
+                ThreadDebugLogger.logIngest(
+                    String.format(
+                        java.util.Locale.US,
+                        "Frame #%d ingested: %dx%d rot=%d, t=%.3fs, ingestMs=%.2fms, balanceBrightness=%s",
+                        ingestedFramesCount,
+                        width,
+                        height,
+                        rotationDegrees,
+                        timestampSec,
+                        ingestLatencyMs,
+                        brightnessBalancer.enabled.get(),
+                    )
+                )
+            }
             val packet = RgbaFramePacket(
                 buffer = dstBuffer,
                 width = width,

@@ -6,6 +6,8 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
+import com.example.driverguardian.ai.monitoring.MonitoringConfig
+import com.example.driverguardian.ai.monitoring.ThreadDebugLogger
 import com.google.mediapipe.framework.image.BitmapImageBuilder
 import com.google.mediapipe.framework.image.ByteBufferImageBuilder
 import com.google.mediapipe.framework.image.MPImage
@@ -67,7 +69,7 @@ class MediaPipeFaceLandmarkerClient(
                 .setOutputFacialTransformationMatrixes(FaceLandmarkerConfiguration.OUTPUT_FACIAL_TRANSFORMATION_MATRIXES)
                 .build()
             initializedDetector = FaceLandmarker.createFromOptions(context, gpuOptions)
-            Log.i(TAG, "MediaPipe FaceLandmarker successfully initialized with Delegate.GPU (Adreno 610)")
+            ThreadDebugLogger.infoPhysical("MediaPipe FaceLandmarker initialized with Delegate.GPU (Adreno 610)")
         } catch (gpuException: Throwable) {
             Log.w(TAG, "MediaPipe GPU delegate initialization failed, falling back to Delegate.CPU", gpuException)
             chosenDelegate = Delegate.CPU
@@ -86,7 +88,7 @@ class MediaPipeFaceLandmarkerClient(
                 .setOutputFacialTransformationMatrixes(FaceLandmarkerConfiguration.OUTPUT_FACIAL_TRANSFORMATION_MATRIXES)
                 .build()
             initializedDetector = FaceLandmarker.createFromOptions(context, cpuOptions)
-            Log.i(TAG, "MediaPipe FaceLandmarker initialized with Delegate.CPU")
+            ThreadDebugLogger.infoPhysical("MediaPipe FaceLandmarker initialized with Delegate.CPU")
         }
 
         landmarker = initializedDetector!!
@@ -159,8 +161,7 @@ class MediaPipeFaceLandmarkerClient(
             val inferenceMs = (SystemClock.elapsedRealtimeNanos() - submittedNs) / 1_000_000.0
 
             if (firstResultLogged.compareAndSet(false, true)) {
-                Log.d(
-                    TAG,
+                ThreadDebugLogger.infoPhysical(
                     "First video face result timestampMs=$taskTimestampMs faces=${result.faceLandmarks().size} " +
                         "inferenceMs=$inferenceMs delegate=$activeDelegate"
                 )
@@ -194,6 +195,6 @@ class MediaPipeFaceLandmarkerClient(
     }
 
     private companion object {
-        const val TAG = "DGFaceLandmarker"
+        const val TAG = MonitoringConfig.TAG_THREAD_1B_PHYSICAL
     }
 }

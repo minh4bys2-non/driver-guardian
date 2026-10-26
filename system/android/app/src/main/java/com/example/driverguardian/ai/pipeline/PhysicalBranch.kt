@@ -2,9 +2,11 @@ package com.example.driverguardian.ai.pipeline
 
 import com.example.driverguardian.ai.physical.model.LandmarkPoint
 import com.example.driverguardian.ai.physical.model.PhysicalMetrics
+import com.example.driverguardian.ai.physical.temporal.PitchSamplesSnapshot
 
 /**
- * Public Physical Branch interface for processing facial landmark frames into driver physical metrics.
+ * Public Physical Branch interface (`UnifiedCameraMetrics` on Thread 1B) for processing facial landmark frames
+ * into driver physical metrics, maintaining event history deques and lazy FFT snapshots.
  */
 interface PhysicalBranch {
 
@@ -23,6 +25,26 @@ interface PhysicalBranch {
         imageHeight: Int,
         timestampSec: Double
     ): PhysicalMetrics
+
+    /**
+     * Captures an immutable snapshot of pitch samples for 1Hz Lazy FFT evaluation on Thread 2.
+     */
+    fun snapshotPitchSamplesForFft(): PitchSamplesSnapshot? = null
+
+    /**
+     * Captures an immutable snapshot of `(timestampSec, durationMs)` blink events within the current 60s window.
+     */
+    fun snapshotBlinkDurations(): List<Pair<Double, Double>> = emptyList()
+
+    /**
+     * Captures an immutable snapshot of `(timestampSec, durationMs)` nod events within the current 60s window.
+     */
+    fun snapshotNodDurations(): List<Pair<Double, Double>> = emptyList()
+
+    /**
+     * Updates the cached FFT dominant frequency and resolution produced by Thread 2.
+     */
+    fun updateCachedFftResult(frequencyHz: Double?, resolutionHz: Double?) = Unit
 
     /**
      * Resets all internal temporal states, sliding windows, calibration samples, and HMM buffers.

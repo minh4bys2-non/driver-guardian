@@ -1,6 +1,7 @@
 package com.example.driverguardian.ai.monitoring.camera
 
 import android.graphics.Bitmap
+import com.example.driverguardian.ai.monitoring.MonitoringConfig
 import com.example.driverguardian.ai.physical.model.LandmarkPoint
 import com.google.mediapipe.tasks.core.Delegate
 import com.google.mediapipe.tasks.vision.core.RunningMode
@@ -8,15 +9,15 @@ import java.io.Closeable
 import java.util.concurrent.atomic.AtomicBoolean
 
 object FaceLandmarkerConfiguration {
-    const val MODEL_ASSET_PATH = "face_landmarker.task"
-    const val MODEL_SHA256 = "64184e229b263107bc2b804c6625db1341ff2bb731874b0bcc2fe6544e0bc9ff"
-    const val NUM_FACES = 1
-    val RUNNING_MODE: RunningMode = RunningMode.VIDEO
-    const val MIN_FACE_DETECTION_CONFIDENCE = 0.6f
-    const val MIN_FACE_PRESENCE_CONFIDENCE = 0.6f
-    const val MIN_TRACKING_CONFIDENCE = 0.6f
-    const val OUTPUT_FACE_BLENDSHAPES = false
-    const val OUTPUT_FACIAL_TRANSFORMATION_MATRIXES = false
+    const val MODEL_ASSET_PATH = MonitoringConfig.FACE_LANDMARKER_MODEL_ASSET_PATH
+    const val MODEL_SHA256 = MonitoringConfig.FACE_LANDMARKER_MODEL_SHA256
+    const val NUM_FACES = MonitoringConfig.FACE_LANDMARKER_NUM_FACES
+    val RUNNING_MODE: RunningMode = RunningMode.valueOf(MonitoringConfig.FACE_LANDMARKER_RUNNING_MODE_NAME)
+    const val MIN_FACE_DETECTION_CONFIDENCE = MonitoringConfig.FACE_LANDMARKER_MIN_DETECTION_CONFIDENCE
+    const val MIN_FACE_PRESENCE_CONFIDENCE = MonitoringConfig.FACE_LANDMARKER_MIN_PRESENCE_CONFIDENCE
+    const val MIN_TRACKING_CONFIDENCE = MonitoringConfig.FACE_LANDMARKER_MIN_TRACKING_CONFIDENCE
+    const val OUTPUT_FACE_BLENDSHAPES = MonitoringConfig.FACE_LANDMARKER_OUTPUT_BLENDSHAPES
+    const val OUTPUT_FACIAL_TRANSFORMATION_MATRIXES = MonitoringConfig.FACE_LANDMARKER_OUTPUT_TRANSFORMATION_MATRIXES
 }
 
 data class FaceLandmarkerFrameResult(

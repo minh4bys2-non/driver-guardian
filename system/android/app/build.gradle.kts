@@ -75,6 +75,7 @@ dependencies {
     implementation("androidx.camera:camera-lifecycle:$cameraXVersion")
     implementation("androidx.camera:camera-view:$cameraXVersion")
     implementation("org.opencv:opencv:4.10.0")
+    implementation("com.github.wendykierp:JTransforms:3.1")
     implementation("com.google.mediapipe:tasks-vision:1.0.0")
     implementation("com.microsoft.onnxruntime:onnxruntime-android:1.30.0")
     implementation("com.squareup.retrofit2:retrofit:2.11.0")

@@ -6,13 +6,14 @@ import androidx.camera.core.ImageProxy
 import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionStrategy
+import com.example.driverguardian.ai.monitoring.MonitoringConfig
 import java.util.concurrent.Executor
 
 object CameraXHardwareConfig {
-    const val TARGET_WIDTH = 640
-    const val TARGET_HEIGHT = 480
-    const val CHANNELS_RGBA = 4
-    const val FRAME_BYTES_RGBA = TARGET_WIDTH * TARGET_HEIGHT * CHANNELS_RGBA // 1,228,800 bytes
+    const val TARGET_WIDTH = MonitoringConfig.TARGET_WIDTH
+    const val TARGET_HEIGHT = MonitoringConfig.TARGET_HEIGHT
+    const val CHANNELS_RGBA = MonitoringConfig.CHANNELS_RGBA
+    const val FRAME_BYTES_RGBA = MonitoringConfig.FRAME_BYTES_RGBA // 1,228,800 bytes
 
     fun buildImageAnalysis(
         ingestExecutor: Executor,

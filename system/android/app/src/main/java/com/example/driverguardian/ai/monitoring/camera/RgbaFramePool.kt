@@ -1,5 +1,6 @@
 package com.example.driverguardian.ai.monitoring.camera
 
+import com.example.driverguardian.ai.monitoring.MonitoringConfig
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
@@ -10,9 +11,9 @@ import java.util.concurrent.atomic.AtomicInteger
  * - Slot 2: Luồng 1B đang đọc để nạp vào GPU & cập nhật pipeline
  */
 class RgbaFramePool(
-    val width: Int = CameraXHardwareConfig.TARGET_WIDTH,
-    val height: Int = CameraXHardwareConfig.TARGET_HEIGHT,
-    private val poolSize: Int = 3
+    val width: Int = MonitoringConfig.TARGET_WIDTH,
+    val height: Int = MonitoringConfig.TARGET_HEIGHT,
+    private val poolSize: Int = MonitoringConfig.RGBA_FRAME_POOL_SIZE
 ) {
     val frameBytesSize: Int = width * height * CameraXHardwareConfig.CHANNELS_RGBA
     private val buffers: Array<ByteArray> = Array(poolSize) { ByteArray(frameBytesSize) }

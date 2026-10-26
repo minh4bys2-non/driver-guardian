@@ -1,23 +1,28 @@
 package com.example.driverguardian.ai.pipeline
 
+import com.example.driverguardian.ai.physical.PhysicalConfig
+
 /**
- * Configuration for the Physical Branch pipeline matching Python CameraMetrics defaults.
+ * Configuration for the Physical Branch pipeline (`ai.pipeline`) matching Python CameraMetrics defaults.
+ * All defaults reference [PhysicalConfig] so nothing is hardcoded in the processor.
  */
 data class PhysicalBranchConfig(
-    val fps: Int = 30,
-    val windowSec: Double = 60.0,
-    val calibrationFrames: Int = 30,
-    val angleLimits: DoubleArray = doubleArrayOf(20.0, 25.0, 20.0), // Pitch, Yaw, Roll limits
-    val nodPitchDeg: Double = 14.0,
-    val nodReleaseDeg: Double = 8.0,
-    val nodDirection: Int = 1,
-    val nodDurationMinMs: Double = 800.0,
-    val nodDurationMaxMs: Double = 3500.0,
-    val maxGapSec: Double = 0.25,
-    val eyeInitDurationSec: Double = 5.0,
-    val mouthInitDurationSec: Double = 5.0,
-    val learningRate: Double = 0.01,
-    val adaptInterval: Int = 300
+    val fps: Int = PhysicalConfig.DEFAULT_FPS,
+    val windowSec: Double = PhysicalConfig.DEFAULT_WINDOW_SEC,
+    val calibrationFrames: Int = PhysicalConfig.DEFAULT_CALIBRATION_FRAMES,
+    val angleLimits: DoubleArray = PhysicalConfig.DEFAULT_ANGLE_LIMITS_DEG.clone(), // Pitch, Yaw, Roll limits
+    val nodPitchDeg: Double = PhysicalConfig.DEFAULT_NOD_PITCH_DEG,
+    val nodReleaseDeg: Double = PhysicalConfig.DEFAULT_NOD_RELEASE_DEG,
+    val nodDirection: Int = PhysicalConfig.DEFAULT_NOD_DIRECTION,
+    val nodDurationMinMs: Double = PhysicalConfig.DEFAULT_NOD_DURATION_MIN_MS,
+    val nodDurationMaxMs: Double = PhysicalConfig.DEFAULT_NOD_DURATION_MAX_MS,
+    val maxGapSec: Double = PhysicalConfig.DEFAULT_MAX_GAP_SEC,
+    val eyeInitDurationSec: Double = PhysicalConfig.DEFAULT_INIT_DURATION_SEC,
+    val mouthInitDurationSec: Double = PhysicalConfig.DEFAULT_INIT_DURATION_SEC,
+    val learningRate: Double = PhysicalConfig.DEFAULT_HMM_LEARNING_RATE,
+    val adaptInterval: Int = PhysicalConfig.DEFAULT_HMM_ADAPT_INTERVAL,
+    val headMotionMinAmplitudeDeg: Double = PhysicalConfig.DEFAULT_HEAD_MOTION_MIN_AMPLITUDE_DEG,
+    val physicalConfig: PhysicalConfig = PhysicalConfig.DEFAULT
 ) {
     init {
         require(calibrationFrames >= 1) { "Calibration frames must be >= 1" }
@@ -28,6 +33,9 @@ data class PhysicalBranchConfig(
         }
         require(fps > 0 && windowSec > 0.0 && maxGapSec > 0.0) { "Invalid temporal parameters" }
         require(nodDurationMinMs in 0.0..<nodDurationMaxMs) { "Invalid nod duration bounds" }
+        require(headMotionMinAmplitudeDeg >= 0.0 && headMotionMinAmplitudeDeg.isFinite()) {
+            "Invalid headMotionMinAmplitudeDeg"
+        }
     }
 
     override fun equals(other: Any?): Boolean {
@@ -47,6 +55,7 @@ data class PhysicalBranchConfig(
         if (mouthInitDurationSec != other.mouthInitDurationSec) return false
         if (learningRate != other.learningRate) return false
         if (adaptInterval != other.adaptInterval) return false
+        if (headMotionMinAmplitudeDeg != other.headMotionMinAmplitudeDeg) return false
         return true
     }
 
@@ -65,6 +74,7 @@ data class PhysicalBranchConfig(
         result = 31 * result + mouthInitDurationSec.hashCode()
         result = 31 * result + learningRate.hashCode()
         result = 31 * result + adaptInterval
+        result = 31 * result + headMotionMinAmplitudeDeg.hashCode()
         return result
     }
 }

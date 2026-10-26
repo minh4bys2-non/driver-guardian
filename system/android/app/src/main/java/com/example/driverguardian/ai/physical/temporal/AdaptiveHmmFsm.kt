@@ -1,5 +1,6 @@
 package com.example.driverguardian.ai.physical.temporal
 
+import com.example.driverguardian.ai.physical.PhysicalConfig
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.roundToInt
@@ -21,38 +22,42 @@ data class AdaptiveHmmFsmResult(
     val eventDone: Boolean,
     val currentDurationMs: Double,
     val lastEventDurationMs: Double,
+    val lastValidDurationMs: Double? = null,
+    val eventCount: Int = 0,
     val ratePerMinute: Double,
     val prolonged: Boolean,
     val observedSeconds: Double
 )
 
 /**
- * Combined pipeline coordinating AdaptiveHmm, TemporalStateMachine, and WindowRatio.
- *
- * Implements the 5-second initial calibration window, P80 dynamic threshold for PERCLOS,
- * and online adaptation.
+ * Combined pipeline coordinating AdaptiveHmm, TemporalStateMachine, and O(1) WindowRatio.
  */
 class AdaptiveHmmFsm(
     val mode: String = "eye",
-    val fps: Int = 30,
-    initDurationSec: Double = 5.0,
-    windowSizeSec: Double = 60.0,
+    val fps: Int = PhysicalConfig.DEFAULT_FPS,
+    initDurationSec: Double = PhysicalConfig.DEFAULT_INIT_DURATION_SEC,
+    windowSizeSec: Double = PhysicalConfig.DEFAULT_WINDOW_SEC,
     minDurationMs: Double? = null,
     maxDurationMs: Double? = null,
-    val maxGapSec: Double = 0.25,
-    learningRate: Double = 0.01,
-    adaptInterval: Int = 300
+    val maxGapSec: Double = PhysicalConfig.DEFAULT_MAX_GAP_SEC,
+    learningRate: Double = PhysicalConfig.DEFAULT_HMM_LEARNING_RATE,
+    adaptInterval: Int = PhysicalConfig.DEFAULT_HMM_ADAPT_INTERVAL,
+    val config: PhysicalConfig = PhysicalConfig.DEFAULT
 ) {
     init {
         require(mode == "eye" || mode == "mouth" || mode == "pitch") { "Invalid mode: $mode" }
         require(fps > 0 && initDurationSec > 0.0) { "Invalid detector configuration" }
     }
 
-    val initFrames = max(4, (fps * initDurationSec).roundToInt())
+    val initFrames = max(config.minInitFrames, (fps * initDurationSec).roundToInt())
     val hmm = AdaptiveHmm(
+        nStates = config.hmmStates,
         positiveState = if (mode == "eye") "low" else "high",
         learningRate = learningRate,
-        adaptInterval = adaptInterval
+        adaptInterval = adaptInterval,
+        minVariance = config.hmmMinVariance,
+        emIterations = config.hmmEmIterations,
+        config = config
     )
     val fsm = TemporalStateMachine(
         mode = mode,
@@ -60,11 +65,13 @@ class AdaptiveHmmFsm(
         windowSizeSec = windowSizeSec,
         minDurationMs = minDurationMs,
         maxDurationMs = maxDurationMs,
-        maxGapSec = maxGapSec
+        maxGapSec = maxGapSec,
+        config = config
     )
     val ratio = WindowRatio(
         windowSec = windowSizeSec,
-        maxGapSec = maxGapSec
+        maxGapSec = maxGapSec,
+        config = config
     )
 
     private val samples = ArrayDeque<Double>(initFrames)
@@ -88,18 +95,21 @@ class AdaptiveHmmFsm(
     private fun initializeHMM() {
         val data = samples.toDoubleArray()
         val sorted = data.clone().apply { sort() }
-        val low = percentile(sorted, 5.0)
-        val high = percentile(sorted, 95.0)
+        val low = percentile(sorted, config.initLowPercentile)
+        val high = percentile(sorted, config.initHighPercentile)
         val separation = when (mode) {
-            "eye" -> 0.06
-            "mouth" -> 0.15
-            else -> 10.0
+            "eye" -> config.eyeSeparation
+            "mouth" -> config.mouthSeparation
+            else -> config.pitchSeparation
         }
-        val norm = percentile(sorted, if (mode == "eye") 80.0 else 20.0)
+        val norm = percentile(
+            sorted,
+            if (mode == "eye") config.eyeBaselinePercentile else config.otherBaselinePercentile
+        )
         this.normal = norm
 
         val distinct = if (mode == "eye") {
-            low < norm * 0.65
+            low < norm * config.eyeDistinctRatio
         } else {
             high > norm + separation
         }
@@ -107,15 +117,12 @@ class AdaptiveHmmFsm(
         if (high - low >= separation && distinct) {
             hmm.fitInitial(data)
         } else {
-            val event = if (mode == "eye") norm * 0.2 else norm + separation * 2.0
+            val event = if (mode == "eye") norm * config.eyeClosedRatio else norm + separation * config.eventSeparationMultiplier
             hmm.means = doubleArrayOf(norm, event)
-            val sigma = max(abs(norm - event) / 4.0, 0.01)
+            val sigma = max(abs(norm - event) / config.fallbackSigmaDivisor, config.fallbackMinSigma)
             hmm.vars = doubleArrayOf(sigma * sigma, sigma * sigma)
-            hmm.a = arrayOf(
-                doubleArrayOf(0.97, 0.03),
-                doubleArrayOf(0.1, 0.9)
-            )
-            hmm.pi = doubleArrayOf(0.99, 0.01)
+            hmm.a = Array(config.fallbackTransition.size) { r -> config.fallbackTransition[r].clone() }
+            hmm.pi = config.restingPrior.clone()
             hmm.initialized = true
         }
 
@@ -135,7 +142,7 @@ class AdaptiveHmmFsm(
             }
         }
 
-        val validValue = if (value != null && value.isFinite()) value else null
+        val validValue = if (value != null && value.isFinite() && (mode == "pitch" || value >= 0.0)) value else null
 
         var state: Int? = null
         var posterior: DoubleArray? = null
@@ -156,9 +163,9 @@ class AdaptiveHmmFsm(
                 state = pred.first
                 posterior = pred.second
 
-                if (mode == "eye" && normal != null && validValue >= normal!! * 0.75) {
+                if (mode == "eye" && normal != null && validValue >= normal!! * config.eyeOpenRatio) {
                     state = 0
-                    val safePost = doubleArrayOf(0.99, 0.01)
+                    val safePost = config.restingPrior.clone()
                     hmm.posterior = safePost
                     posterior = safePost
                 }
@@ -176,7 +183,7 @@ class AdaptiveHmmFsm(
         if (mode == "eye" && initialized && normal != null && eventReference != null) {
             val opened = normal!!
             val closed = eventReference!!
-            threshold = opened - 0.8 * (opened - closed)
+            threshold = opened - config.perclosClosedFraction * (opened - closed)
         }
 
         val active: Boolean? = if (mode == "eye") {
@@ -201,6 +208,8 @@ class AdaptiveHmmFsm(
             eventDone = fsmRes.eventDone,
             currentDurationMs = fsmRes.currentDurationMs,
             lastEventDurationMs = fsmRes.lastEventDurationMs,
+            lastValidDurationMs = fsmRes.lastValidDurationMs,
+            eventCount = fsmRes.eventCount,
             ratePerMinute = fsmRes.ratePerMinute,
             prolonged = fsmRes.prolonged,
             observedSeconds = validSec

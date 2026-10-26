@@ -1,0 +1,117 @@
+{
+  "fitness_method": "noisy_or",
+  "input_schema": {
+    "features": [
+      "blink_frequency",
+      "blink_duration",
+      "perclos",
+      "yawn_frequency",
+      "nod_duration",
+      "nod_frequency",
+      "dominant_head_motion_frequency",
+      "neuralnetwork_score"
+    ],
+    "feature_encoding": "physical_v1",
+    "normalization_id": "4c1c8e218c32090b8158ebda143dde01a45e9008ebc1d50f7299dd40e964d447",
+    "normalization_scales": {
+      "blink_frequency": 604.0,
+      "blink_duration": 2000,
+      "perclos": 1.0,
+      "yawn_frequency": 18.0,
+      "nod_duration": 3.5,
+      "nod_frequency": 78.0,
+      "dominant_head_motion_frequency": 15.0,
+      "neuralnetwork_score": 1.0
+    }
+  },
+  "selected_model": {
+    "model": "candidate",
+    "candidate": [
+      0.2923271358013153,
+      0.7226412892341614,
+      0.770183801651001,
+      0.44023099541664124,
+      0.0,
+      0.9959285855293274,
+      0.6730811595916748,
+      0.07252885401248932,
+      0.14543630182743073
+    ],
+    "num_features": 7,
+    "selected_features": [
+      "blink_frequency",
+      "blink_duration",
+      "perclos",
+      "yawn_frequency",
+      "nod_frequency",
+      "dominant_head_motion_frequency",
+      "neuralnetwork_score"
+    ]
+  },
+  "validation_metrics": {
+    "tp": 187,
+    "tn": 161,
+    "fp": 59,
+    "fn": 37,
+    "recall": 0.8348214285714286,
+    "precision": 0.7601626016260162,
+    "specificity": 0.7318181818181818,
+    "false_positive_rate": 0.2681818181818182,
+    "balanced_accuracy": 0.7833198051948052,
+    "f1": 0.7957446808510639,
+    "accuracy": 0.7837837837837838,
+    "predicted_positive": 246,
+    "constant_prediction": false
+  },
+  "validation_beats_constant_baseline": true,
+  "test_metrics": {
+    "tp": 194,
+    "tn": 126,
+    "fp": 114,
+    "fn": 34,
+    "recall": 0.8508771929824561,
+    "precision": 0.6298701298701299,
+    "specificity": 0.525,
+    "false_positive_rate": 0.475,
+    "balanced_accuracy": 0.6879385964912281,
+    "f1": 0.7238805970149254,
+    "accuracy": 0.6837606837606838,
+    "predicted_positive": 308,
+    "constant_prediction": false
+  },
+  "test_baselines": {
+    "constant_0": {
+      "tp": 0,
+      "tn": 240,
+      "fp": 0,
+      "fn": 228,
+      "recall": 0.0,
+      "precision": 0.0,
+      "specificity": 1.0,
+      "false_positive_rate": 0.0,
+      "balanced_accuracy": 0.5,
+      "f1": 0.0,
+      "accuracy": 0.5128205128205128,
+      "predicted_positive": 0,
+      "constant_prediction": true
+    },
+    "constant_1": {
+      "tp": 228,
+      "tn": 0,
+      "fp": 240,
+      "fn": 0,
+      "recall": 1.0,
+      "precision": 0.48717948717948717,
+      "specificity": 0.0,
+      "false_positive_rate": 1.0,
+      "balanced_accuracy": 0.5,
+      "f1": 0.6551724137931034,
+      "accuracy": 0.48717948717948717,
+      "predicted_positive": 468,
+      "constant_prediction": true
+    }
+  },
+  "evaluations": 9950,
+  "elapsed_seconds": 17.842738374999954,
+  "output_dir": "/home/tranmanhduy/Workspace/ptithcm/driver-guardian/ai/OptimalAlgorithsm/TrainingSystem/output/ibgwo4/ibgwo4_noisy_or"
+}

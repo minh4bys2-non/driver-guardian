@@ -97,7 +97,7 @@ def split_dataset(records, y, seed=42, group_by="subject"):
 def score_candidates(positions, fitness, y, method):
     results = []
     for candidate in positions:
-        mask = candidate[:8] >= 0.5
+        mask = candidate[:8] > 0
         if not mask.any():
             continue
         results.append(
@@ -182,7 +182,7 @@ def run_experiment(
             "n_samples_total": len(y),
             "split_manifest": "split.json",
             "input_schema": metadata["input_schema"],
-            "selection_rule": "validation balanced_accuracy, then f1, then fewer features; includes constant baselines",
+            "selection_rule": "validation balanced_accuracy, then f1; includes constant baselines",
         }
     )
     config_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")

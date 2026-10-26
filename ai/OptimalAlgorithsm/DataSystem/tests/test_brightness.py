@@ -92,4 +92,5 @@ def test_engine_passes_brightness_configuration_to_reader(tmp_path, monkeypatch,
     monkeypatch.setattr(engine, 'CameraMetrics', Mock())
     pipeline = engine.Engine(tmp_path, config=replace(DEFAULT_CONFIG, target_luma=target))
     assert list(pipeline.process_video('clip.mp4', 0)) == []
-    reader.assert_called_once_with(str(tmp_path / 'clip.mp4'), target_fps=30, target_luma=target)
+    reader.assert_called_once_with(str(tmp_path / 'clip.mp4'), target_fps=30, target_luma=target,
+                                   min_duration_sec=30)

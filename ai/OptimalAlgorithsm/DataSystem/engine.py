@@ -14,6 +14,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
+from tqdm import tqdm
 
 if __package__:
     from .loadvideo2handle import read_video
@@ -132,10 +133,10 @@ class Engine:
                 for v, minimum in zip(coverage, required)
             )
         ):
-            print(f"[skip] {source} [{start:g}, {start + window:g}): "
+            tqdm.write(f"[skip] {source} [{start:g}, {start + window:g}): "
                   f"ready eye/mouth/head={m['eye_ready']}/{m['mouth_ready']}/{m['head_calibrated']}, "
                   f"coverage eye/mouth/head={coverage}s (need {required}s), "
-                  f"perclos={m['perclos_pct']}", file=sys.stderr, flush=True)
+                  f"perclos={m['perclos_pct']}", file=sys.stderr)
             return None
 
         motion_window = windows.get("head_motion", self.window_sec)
@@ -152,10 +153,10 @@ class Engine:
             and observed >= motion_window - 1e-9
         )
         if not reliable_motion:
-            print(f"[skip] {source} [{start:g}, {start + window:g}): "
+            tqdm.write(f"[skip] {source} [{start:g}, {start + window:g}): "
                   f"FFT observed={observed}s (need {motion_window:g}s), "
                   f"frequency={frequency}Hz, resolution={resolution}Hz",
-                  file=sys.stderr, flush=True)
+                  file=sys.stderr)
             return None
 
         with torch.inference_mode():
@@ -201,17 +202,20 @@ class Engine:
         if type(label) is not int or label not in (0, 1):
             raise ValueError("label must be 0 (alert) or 1 (drowsy)")
         path = self.root / video_path
-        print(f"[video] {video_path}: starting face tracking; window={self.window_sec:g}s, "
-              f"stride={self.stride / self.fps:g}s", file=sys.stderr, flush=True)
+        tqdm.write(f"[video] {video_path}: starting face tracking; window={self.window_sec:g}s, "
+              f"stride={self.stride / self.fps:g}s", file=sys.stderr)
         camera = CameraMetrics(config=self.config)
         nn_frames = deque(maxlen=self.neural_count)
         blink_durations, nod_durations = deque(), deque()
         started = last_progress = time.monotonic()
         frame_count = emitted = skipped = resumed = 0
+        progress = tqdm(
+            read_video(str(path), target_fps=self.fps, target_luma=self.config.target_luma,
+                       min_duration_sec=self.window_sec),
+            desc=video_path, unit="frame", position=1, leave=False, dynamic_ncols=True,
+        )
         try:
-            for i, (frame, timestamp) in enumerate(
-                read_video(str(path), target_fps=self.fps, target_luma=self.config.target_luma)
-            ):
+            for i, (frame, timestamp) in enumerate(progress):
                 if (
                     not isinstance(frame, np.ndarray)
                     or frame.dtype != np.uint8
@@ -248,10 +252,8 @@ class Engine:
                 frame_count = count
                 now = time.monotonic()
                 if PROGRESS_INTERVAL_SEC > 0 and now - last_progress >= PROGRESS_INTERVAL_SEC:
-                    print(f"[progress] {video_path}: video={timestamp:.1f}s, frames={count}, "
-                          f"speed={count / max(now - started, 1e-6):.1f}fps, "
-                          f"samples={emitted}, skipped={skipped}, resumed={resumed}",
-                          file=sys.stderr, flush=True)
+                    progress.set_postfix(video=f"{timestamp:.1f}s", samples=emitted,
+                                         skipped=skipped, resumed=resumed)
                     last_progress = now
                 if count >= self.window and (count - self.window) % self.stride == 0:
                     start = (count - self.window) / self.fps
@@ -276,10 +278,11 @@ class Engine:
                     else:
                         skipped += 1
         finally:
+            progress.close()
             camera.close()
-            print(f"[video summary] {video_path}: frames={frame_count}, samples={emitted}, "
+            tqdm.write(f"[video summary] {video_path}: frames={frame_count}, samples={emitted}, "
                   f"skipped={skipped}, resumed={resumed}, elapsed={time.monotonic() - started:.1f}s",
-                  file=sys.stderr, flush=True)
+                  file=sys.stderr)
 
     def run(self, input_jsonl, output_jsonl, strict=False, resume=False):
         src, dst = Path(input_jsonl).resolve(), Path(output_jsonl).resolve()
@@ -350,14 +353,17 @@ class Engine:
         dst.parent.mkdir(parents=True, exist_ok=True)
         count = 0
         seen = set()
+        with src.open(encoding="utf-8") as manifest:
+            total = sum(bool(line.strip()) for line in manifest)
         with src.open(encoding="utf-8") as fin, dst.open(
             "a" if resume else "w", encoding="utf-8"
-        ) as fout:
+        ) as fout, tqdm(
+            ((n, line) for n, line in enumerate(fin, 1) if line.strip()),
+            total=total, desc="Dataset", unit="video", position=0, dynamic_ncols=True,
+        ) as progress:
             if needs_newline:
                 fout.write("\n")
-            for line_number, line in enumerate(fin, 1):
-                if not line.strip():
-                    continue
+            for line_number, line in progress:
                 try:
                     record = json.loads(line)
                     if not isinstance(record, dict):
@@ -408,13 +414,17 @@ class Engine:
                         if windows is not None:
                             windows.add(window)
                         count += 1
-                        print(f"[saved] {source}: [{sample.get('start_second')}, "
+                        progress.set_postfix(saved=count, refresh=False)
+                        tqdm.write(f"[saved] {source}: [{sample.get('start_second')}, "
                               f"{sample.get('end_second')}), total_new={count}",
-                              file=sys.stderr, flush=True)
+                              file=sys.stderr)
                 except (OSError, ValueError, KeyError, RuntimeError, cv2.error) as exc:
                     if strict:
                         raise
-                    print(f"[line {line_number}] {exc}", file=sys.stderr)
+                    tqdm.write(f"[line {line_number}] {exc}", file=sys.stderr)
+        if count == 0:
+            tqdm.write("[summary] No new samples saved. Check video duration, [skip] quality errors, "
+                       "and whether resume already contains all valid windows.", file=sys.stderr)
         return count
 
 

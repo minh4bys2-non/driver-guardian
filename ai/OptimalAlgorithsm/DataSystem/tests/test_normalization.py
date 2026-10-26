@@ -47,8 +47,8 @@ def test_accepts_numpy_numeric_scalars(normalizer):
 
 def test_default_scales_match_detector_units(normalizer):
     assert normalizer.scales == {
-        'blink_frequency': 602., 'blink_duration': 2000, 'perclos': 1.,
-        'yawn_frequency': 17., 'nod_duration': 3.5, 'nod_frequency': 77.,
+        'blink_frequency': 604., 'blink_duration': 2000, 'perclos': 1.,
+        'yawn_frequency': 18., 'nod_duration': 3.5, 'nod_frequency': 78.,
         'dominant_head_motion_frequency': 15., 'neuralnetwork_score': 1.,
     }
 

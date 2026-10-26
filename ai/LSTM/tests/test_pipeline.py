@@ -356,3 +356,50 @@ def test_config_json_roundtrip_and_independent_defaults(tmp_path):
     assert restored == cfg
     cfg.lr = 0.5
     assert load_config().lr == restored.lr
+
+
+def test_finetune_loads_all_weights_freezes_cnn_and_restarts_optimizer(tmp_path, fake_loaders, monkeypatch):
+    from ai.LSTM.src.finetune import finetune
+
+    cfg = tiny_config(tmp_path)
+    training.train(cfg)
+    source = Path(cfg.save_dir) / "best.pt"
+    pretrained = load_checkpoint(source)
+    real_epoch = training.run_epoch
+    checked = False
+
+    def run(model, loader, criterion, device, optimizer=None, *args, **kwargs):
+        nonlocal checked
+        if optimizer is not None and not checked:
+            for name, value in model.state_dict().items():
+                torch.testing.assert_close(value, pretrained["model"][name], rtol=0, atol=0)
+            assert not optimizer.state
+            assert optimizer.param_groups[0]["lr"] == pytest.approx(cfg.lr / 10)
+            assert kwargs["epoch"] == 1
+            model.train()
+            assert not model.backbone_neck.training
+            assert all(not p.requires_grad for p in model.backbone_neck.parameters())
+            checked = True
+        return real_epoch(model, loader, criterion, device, optimizer, *args, **kwargs)
+
+    monkeypatch.setattr(training, "run_epoch", run)
+    destination = tmp_path / "finetuned"
+    model, _ = finetune(source, "new_dataset", destination, batch_size=1, epochs=1,
+                        warmup_epochs=0, num_workers=0, amp=False)
+    assert checked
+    for name, value in model.backbone_neck.state_dict().items():
+        torch.testing.assert_close(value, pretrained["model"][f"backbone_neck.{name}"], rtol=0, atol=0)
+    assert any(not torch.equal(value, pretrained["model"][f"conv_gru.{name}"])
+               for name, value in model.conv_gru.state_dict().items())
+    last = load_checkpoint(destination / "last.pt")
+    assert last["config"]["dataset_dir"] == "new_dataset"
+    assert last["config"]["lr"] == pytest.approx(cfg.lr / 10)
+    assert last["epoch"] == 1
+    assert last["config"]["batch_size"] == 1
+    assert last["config"]["num_workers"] == 0
+    assert last["config"]["amp"] is False
+    assert last["model_config"]["freeze_backbone"] is True
+    source.unlink()
+    resumed = TrainConfig(**last["config"])
+    resumed.resume = str(destination / "last.pt")
+    training.train(resumed)

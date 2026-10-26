@@ -17,7 +17,6 @@ from ai.OptimalAlgorithsm.DataSystem.config import (
     BENCHMARK_RUNS, BENCHMARK_WARMUP, DEFAULT_CONFIG, LETTERBOX_COLOR, MODEL_IMAGE_SIZE,
 )
 
-
 class NeuralNetwork(nn.Module):
     def __init__(self, checkpoint_path=None, device=None, chunk_size=None, *,
                  config=DEFAULT_CONFIG, model: DrowsyClassifier | None = None):

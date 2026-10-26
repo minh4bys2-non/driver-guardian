@@ -181,6 +181,11 @@ def _train(cfg, saved, save_dir, writer):
     if saved:
         model = DrowsyClassifier(**saved["model_config"])
         model.load_state_dict(saved["model"], strict=True)
+    elif cfg.finetune_from:
+        pretrained = load_checkpoint(cfg.finetune_from)
+        model = DrowsyClassifier(**(pretrained["model_config"] | dict(freeze_backbone=True, freeze_bn=True)))
+        model.load_state_dict(pretrained["model"], strict=True)
+        logger.info("Finetuning weights from %s with a fresh optimizer/schedule", cfg.finetune_from)
     else:
         model = DrowsyClassifier(
             backbone_checkpoint=cfg.backbone_checkpoint, freeze_backbone=cfg.backbone_mode == "frozen",

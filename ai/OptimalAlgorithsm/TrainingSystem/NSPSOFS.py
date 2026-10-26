@@ -1,4 +1,4 @@
-"""NSPSOFS adapted to continuous weights and three minimization objectives.
+"""NSPSOFS adapted to continuous weights and two minimization objectives.
 
 Reference: Xue, Zhang and Browne, Particle Swarm Optimization for Feature
 Selection in Classification: A Multi-Objective Approach (Algorithm 1).
@@ -52,9 +52,9 @@ class NSPSOFSConfig:
             raise ValueError(
                 "population_size, generations and archive_size must be positive"
             )
-        if type(self.dimensions) is not int or self.dimensions != 9:
+        if type(self.dimensions) is not int or self.dimensions not in (9, 33):
             raise ValueError(
-                "Fitness requires 8 weights and 1 classification threshold"
+                "Fitness requires 9 parameters, or 33 for physical_quadratic"
             )
         if not 0 < self.leader_fraction <= 1:
             raise ValueError("leader_fraction must be in (0, 1]")
@@ -78,8 +78,8 @@ class NSPSOFSLogger(RunLogger):
             "fitness_method": fitness_method,
             "n_samples": n_samples,
             "features": FEATURES,
-            "feature_selection_threshold": 0.5,
-            "objectives": ["1 - recall", "1 - precision", "num_feature / 8"],
+            "feature_weighting": "continuous; zero weight contributes nothing",
+            "objectives": ["1 - recall", "1 - precision"],
             "config": asdict(config),
         }
         with open(self.output_dir / "config.json", "w", encoding="utf-8") as f:
@@ -90,8 +90,10 @@ class NSPSOFS:
     def __init__(self, fitness, y_true, method, config, logger):
         self.fitness = fitness
         self.y_true = validate_labels(y_true, len(fitness.X))
-        if method not in ("weighted_mean", "noisy_or", "cooccurrence"):
+        if method not in ("weighted_mean", "noisy_or", "cooccurrence", "physical_quadratic"):
             raise ValueError(f"Unknown fitness method: {method}")
+        if config.dimensions != (33 if method == "physical_quadratic" else 9):
+            raise ValueError("Candidate dimensions do not match fitness method")
         self.method = method
         self.cfg = config
         self.logger = logger
@@ -104,8 +106,8 @@ class NSPSOFS:
 
     def _evaluate(self, candidate):
         self.evaluations += 1
-        if not np.any(candidate[:8] >= 0.5):
-            return np.ones(3, dtype=np.float32)
+        if not np.any(candidate[:8] > 0):
+            return np.ones(2, dtype=np.float32)
         prediction = self.fitness.predict(candidate, method=self.method)
         return self.fitness.evaluate(candidate, prediction, self.y_true)
 
@@ -204,10 +206,11 @@ class NSPSOFS:
 
 if __name__ == "__main__":
     from ai.OptimalAlgorithsm.DataSystem.config import OUTPUT_JSONL as DATA_PATH
+    # cooccurrence, weighted_mean, noisy_or
 
     BASE_DIR = Path(__file__).resolve().parent
     OUTPUT_DIR = BASE_DIR / "output" / "nspsofs"
-    FITNESS_METHOD = "cooccurrence"
+    FITNESS_METHOD = "physical_quadratic"
     CONFIG = NSPSOFSConfig(
         population_size=50,
         generations=100,
@@ -218,6 +221,7 @@ if __name__ == "__main__":
         archive_size=100,
         leader_fraction=0.20,
         seed=42,
+        dimensions=33
     )
 
     from ai.OptimalAlgorithsm.TrainingSystem.engine import run_experiment

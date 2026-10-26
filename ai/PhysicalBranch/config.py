@@ -15,7 +15,7 @@ class PhysicalConfig:
 
     # Timeline, bộ lọc thời lượng và cửa sổ thống kê.
     fps: int = 30  # FPS quy ước của detector; DataSystem dùng làm FPS lấy mẫu video.
-    window_sec: float = 60  # Cửa sổ thống kê chung, giây; có thể ghi đè từng metric qua windows.
+    window_sec: float = 30  # Cửa sổ thống kê chung, giây; có thể ghi đè từng metric qua windows.
     max_gap_sec: float = 0.25  # Gap tối đa giữa hai quan sát, giây; vượt mức này ngắt sự kiện/chuỗi liên tục.
     blink_duration_ms: tuple = (100, 2000)  # (Tối thiểu, tối đa), ms; chỉ đếm nháy mắt hoàn tất trong khoảng này.
     yawn_duration_ms: tuple = (4000, 7500)  # (Tối thiểu, tối đa), ms; lọc sự kiện mở miệng được tính là ngáp.

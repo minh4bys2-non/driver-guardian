@@ -26,7 +26,7 @@ Hệ số chuẩn hóa được suy ra từ cấu hình thực tế của detect
 
 DataSystem đọc video và nhãn từ manifest JSONL, trích xuất **7 đặc trưng vật lý + 1 điểm CNN–ConvGRU**, sau đó ghi từng mẫu thành một dòng JSONL cho `TrainingSystem`.
 
-Một mẫu mặc định mô tả cửa sổ video 60 giây. Nhánh vật lý cập nhật ở 30 FPS; nhánh mạng dùng 50 ảnh ở 5 FPS trong **10 giây cuối** của cửa sổ. Các cửa sổ dịch 60 giây mỗi lần, không chồng lấn.
+Một mẫu mặc định mô tả cửa sổ video 30 giây. Nhánh vật lý cập nhật ở 30 FPS; nhánh mạng dùng 50 ảnh ở 5 FPS trong **10 giây cuối** của cửa sổ. Các cửa sổ dịch 30 giây mỗi lần, không chồng lấn.
 
 Mã không huấn luyện lại CNN/ConvGRU, không tự gán nhãn và không xác nhận người trong video thực sự buồn ngủ. Nhãn đầu ra được giữ nguyên từ manifest. Các đặc trưng đã chuẩn hóa là đầu vào cho bước tối ưu tiếp theo, không phải tất cả đều là xác suất.
 
@@ -58,7 +58,7 @@ flowchart TD
     D --> F[Nhánh mạng: lấy mỗi 6 frame]
     E --> G[FaceMesh và landmark]
     G --> H[EAR, MAR, góc đầu]
-    H --> I[Hiệu chuẩn, HMM, FSM, thống kê 60 giây]
+    H --> I[Hiệu chuẩn, HMM, FSM, thống kê 30 giây]
     F --> J[Letterbox 224 x 224]
     J --> K[Buffer 50 ảnh trong 10 giây cuối]
     I --> L{Đến lịch xuất và đủ chất lượng?}
@@ -128,8 +128,8 @@ Thời gian đích:  0.00   0.25   0.50   0.75
 | Tham số | Mặc định | Ý nghĩa |
 | --- | --- | --- |
 | `fps` | 30 | Timeline chung và tốc độ xử lý nhánh vật lý |
-| `window_sec` | 60 | Độ dài cửa sổ vật lý, 1.800 frame |
-| `stride_sec` | 60 | Khoảng dịch giữa hai cửa sổ, 1.800 frame |
+| `window_sec` | 30 | Độ dài cửa sổ vật lý, 900 frame |
+| `stride_sec` | 30 | Khoảng dịch giữa hai cửa sổ, 900 frame |
 | `neural_sec` | 10 | Độ dài đoạn đưa vào ConvGRU |
 | `neural_fps` | 5 | 5 ảnh/giây, cách nhau 0,2 giây |
 | `neural_size` | 224 | Kích thước letterbox trước khi lưu buffer mạng |
@@ -143,9 +143,9 @@ Với mặc định, cứ mỗi 6 frame của timeline 30 FPS sẽ giữ 1 frame
 
 ```text
 Cửa sổ vật lý         Frame mạng tương ứng
-[ 0, 60) giây         50.0, 50.2, ..., 59.8
-[60,120) giây        110.0, 110.2, ..., 119.8
-[120,180) giây       170.0, 170.2, ..., 179.8
+[ 0,30) giây         20.0, 20.2, ..., 29.8
+[30,60) giây         50.0, 50.2, ..., 59.8
+[60,90) giây         80.0, 80.2, ..., 89.8
 ```
 
 Đây là lịch xét xuất, không đảm bảo mỗi mốc đều có một dòng đầu ra. Video ngắn hơn một cửa sổ không tạo mẫu. Cửa sổ cuối chưa đầy bị bỏ.
@@ -167,7 +167,7 @@ Metadata `[start_second, end_second)` biểu diễn cửa sổ **frame**. Frame 
 
 FSM giữ sự kiện hoàn tất trong `(t - window_sec, t]`. Trên lưới đều, đó là các mốc sự kiện thuộc cửa sổ frame. Tỷ lệ như PERCLOS được tích phân từ các khoảng giữa hai lần quan sát đến `t`, nên biên thống kê liên tục sớm hơn biên metadata tối đa một bước frame, khoảng 33,3 ms ở 30 FPS. Không diễn giải đây là phép đo liên tục chính xác đến mili giây.
 
-Cửa sổ FFT được đặt đúng 60 giây theo cấu hình riêng. Tại mốc xuất đầu tiên, 1.800 ảnh chỉ trải dài 59,9667 giây nên chưa đủ chuỗi FFT; mẫu đầu tiên có thể bị loại.
+Cửa sổ FFT được đặt đúng 30 giây theo cấu hình riêng. Tại mốc xuất đầu tiên, 900 ảnh chỉ trải dài 29,9667 giây nên chưa đủ chuỗi FFT; mẫu đầu tiên có thể bị loại.
 
 ## 7. Nhánh vật lý
 
@@ -225,7 +225,7 @@ Gật đầu dùng hysteresis theo pitch: vào trạng thái gật khi vượt 1
 
 Tần số chuyển động đầu dùng chuỗi pitch liên tục đủ dài: nội suy theo timestamp, trừ trung bình, áp dụng cửa sổ Hann, tìm đỉnh phổ FFT khác DC. Nếu đã đủ cửa sổ liên tục và biên độ peak-to-peak không vượt 0,1°, trả `0 Hz` và giữ mẫu. Thiếu dữ liệu trả `None` và loại mẫu.
 
-Mất pitch hoặc khoảng thời gian gián đoạn lớn hơn 0,25 giây làm xóa chuỗi FFT. Sau đó phải tích lũy lại đủ 60 giây liên tục. Đây là điều kiện mạnh hơn yêu cầu coverage 80%.
+Mất pitch hoặc khoảng thời gian gián đoạn lớn hơn 0,25 giây làm xóa chuỗi FFT. Sau đó phải tích lũy lại đủ 30 giây liên tục. Đây là điều kiện mạnh hơn yêu cầu coverage 80%.
 
 ## 8. Điều kiện xuất một mẫu
 
@@ -243,9 +243,9 @@ flowchart TD
     F -->|Có| G[Chuẩn hóa và ghi mẫu]
 ```
 
-Coverage dùng cửa sổ thực của từng metric (`perclos`, `pom`, `over_angle`), kể cả override. Mặc định yêu cầu từng giá trị `eye_observed_sec`, `mouth_observed_sec`, `head_observed_sec` đạt ít nhất `60 * 0.8 = 48 giây`.
+Coverage dùng cửa sổ thực của từng metric (`perclos`, `pom`, `over_angle`), kể cả override. Mặc định yêu cầu từng giá trị `eye_observed_sec`, `mouth_observed_sec`, `head_observed_sec` đạt ít nhất `30 * 0.8 = 24 giây`.
 
-Trong điều kiện liên tục, HMM khởi tạo khoảng 10 giây, còn khoảng 50 giây quan sát mắt/miệng trong cửa sổ đầu. Tuy nhiên, `[0,60)` vẫn bị loại với cấu hình mặc định vì FFT chưa đủ 60 giây liên tục sau hiệu chuẩn đầu. Với stride mặc định 60 giây, `[60,120)` là cửa sổ tiếp theo có thể đạt điều kiện. Mất tín hiệu có thể làm đầu ra muộn hơn; đầu đứng yên nhưng đủ dữ liệu vẫn hợp lệ.
+Trong điều kiện liên tục, HMM khởi tạo khoảng 10 giây, còn khoảng 20 giây quan sát mắt/miệng trong cửa sổ đầu. Tuy nhiên, `[0,30)` vẫn bị loại với cấu hình mặc định vì FFT chưa đủ 30 giây liên tục sau hiệu chuẩn đầu. Với stride mặc định 30 giây, `[30,60)` là cửa sổ tiếp theo có thể đạt điều kiện. Mất tín hiệu có thể làm đầu ra muộn hơn; đầu đứng yên nhưng đủ dữ liệu vẫn hợp lệ.
 
 `min_observed_ratio=0` chỉ bỏ ngưỡng coverage. Các điều kiện khởi tạo và PERCLOS vẫn áp dụng; FFT phải có tần số hữu hạn không âm, độ phân giải dương và đủ cửa sổ quan sát liên tục. Thiếu dữ liệu FFT làm loại mẫu.
 
@@ -312,8 +312,8 @@ from ai.OptimalAlgorithsm.DataSystem.engine import Engine
 engine = Engine(
     video_root="ai/OptimalAlgorithsm/UTA-RLDD",
     fps=30,
-    window_sec=60,
-    stride_sec=60,
+    window_sec=30,
+    stride_sec=30,
     neural_sec=10,
     neural_fps=5,
     neural_size=224,
@@ -404,15 +404,15 @@ Không dùng các điểm cũ để suy ngược số đo vì phép bão hòa/đ
 ## 13. Những điểm cần giữ khi tạo bộ dữ liệu huấn luyện
 
 1. **Tạo lại dữ liệu theo `physical_v1`.** Không trộn các phiên bản cũ với dữ liệu mới. Phiên cập nhật không ghi đè dataset hiện có.
-2. **Tách tập theo người/video trước khi đánh giá.** Dữ liệu cũ dùng cửa sổ 60 giây dịch 10 giây, chồng lấn 50 giây; cấu hình mới dùng stride 60 giây. Chia ngẫu nhiên theo dòng có thể đưa gần như cùng nội dung vào train và test. Với UTA-RLDD nên giữ toàn bộ video cùng subject trong cùng nhóm; DataSystem chưa tự chia tập.
-3. **Theo dõi tỷ lệ cửa sổ bị loại.** Điều kiện FFT đủ 60 giây liên tục có thể loại nhiều video khó. Cần báo cáo số mẫu theo lớp/subject và coverage để nhận biết thiên lệch do chất lượng theo dõi.
+2. **Tách tập theo người/video trước khi đánh giá.** Dữ liệu cũ dùng cửa sổ 60 giây dịch 10 giây, chồng lấn 50 giây; cấu hình mới dùng cửa sổ và stride 30 giây. Chia ngẫu nhiên theo dòng có thể đưa gần như cùng nội dung vào train và test. Với UTA-RLDD nên giữ toàn bộ video cùng subject trong cùng nhóm; DataSystem chưa tự chia tập.
+3. **Theo dõi tỷ lệ cửa sổ bị loại.** Điều kiện FFT đủ 30 giây liên tục có thể loại nhiều video khó. Cần báo cáo số mẫu theo lớp/subject và coverage để nhận biết thiên lệch do chất lượng theo dõi.
 4. **Kiểm chứng calibration trên video thực tế.** Tư thế ban đầu, mắt đã nhắm, kính, che khuất, góc quay và ảnh lặp do FPS thấp có thể làm thay đổi phép đo.
 5. **Không đồng nhất chạy đúng với dự đoán đúng.** Muốn kết luận độ chính xác cần tập kiểm thử độc lập, nhãn phù hợp cho từng cửa sổ và đối chiếu sự kiện với annotation. Bộ kiểm thử phần mềm không cung cấp accuracy/precision/recall hành vi.
 6. **Lưu provenance.** Ghi phiên bản mã, đường dẫn/hash checkpoint, tham số Engine, manifest và log tạo dữ liệu. Kiểm tra checkpoint có từng được huấn luyện trên các subject dùng để đánh giá hay không.
 
 ## 14. Sơ đồ Mermaid chi tiết: video → JSONL
 
-Các sơ đồ dưới đây mô tả cấu hình mặc định `physical_v1`: nhánh vật lý 30 FPS, cửa sổ 60 giây, stride 60 giây; mạng nhận 50 ảnh ở 5 FPS trong 10 giây cuối. Hai nhánh dùng cùng timeline; mã cập nhật tuần tự theo frame, không chạy hai worker song song.
+Các sơ đồ dưới đây mô tả cấu hình mặc định `physical_v1`: nhánh vật lý 30 FPS, cửa sổ 30 giây, stride 30 giây; mạng nhận 50 ảnh ở 5 FPS trong 10 giây cuối. Hai nhánh dùng cùng timeline; mã cập nhật tuần tự theo frame, không chạy hai worker song song.
 
 ### 14.1. Điều phối manifest và vòng đời từng video
 
@@ -451,21 +451,21 @@ flowchart TD
     FRAME --> BGR["Đổi RGB → BGR cho CameraMetrics"]
     BGR --> FACE["FaceMesh: landmark khuôn mặt<br/>Tính EAR, MAR và pitch/yaw/roll"]
     FACE --> EYE["Mắt và miệng: khởi tạo mô hình, HMM và FSM<br/>Đếm sự kiện nháy mắt, ngáp<br/>Tích lũy PERCLOS và thời gian quan sát"]
-    EYE --> HEAD["Đầu: hiệu chuẩn baseline và pitch tương đối<br/>Hysteresis + FSM phát hiện gật<br/>Tích lũy pitch liên tục cho FFT 60 giây"]
+    EYE --> HEAD["Đầu: hiệu chuẩn baseline và pitch tương đối<br/>Hysteresis + FSM phát hiện gật<br/>Tích lũy pitch liên tục cho FFT 30 giây"]
     HEAD --> SAMPLE{"Chỉ số frame chia hết cho 6?"}
     SAMPLE -->|Có| BUFFER["Letterbox RGB thành 224 × 224<br/>Thêm vào deque tối đa 50 ảnh<br/>Tốc độ lưu ảnh mạng: 5 FPS"]
     SAMPLE -->|Không| HISTORY
-    BUFFER --> HISTORY["Lưu thời lượng blink/nod hợp lệ vừa kết thúc<br/>Loại sự kiện kết thúc ngoài cửa sổ 60 giây"]
-    HISTORY --> DUE{"Đủ 1.800 frame và đến stride 1.800 frame?"}
+    BUFFER --> HISTORY["Lưu thời lượng blink/nod hợp lệ vừa kết thúc<br/>Loại sự kiện kết thúc ngoài cửa sổ 30 giây"]
+    HISTORY --> DUE{"Đủ 900 frame và đến stride 900 frame?"}
     DUE -->|Không| NEXT["Đọc frame tiếp theo"]
     NEXT --> READ
     DUE -->|Có| SAVED{"Resume và cửa sổ đã có trong JSONL?"}
     SAVED -->|Có| NEXT
     SAVED -->|Không| READY{"Mắt, miệng đã sẵn sàng<br/>và đầu đã hiệu chuẩn?"}
     READY -->|Không| SKIP["Bỏ cửa sổ, tiếp tục giữ và cập nhật trạng thái"]
-    READY -->|Có| COVER{"Có PERCLOS và mỗi nhóm mắt, miệng, đầu<br/>quan sát được ít nhất 48 giây?"}
+    READY -->|Có| COVER{"Có PERCLOS và mỗi nhóm mắt, miệng, đầu<br/>quan sát được ít nhất 24 giây?"}
     COVER -->|Không| SKIP
-    COVER -->|Có| FFT{"FFT tin cậy theo cấu hình?<br/>Pitch liên tục đủ 60 giây<br/>Tần số hữu hạn không âm, độ phân giải dương"}
+    COVER -->|Có| FFT{"FFT tin cậy theo cấu hình?<br/>Pitch liên tục đủ 30 giây<br/>Tần số hữu hạn không âm, độ phân giải dương"}
     FFT -->|Không| SKIP
     SKIP --> NEXT
     FFT -->|Có| NEURAL["Suy luận 50 ảnh của 10 giây cuối<br/>Theo sơ đồ 14.3"]
@@ -474,13 +474,13 @@ flowchart TD
     YIELD --> NEXT
 ```
 
-Tại cửa sổ frame `[0,60)`, timestamp cuối là khoảng 59,9667 giây nên chưa đủ chuỗi FFT dài 60 giây. Một cửa sổ bị loại không làm reset cả video. Riêng mất pitch hoặc gián đoạn trên 0,25 giây làm xóa chuỗi FFT, cần tích lũy lại. FFT không tin cậy làm loại mẫu; không thay giá trị thiếu bằng 0.
+Tại cửa sổ frame `[0,30)`, timestamp cuối là khoảng 29,9667 giây nên chưa đủ chuỗi FFT dài 30 giây. Một cửa sổ bị loại không làm reset cả video. Riêng mất pitch hoặc gián đoạn trên 0,25 giây làm xóa chuỗi FFT, cần tích lũy lại. FFT không tin cậy làm loại mẫu; không thay giá trị thiếu bằng 0.
 
 ### 14.3. Nhánh CNN–ConvGRU: chỉ dùng 10 giây cuối
 
 ```mermaid
 flowchart LR
-    INPUT["50 ảnh RGB uint8<br/>Ví dụ cửa sổ 60–120 giây:<br/>ảnh tại 110,0; 110,2; ...; 119,8"]
+    INPUT["50 ảnh RGB uint8<br/>Ví dụ cửa sổ 30–60 giây:<br/>ảnh tại 50,0; 50,2; ...; 59,8"]
     INPUT --> STACK["Stack thành T × 3 × 224 × 224<br/>T = 50"]
     STACK --> CHUNK["DrowsyClassifier chia chunk tối đa 8 ảnh<br/>Chuyển sang device, float32<br/>Chia 255 để pixel về 0–1"]
     CHUNK --> CNN["CNN backbone → neck<br/>Trích xuất đặc trưng P4"]
@@ -501,7 +501,7 @@ flowchart TD
     BOUNDS --> SCALE["z = x / U; tám đặc trưng trong 0–1"]
     VALID --> SCALE
     SCALE --> SAVE["Lưu physical_v1, raw_features, scales, mã cấu hình và nhãn"]
-    SAVE --> JSONL["drowsiness_physical_60.jsonl"]
+    SAVE --> JSONL["drowsiness_physical_30.jsonl"]
 ```
 
 Tần suất dùng cửa sổ của từng FSM. Không có sự kiện hợp lệ thì thời lượng bằng 0.
@@ -530,15 +530,17 @@ Các kiểm thử bao phủ stride, resume khác phiên bản/cấu hình, dữ 
 nhãn mâu thuẫn và coverage không hữu hạn. Chạy các lệnh ở mục 12 để kiểm tra
 phiên bản hiện tại.
 
-Output mặc định là `drowsiness_physical_60.jsonl`. Chọn file này khi chạy
+Output mặc định là `drowsiness_physical_30.jsonl`. Chọn file này khi chạy
 TrainingSystem sau khi tạo dữ liệu mới. Các phép gộp hiện tại dùng trọng số dương:
 chúng chưa học được quan hệ không đơn điệu từ đặc trưng trung lập.
 Xem phần giới hạn trong [NORMALIZATION.md](NORMALIZATION.md).
 
 ### Chẩn đoán cửa sổ bị loại
 
-`[skip]` in riêng lỗi readiness/coverage hoặc FFT. Với mặc định, `[0,60)`
-không đủ 60 giây pitch sau hiệu chuẩn; mất một pose làm chuỗi FFT bắt đầu lại.
+Khi chạy engine, thanh `Dataset` hiển thị tiến độ theo số dòng manifest không rỗng, ETA và tổng mẫu đã lưu. Dòng tiến trình video hiển thị số frame, tốc độ xử lý; các số mẫu hợp lệ/bị loại/đã có khi resume cập nhật theo `PROGRESS_INTERVAL_SEC`. Log được in qua `tqdm.write` để không chen vào thanh tiến trình.
+
+`[skip]` in riêng lỗi readiness/coverage hoặc FFT. Với mặc định, `[0,30)`
+không đủ 30 giây pitch sau hiệu chuẩn; mất một pose làm chuỗi FFT bắt đầu lại.
 `min_observed_ratio` không hạ yêu cầu FFT. Có thể cấu hình
 `windows={"head_motion": 20}` nếu chấp nhận độ phân giải khoảng 0,05 Hz
 thay vì 0,0167 Hz. Đây là thay đổi định nghĩa đặc trưng, cần trích xuất dataset
@@ -589,3 +591,7 @@ NO_ALBUMENTATIONS_UPDATE=1 python -m pytest ai/OptimalAlgorithsm/DataSystem/test
 
 Checkpoint trong test được tạo tạm thời; các test này không xác minh chất lượng
 checkpoint triển khai hoặc độ chính xác nhận diện trên video có nhãn thực tế.
+
+Khi chuyển từ cửa sổ 60 sang 30 giây, cần trích xuất lại dataset vào
+`drowsiness_physical_30.jsonl` và huấn luyện lại trọng số fusion. Không đổi tên
+dataset cũ để tái sử dụng: số đo và mã cấu hình chuẩn hóa đã thay đổi.

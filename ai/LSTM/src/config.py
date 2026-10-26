@@ -5,9 +5,9 @@ from pathlib import Path
 
 @dataclass
 class TrainConfig:
-    dataset_dir: str = "/home/tranmanhduy/Workspace/dataE/DataLSTM"
+    dataset_dir: str = "/home/tranmanhduy/Workspace/dataE/DataLSTM_v2"
     # dataset_dir: str = "/home/tranmanhduy/Workspace/dataE/UL-DD_Processed"
-    save_dir: str = "ai/LSTM/checkpoints/head_landmarkv1"
+    save_dir: str = "ai/LSTM/checkpoints/head_landmarkv2"
     backbone_mode: str = "frozen"  # scratch | frozen
     backbone_checkpoint: str | None = str(
         Path(__file__).resolve().parents[2] / "ObjectDetection_2p6M/checkpoints"
@@ -27,7 +27,7 @@ class TrainConfig:
     window_sec: float = 10
     target_fps: float = 5
     use_augmentation: bool = True
-    batch_size: int = 1
+    batch_size: int = 2
     num_workers: int = 2
     epochs: int = 100
     lr: float = 3e-4
@@ -40,6 +40,7 @@ class TrainConfig:
     device: str = "auto"
     amp: bool = True
     resume: str | None = None  # Path to last.pt; keep the original epoch budget.
+    finetune_from: str | None = None  # Full classifier weights; start a new optimizer/schedule.
 
     def __post_init__(self):
         self.backbone_w, self.backbone_n = tuple(self.backbone_w), tuple(self.backbone_n)
@@ -52,7 +53,9 @@ class TrainConfig:
                 raise ValueError(f"{name} must be a nonnegative integer")
         if self.backbone_mode not in ("scratch", "frozen"):
             raise ValueError("backbone_mode must be scratch or frozen")
-        if self.backbone_mode == "frozen" and not self.backbone_checkpoint:
+        if self.finetune_from and self.backbone_mode != "frozen":
+            raise ValueError("finetune_from requires frozen backbone_mode")
+        if self.backbone_mode == "frozen" and not (self.backbone_checkpoint or self.finetune_from):
             raise ValueError("frozen mode requires backbone_checkpoint")
         if self.backbone_mode == "scratch" and self.backbone_checkpoint:
             raise ValueError("scratch mode must not load backbone_checkpoint")
@@ -71,9 +74,7 @@ class TrainConfig:
     def to_dict(self):
         return asdict(self)
 
-
 DEFAULT_CONFIG = TrainConfig()
-
 
 def load_config(path=None):
     if path is None:

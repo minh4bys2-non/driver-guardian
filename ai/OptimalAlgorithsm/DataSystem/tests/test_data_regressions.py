@@ -25,9 +25,9 @@ class DataRegressionTests(unittest.TestCase):
     @staticmethod
     def metrics():
         return dict(eye_ready=True, mouth_ready=True, head_calibrated=True,
-                    eye_observed_sec=60, mouth_observed_sec=60, head_observed_sec=60,
-                    head_motion_resolution_hz=1 / 60, head_motion_frequency_hz=0.,
-                    head_motion_observed_sec=60, perclos_pct=0., blink_rate_per_min=0.,
+                    eye_observed_sec=30, mouth_observed_sec=30, head_observed_sec=30,
+                    head_motion_resolution_hz=1 / 30, head_motion_frequency_hz=0.,
+                    head_motion_observed_sec=30, perclos_pct=0., blink_rate_per_min=0.,
                     yawning_frequency_per_min=0., nodding_frequency_per_min=0.,
                     blink_detected=False, nod_detected=False)
 
@@ -50,16 +50,16 @@ class DataRegressionTests(unittest.TestCase):
 
     def test_full_fft_policy_explains_first_window_and_loss_skips(self):
         model = self.make_engine(fps=10)
-        motion = HeadMotionWindow(60)
+        motion = HeadMotionWindow(30)
         def process(frame, timestamp):
-            # Head calibration takes one second; a single lost pose at 125s resets FFT.
-            pitch = None if timestamp < 1 or timestamp == 125 else 0.
+            # Head calibration takes one second; a single lost pose at 65s resets FFT.
+            pitch = None if timestamp < 1 or timestamp == 65 else 0.
             return self.metrics() | motion.process(pitch, timestamp)
-        frames = ((np.zeros((3, 4, 8), np.uint8), i / 10) for i in range(2400))
+        frames = ((np.zeros((3, 4, 8), np.uint8), i / 10) for i in range(1200))
         with patch.object(engine, 'CameraMetrics') as camera, patch.object(engine, 'read_video', return_value=frames), contextlib.redirect_stderr(io.StringIO()):
             camera.return_value.process.side_effect = process
             sampled = list(model.process_video('video.mp4', 0))
-        self.assertEqual([row['start_second'] for row in sampled], [60., 180.])
+        self.assertEqual([row['start_second'] for row in sampled], [30., 90.])
         camera.return_value.close.assert_called_once()
 
     def test_manifest_subject_survives_extraction_and_resume(self):
@@ -71,7 +71,7 @@ class DataRegressionTests(unittest.TestCase):
             with patch.object(model, 'process_video', return_value=iter([row])):
                 self.assertEqual(model.run(src, dst, strict=True), 1)
             self.assertEqual(json.loads(dst.read_text())['subject_id'], 'driver-1')
-            second = row | dict(start_second=60, end_second=120)
+            second = row | dict(start_second=30, end_second=60)
             src.write_text(json.dumps(dict(video_path='video.mp4', label=0)))
             with patch.object(model, 'process_video', return_value=iter([second])):
                 self.assertEqual(model.run(src, dst, strict=True, resume=True), 1)

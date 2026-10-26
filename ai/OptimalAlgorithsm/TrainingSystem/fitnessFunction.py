@@ -122,7 +122,7 @@ def classification_metrics(y_true, y_pred):
 
 def selection_key(row):
     metrics = row["metrics"]
-    return metrics["balanced_accuracy"], metrics["f1"], -row["num_features"]
+    return metrics["balanced_accuracy"], metrics["f1"]
 
 
 class Fitness:
@@ -150,24 +150,25 @@ class Fitness:
             raise ValueError("Candidate values must be in [0, 1]")
         w = candidate[:8]
         threshold = candidate[8]
-        mask = w >= 0.5
-        return w, threshold, mask
+        return w, threshold
 
     def score(self, candidate, method="weighted_mean"):
+        if method == "physical_quadratic":
+            return self.physical_quadratic_score(candidate)
         if method not in ("weighted_mean", "noisy_or", "cooccurrence"):
             raise ValueError(f"Unknown fitness method: {method}")
-        w, _, mask = self._candidate(candidate)
-        if not mask.any():
+        w, _ = self._candidate(candidate)
+        if not w.any():
             return np.zeros(len(self.X), dtype=np.float32)
-        z = self.X[:, mask] * w[mask]
+        z = self.X * w
         if method == "weighted_mean":
-            return z.sum(axis=1) / w[mask].sum()
+            return z.sum(axis=1) / w.sum()
         if method == "noisy_or":
             return 1.0 - np.prod(1.0 - z, axis=1)
         z = np.sort(z, axis=1)
         strongest = z[:, -1]
         # The strongest pair adds support without accumulating many weak signals.
-        joint = strongest * z[:, -2] if z.shape[1] > 1 else 0.0
+        joint = strongest * z[:, -2]
         return strongest + (1.0 - strongest) * joint
 
     def weighted_mean(self, candidate):
@@ -179,14 +180,43 @@ class Fitness:
     def cooccurrence(self, candidate):
         return self.predict(candidate, "cooccurrence")
 
+    @staticmethod
+    def _quadratic_candidate(candidate):
+        candidate = np.asarray(candidate, dtype=np.float32)
+        if candidate.shape != (33,):
+            raise ValueError("Physical quadratic candidate must contain 8 weights, T_cls and 8 triples")
+        if not np.isfinite(candidate).all() or np.any((candidate < 0) | (candidate > 1)):
+            raise ValueError("Candidate values must be in [0, 1]")
+        return candidate[:8], candidate[8], candidate[9:].reshape(8, 3)
+
+    def physical_quadratic_score(self, candidate):
+        """Learn a bounded quadratic response per physical feature, then average."""
+        w, _, control = self._quadratic_candidate(candidate)
+        if not w.any():
+            return np.zeros(len(self.X), dtype=np.float32)
+        x = self.X
+        response = (control[:, 0] * (1 - x) ** 2
+                    + 2 * control[:, 1] * x * (1 - x) + control[:, 2] * x ** 2)
+        return np.clip((response * w).sum(axis=1) / w.sum(), 0, 1)
+
+    def physical_quadratic(self, candidate):
+        score = self.physical_quadratic_score(candidate)
+        w, threshold, _ = self._quadratic_candidate(candidate)
+        return (score >= threshold).astype(np.int8) if w.any() else np.zeros(len(self.X), dtype=np.int8)
+
     def predict(self, candidate, method="weighted_mean"):
+        if method == "physical_quadratic":
+            return self.physical_quadratic(candidate)
         score = self.score(candidate, method)
-        _, threshold, mask = self._candidate(candidate)
-        return (score >= threshold).astype(np.int8) if mask.any() else np.zeros(len(self.X), dtype=np.int8)
+        w, threshold = self._candidate(candidate)
+        return (score >= threshold).astype(np.int8) if w.any() else np.zeros(len(self.X), dtype=np.int8)
 
     @staticmethod
     def evaluate(candidate, y_pred, y_true):
-        _, _, mask = Fitness._candidate(candidate)
+        if np.asarray(candidate).shape == (33,):
+            Fitness._quadratic_candidate(candidate)
+        else:
+            Fitness._candidate(candidate)
         y_true = validate_labels(y_true)
         y_pred = validate_labels(y_pred, len(y_true))
 
@@ -197,13 +227,10 @@ class Fitness:
         recall = tp / (tp + fn) if tp + fn else 0.0
         precision = tp / (tp + fp) if tp + fp else 0.0
 
-        num_feature = mask.sum()
-
         return np.asarray(
             [
                 1.0 - recall,
                 1.0 - precision,
-                num_feature / 8.0,
             ],
             dtype=np.float32,
         )

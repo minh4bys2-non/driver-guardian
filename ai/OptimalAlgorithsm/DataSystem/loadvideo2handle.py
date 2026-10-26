@@ -28,9 +28,12 @@ def balance_brightness(frame, target_luma=DEFAULT_CONFIG.target_luma):
 
 # [Frame: RGB, shape: [3, H, W], dtype: uint8, range: [0, 255], timeline = 30FPS]
 # (frame: np.ndarray, timestamp: float)
-def read_video(path, target_fps=DEFAULT_CONFIG.fps, *, target_luma=DEFAULT_CONFIG.target_luma):
+def read_video(path, target_fps=DEFAULT_CONFIG.fps, *, target_luma=DEFAULT_CONFIG.target_luma,
+               min_duration_sec=0):
     if not np.isfinite(target_fps) or target_fps <= 0:
         raise ValueError("target_fps must be finite and positive")
+    if not np.isfinite(min_duration_sec) or min_duration_sec < 0:
+        raise ValueError("min_duration_sec must be finite and nonnegative")
     if not np.isfinite(target_luma) or not 0 <= target_luma <= 255:
         raise ValueError("target_luma must be finite and in [0,255]")
     cap = cv2.VideoCapture(path)
@@ -44,6 +47,10 @@ def read_video(path, target_fps=DEFAULT_CONFIG.fps, *, target_luma=DEFAULT_CONFI
         source_fps = cap.get(cv2.CAP_PROP_FPS)
         if not np.isfinite(source_fps) or source_fps <= 0:
             raise ValueError(f"Invalid source FPS: {path}")
+        if min_duration_sec > 0:
+            frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+            if np.isfinite(frame_count) and frame_count > 0 and frame_count / source_fps < min_duration_sec - 1e-6:
+                raise ValueError(f"Video too short: {frame_count / source_fps:g}s < {min_duration_sec:g}s window: {path}")
         while True:
             ok, frame = cap.read()
             if not ok:
@@ -81,7 +88,7 @@ def read_video(path, target_fps=DEFAULT_CONFIG.fps, *, target_luma=DEFAULT_CONFI
 
 
 if __name__ == "__main__":
-    path = str(VIDEO_ROOT / "Fold1_part1/01/10.MOV")
+    path = str(Path(VIDEO_ROOT) / "Fold1_part1/01/10.MOV")
     for frame, timestamp in read_video(path):
         print(frame.shape, timestamp)
         image = np.transpose(frame, (1, 2, 0))

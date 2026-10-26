@@ -1,0 +1,116 @@
+{
+  "fitness_method": "weighted_mean",
+  "input_schema": {
+    "features": [
+      "blink_frequency",
+      "blink_duration",
+      "perclos",
+      "yawn_frequency",
+      "nod_duration",
+      "nod_frequency",
+      "dominant_head_motion_frequency",
+      "neuralnetwork_score"
+    ],
+    "feature_encoding": "physical_v1",
+    "normalization_id": "4c1c8e218c32090b8158ebda143dde01a45e9008ebc1d50f7299dd40e964d447",
+    "normalization_scales": {
+      "blink_frequency": 604.0,
+      "blink_duration": 2000,
+      "perclos": 1.0,
+      "yawn_frequency": 18.0,
+      "nod_duration": 3.5,
+      "nod_frequency": 78.0,
+      "dominant_head_motion_frequency": 15.0,
+      "neuralnetwork_score": 1.0
+    }
+  },
+  "selected_model": {
+    "model": "candidate",
+    "candidate": [
+      0.3904489278793335,
+      0.679773211479187,
+      0.4000000059604645,
+      0.4018171727657318,
+      0.0,
+      0.6320846676826477,
+      0.021052664145827293,
+      0.0,
+      0.030663106590509415
+    ],
+    "num_features": 6,
+    "selected_features": [
+      "blink_frequency",
+      "blink_duration",
+      "perclos",
+      "yawn_frequency",
+      "nod_frequency",
+      "dominant_head_motion_frequency"
+    ]
+  },
+  "validation_metrics": {
+    "tp": 191,
+    "tn": 163,
+    "fp": 57,
+    "fn": 33,
+    "recall": 0.8526785714285714,
+    "precision": 0.7701612903225806,
+    "specificity": 0.740909090909091,
+    "false_positive_rate": 0.2590909090909091,
+    "balanced_accuracy": 0.7967938311688312,
+    "f1": 0.809322033898305,
+    "accuracy": 0.7972972972972973,
+    "predicted_positive": 248,
+    "constant_prediction": false
+  },
+  "validation_beats_constant_baseline": true,
+  "test_metrics": {
+    "tp": 206,
+    "tn": 111,
+    "fp": 129,
+    "fn": 22,
+    "recall": 0.9035087719298246,
+    "precision": 0.6149253731343284,
+    "specificity": 0.4625,
+    "false_positive_rate": 0.5375,
+    "balanced_accuracy": 0.6830043859649123,
+    "f1": 0.7317939609236235,
+    "accuracy": 0.6773504273504274,
+    "predicted_positive": 335,
+    "constant_prediction": false
+  },
+  "test_baselines": {
+    "constant_0": {
+      "tp": 0,
+      "tn": 240,
+      "fp": 0,
+      "fn": 228,
+      "recall": 0.0,
+      "precision": 0.0,
+      "specificity": 1.0,
+      "false_positive_rate": 0.0,
+      "balanced_accuracy": 0.5,
+      "f1": 0.0,
+      "accuracy": 0.5128205128205128,
+      "predicted_positive": 0,
+      "constant_prediction": true
+    },
+    "constant_1": {
+      "tp": 228,
+      "tn": 0,
+      "fp": 240,
+      "fn": 0,
+      "recall": 1.0,
+      "precision": 0.48717948717948717,
+      "specificity": 0.0,
+      "false_positive_rate": 1.0,
+      "balanced_accuracy": 0.5,
+      "f1": 0.6551724137931034,
+      "accuracy": 0.48717948717948717,
+      "predicted_positive": 468,
+      "constant_prediction": true
+    }
+  },
+  "evaluations": 5000,
+  "elapsed_seconds": 9.020109303000027,
+  "output_dir": "/home/tranmanhduy/Workspace/ptithcm/driver-guardian/ai/OptimalAlgorithsm/TrainingSystem/output/cmdpsofs/cmdpsofs_weighted_mean"
+}

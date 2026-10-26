@@ -24,12 +24,12 @@ Train/validation/test chia hết các mẫu theo nhóm. Chỉ train tham gia t�
 validation chọn mô hình, test đánh giá sau cùng. Cả bốn optimizer được test
 về số mẫu đánh giá, số thế hệ và số cá thể ghi log.
 
-DataSystem chỉ xuất cửa sổ đầy. Mặc định FFT cần 60 giây pitch liên tục sau
+DataSystem chỉ xuất cửa sổ đầy. Mặc định FFT cần 30 giây pitch liên tục sau
 hiệu chuẩn; một lần mất pose xóa chuỗi FFT. Coverage 80% không thay điều kiện
-này. Với stride 60 giây, cửa sổ đầu bị loại và cửa sổ thứ hai mới có thể đạt.
+này. Với stride 30 giây, cửa sổ đầu bị loại và cửa sổ thứ hai mới có thể đạt.
 Đầu đứng yên đủ dữ liệu không còn bị loại.
 
-Đã chạy FaceMesh/PnP thật trên 120 giây đầu của `A/A/A_IR_A.mp4` và
+Lần kiểm tra lịch sử với cửa sổ/stride 60 giây đã chạy FaceMesh/PnP thật trên 120 giây đầu của `A/A/A_IR_A.mp4` và
 `A/D/A_IR_D.mp4`, tổng 7.200 frame ở 30 FPS. Mỗi video giữ `[60,120)` và loại
 `[0,60)` vì FFT mới quan sát 59 giây. NeuralNetwork được thay bằng callable
 trả 0.5 trong lần kiểm tra này để không cần nạp checkpoint; không ghi dataset.

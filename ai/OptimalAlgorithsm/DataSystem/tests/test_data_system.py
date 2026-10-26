@@ -91,7 +91,7 @@ class DataSystemTests(unittest.TestCase):
     def test_30fps_timeline_samples_last_ten_seconds_at_5fps(self):
         model = self.make_engine()
         frames = ((np.full((3, 4, 8), (i // 6) % 256, np.uint8), i / 30)
-                  for i in range(1800))
+                  for i in range(900))
         with patch.object(engine, "CameraMetrics") as camera, patch.object(
             engine, "read_video", return_value=frames
         ):
@@ -101,7 +101,7 @@ class DataSystemTests(unittest.TestCase):
         model.neural.assert_called_once()
         batch = model.neural.call_args.args[0]
         self.assertEqual(batch.shape, (50, 3, 224, 224))
-        np.testing.assert_array_equal(batch[:, 0, 112, 112], np.arange(250, 300) % 256)
+        np.testing.assert_array_equal(batch[:, 0, 112, 112], np.arange(100, 150) % 256)
 
     def test_inherited_config_reaches_camera_and_neural_pipeline(self):
         config = DataSystemConfig(
@@ -231,12 +231,12 @@ class DataSystemTests(unittest.TestCase):
                 source_video="video.mp4",
                 label=0,
                 start_second=0,
-                end_second=60,
+                end_second=30,
                 feature_encoding=FEATURE_ENCODING,
                 normalization_id=model.normalizer.id,
                 normalization_scales=model.normalizer.scales,
             )
-            second = row | {"start_second": 60, "end_second": 120}
+            second = row | {"start_second": 30, "end_second": 60}
             original = json.dumps(row)
             dst.write_text(original)
             with patch.object(
@@ -309,15 +309,17 @@ class DataSystemTests(unittest.TestCase):
 
     def test_default_stride_produces_nonoverlapping_windows(self):
         model = self.make_engine(neural_size=8)
-        self.assertEqual(model.stride / model.fps, 60)
-        frames = ((np.zeros((3, 4, 8), np.uint8), i / 30) for i in range(3600))
+        self.assertEqual(model.stride / model.fps, 30)
+        self.assertEqual(model.window / model.fps, 30)
+        self.assertEqual(set(engine.CameraMetrics().windows_sec.values()), {30})
+        frames = ((np.zeros((3, 4, 8), np.uint8), i / 30) for i in range(1800))
         with patch.object(engine, "CameraMetrics") as camera, patch.object(
             engine, "read_video", return_value=frames
         ):
             camera.return_value.process.return_value = self.metrics()
             rows = list(model.process_video("video.mp4", 1))
         self.assertEqual(
-            [(r["start_second"], r["end_second"]) for r in rows], [(0, 60), (60, 120)]
+            [(r["start_second"], r["end_second"]) for r in rows], [(0, 30), (30, 60)]
         )
 
     def make_engine(self, **options):
@@ -327,7 +329,7 @@ class DataSystemTests(unittest.TestCase):
         return model
 
     @staticmethod
-    def metrics(window=60, **overrides):
+    def metrics(window=30, **overrides):
         return (
             dict(
                 eye_ready=True,
@@ -421,14 +423,14 @@ class DataSystemTests(unittest.TestCase):
             {"head_motion_frequency_hz": -0.1},
             {"head_motion_frequency_hz": float("nan")},
             {"head_motion_resolution_hz": None},
-            {"head_motion_observed_sec": 59.9},
+            {"head_motion_observed_sec": 29.9},
         ):
             self.assertIsNone(
                 model._features(self.metrics(**change), [], [], frames, "video", 0, 1)
             )
         for frequency in (0.1, 0.4):
-            motion = HeadMotionWindow(60)
-            for i in range(1201):
+            motion = HeadMotionWindow(30)
+            for i in range(601):
                 result = motion.process(
                     5 * np.sin(2 * np.pi * frequency * i / 20), i / 20
                 )
@@ -439,7 +441,7 @@ class DataSystemTests(unittest.TestCase):
                 frequency / (model.fps / 2),
                 delta=0.001,
             )
-            lost = motion.process(None, 60.05)
+            lost = motion.process(None, 30.05)
             self.assertIsNone(
                 model._features(self.metrics(**lost), [], [], frames, "video", 0, 1)
             )
@@ -451,7 +453,7 @@ class DataSystemTests(unittest.TestCase):
             list(model.process_video("video.mp4", 0))
             options = factory.call_args.kwargs
         camera = engine.CameraMetrics(**options)
-        self.assertEqual(camera.head_motion.window, 60)
+        self.assertEqual(camera.head_motion.window, 30)
         self.assertEqual(camera.mouth.fsm.minimum, 4000)
         self.assertEqual(camera.nod.minimum, 800)
         for detector, duration in (

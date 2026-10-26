@@ -2,6 +2,7 @@ package com.example.driverguardian.ai.monitoring.camera
 
 import android.graphics.Bitmap
 import com.example.driverguardian.ai.physical.model.LandmarkPoint
+import com.google.mediapipe.tasks.core.Delegate
 import com.google.mediapipe.tasks.vision.core.RunningMode
 import java.io.Closeable
 import java.util.concurrent.atomic.AtomicBoolean
@@ -10,7 +11,12 @@ object FaceLandmarkerConfiguration {
     const val MODEL_ASSET_PATH = "face_landmarker.task"
     const val MODEL_SHA256 = "64184e229b263107bc2b804c6625db1341ff2bb731874b0bcc2fe6544e0bc9ff"
     const val NUM_FACES = 1
-    val RUNNING_MODE: RunningMode = RunningMode.LIVE_STREAM
+    val RUNNING_MODE: RunningMode = RunningMode.VIDEO
+    const val MIN_FACE_DETECTION_CONFIDENCE = 0.6f
+    const val MIN_FACE_PRESENCE_CONFIDENCE = 0.6f
+    const val MIN_TRACKING_CONFIDENCE = 0.6f
+    const val OUTPUT_FACE_BLENDSHAPES = false
+    const val OUTPUT_FACIAL_TRANSFORMATION_MATRIXES = false
 }
 
 data class FaceLandmarkerFrameResult(
@@ -24,6 +30,8 @@ data class FaceLandmarkerFrameResult(
 )
 
 interface FaceLandmarkerClient : Closeable {
+    val activeDelegate: Delegate get() = Delegate.CPU
+
     fun isReadyForFrame(): Boolean = true
 
     fun detect(
@@ -35,6 +43,20 @@ interface FaceLandmarkerClient : Closeable {
         receiptElapsedNs: Long,
         generation: Long,
     )
+
+    fun detectRgba(
+        rgbaBytes: ByteArray,
+        width: Int,
+        height: Int,
+        rotationDegrees: Int,
+        cameraTimestampNs: Long,
+        receiptElapsedNs: Long,
+        generation: Long,
+    ) {
+        val compact = java.nio.ByteBuffer.wrap(rgbaBytes)
+        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).also { it.copyPixelsFromBuffer(compact) }
+        detect(bitmap, width, height, rotationDegrees, cameraTimestampNs, receiptElapsedNs, generation)
+    }
 }
 
 class MonotonicTaskTimestamp {

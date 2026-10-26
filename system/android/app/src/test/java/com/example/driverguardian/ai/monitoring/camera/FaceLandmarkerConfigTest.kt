@@ -1,14 +1,21 @@
 package com.example.driverguardian.ai.monitoring.camera
 
 import com.google.mediapipe.tasks.vision.core.RunningMode
-import org.junit.Assert.*
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class FaceLandmarkerConfigTest {
-    @Test fun configurationIsAssetsOnlyLiveStreamOneFace() {
+    @Test fun configurationIsAssetsOnlyVideoModeOneFaceAndOptimizedThresholds() {
         assertEquals("face_landmarker.task", FaceLandmarkerConfiguration.MODEL_ASSET_PATH)
-        assertEquals(RunningMode.LIVE_STREAM, FaceLandmarkerConfiguration.RUNNING_MODE)
+        assertEquals(RunningMode.VIDEO, FaceLandmarkerConfiguration.RUNNING_MODE)
         assertEquals(1, FaceLandmarkerConfiguration.NUM_FACES)
+        assertEquals(0.6f, FaceLandmarkerConfiguration.MIN_FACE_DETECTION_CONFIDENCE, 1e-4f)
+        assertEquals(0.6f, FaceLandmarkerConfiguration.MIN_FACE_PRESENCE_CONFIDENCE, 1e-4f)
+        assertEquals(0.6f, FaceLandmarkerConfiguration.MIN_TRACKING_CONFIDENCE, 1e-4f)
+        assertFalse(FaceLandmarkerConfiguration.OUTPUT_FACE_BLENDSHAPES)
+        assertFalse(FaceLandmarkerConfiguration.OUTPUT_FACIAL_TRANSFORMATION_MATRIXES)
     }
 
     @Test fun taskMillisecondsAreStrictlyIncreasingWithoutChangingCameraNanoseconds() {

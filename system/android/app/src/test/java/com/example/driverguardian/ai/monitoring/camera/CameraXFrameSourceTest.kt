@@ -32,4 +32,17 @@ class CameraXFrameSourceTest {
         assertTrue(gate.isCurrent(second))
         assertFalse(gate.isCurrent(first))
     }
+
+    @Test fun testFramePoolIntegrationAndControlFlags() {
+        val pool = RgbaFramePool(width = 640, height = 480, poolSize = 3)
+        val balancer = BrightnessBalancer(targetLuma = 70.0)
+
+        assertFalse(balancer.enabled.get())
+        balancer.enabled.set(true)
+        assertTrue(balancer.enabled.get())
+        balancer.enabled.set(false)
+        assertFalse(balancer.enabled.get())
+
+        assertEquals(3, pool.capacity)
+    }
 }

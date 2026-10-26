@@ -12,14 +12,12 @@ nghệ Bưu chính Viễn thông – Cơ sở tại TP.HCM (PTITHCM).
   lịch sử chuyến đi và sự kiện cảnh báo với hệ thống Backend trung tâm.
 - **Pipeline giám sát thời gian thực (Production):**
   `CameraX` → `MediaPipe Face Landmarker` (`face_landmarker.task` - 478 điểm mốc 3D) →
-  `PhysicalBranchProcessor` → `PhysicalMetrics` (EAR, MAR, PERCLOS, POM, Head Pose 3D, Nodding,
+  `PhysicalBranchProcessor` (`ai.pipeline`) → `PhysicalMetrics` (EAR, MAR, PERCLOS, POM, Head Pose 3D, Nodding,
   Adaptive HMM + Temporal FSM).
 - **Ranh giới AI & Demo (Strict AI Boundary):**
     - `face_landmarker.task` chỉ trích xuất tọa độ mốc khuôn mặt, **không phải** model phân loại
       buồn ngủ.
-    - Suy luận mạng học sâu ONNX (`OnnxRuntimeEngine`, `EndToEndDemoInferenceRunner`) hiện được tách
-      biệt trong màn hình `OnnxDemoScreen`, không tự động kích hoạt cảnh báo giả trong phiên lái
-      thực tế.
+    - Các file mô hình nhị phân `.onnx` và thư viện ONNX Runtime được lưu giữ sẵn cho việc tích hợp mô hình phân loại học sâu trong tương lai.
     - Luồng cảnh báo nguy hiểm hiện tại được kích hoạt tường minh qua nút `DEMO: Cảnh báo nguy hiểm`
       (`DangerAlertScreen`) để kiểm thử trọn vẹn chu trình sự kiện mà không bịa đặt điểm số AI giả.
 
@@ -37,8 +35,8 @@ nghệ Bưu chính Viễn thông – Cơ sở tại TP.HCM (PTITHCM).
 - **Suy luận AI trên thiết bị (On-device AI):**
     - Nhánh vật lý (`ai/physical`): Toán học hình học 3D (EAR, MAR, SolvePnP Head Pose),
       `AdaptiveHmm`, `TemporalStateMachine`, `WindowRatio` (khớp số học với nhánh Python gốc).
-    - Nhánh học sâu (`ai/runtime`, `ai/demo`): `ONNX Runtime Android`
-      (`onnxruntime-android:1.30.0`).
+    - Nhánh pipeline (`ai/pipeline`): Điều phối các thuật toán vật lý (`PhysicalBranch`, `PhysicalBranchConfig`, `PhysicalBranchProcessor`).
+    - Nhánh học sâu: ONNX Runtime Android (`onnxruntime-android:1.30.0`).
 - **Mạng, Xác thực & Bảo mật:**
     - `Retrofit 2` (`2.11.0`) + `Gson Converter` kết nối với **FastAPI Backend** và **Oracle
       Database**.
@@ -85,19 +83,14 @@ Mã nguồn đặt tại `app/src/main/java/com/example/driverguardian` và đư
 package:
 
 - `com.example.driverguardian.ai`: Toàn bộ lõi xử lý AI và giám sát thời gian thực trên thiết bị
-    - `ai.contract`: Hợp đồng đầu vào/đầu ra của model (`ModelContract`, `DrowsinessModelContract`,
-      `EndToEndDemoModelContract`).
-    - `ai.demo`: Pipeline tiền xử lý, bộ đệm chuỗi `BoundedSequenceBuffer` và bộ chạy suy luận cho
-      bản demo ONNX.
     - `ai.monitoring`: Điều phối luồng giám sát thời gian thực (`DriverMonitoringEngine`,
       `DriverMonitoringCoordinator`), thu nhận khung hình CameraX (`camera/`), cảm biến chuyển động
       (`device/`), đồng bộ thời gian (`time/`, `sync/`) và trạng thái chẩn đoán (`model/`).
-    - `ai.parity`: Bộ công cụ kiểm thử đối sánh độ chính xác số học (Golden Vectors) giữa Kotlin và
-      Python.
-    - `ai.physical`: Nhánh phân tích đặc trưng vật lý (`AspectRatioCalculator`, `HeadPoseEstimator`,
-      `AdaptiveHmm`, `TemporalStateMachine`, `WindowRatio`, `PhysicalBranchProcessor`).
-    - `ai.runtime`: Lớp bọc quản lý phiên chạy `OnnxRuntimeEngine` và `OnnxModelSession`.
-    - `ai.tensor`: Cấu trúc dữ liệu Tensor, shape và tiện ích tạo dữ liệu kiểm thử.
+    - `ai.physical`: Nhánh phân tích đặc trưng vật lý nền tảng:
+      `geometry/` (`AspectRatioCalculator`, `HeadPoseEstimator`),
+      `model/` (`PhysicalMetrics`, `HeadPose`, `LandmarkPoint`),
+      `temporal/` (`AdaptiveHmm`, `AdaptiveHmmFsm`, `TemporalStateMachine`, `WindowRatio`).
+    - `ai.pipeline`: Pipeline tích hợp và điều phối các thuật toán đặc trưng vật lý thành luồng giám sát hoàn chỉnh (`PhysicalBranch`, `PhysicalBranchConfig`, `PhysicalBranchProcessor`).
 - `com.example.driverguardian.data`: Tầng dữ liệu, xác thực và kết nối mạng
     - `data.auth`: Quản lý đăng nhập Google (`GoogleAuthManager`), lưu trữ token bảo mật
       (`TokenStore`), quản lý phiên (`SessionManager`) và `AuthInterceptor`.
@@ -117,8 +110,7 @@ package:
     - `ui.navigation`: Cấu hình điều hướng `AppNavigation` và định nghĩa các route trong
       `Screen.kt`.
     - `ui.screens`: Chứa toàn bộ các màn hình chức năng (`auth/`, `home/`, `selection/`, `pretrip/`,
-      `driving/`, `summary/`, `history/`, `analytics/`, `alerts/`, `settings/`, `system/`,
-      `onnxdemo/`).
+      `driving/`, `summary/`, `history/`, `analytics/`, `alerts/`, `settings/`, `system/`).
     - `ui.session`: `DrivingSessionViewModel` và `DrivingSessionUiState` quản lý vòng đời phiên lái
       xe.
     - `ui.theme`: Cấu hình màu sắc, kiểu chữ và Material 3 Theme (`Color.kt`, `Theme.kt`,
@@ -149,7 +141,7 @@ package:
     - Tuân thủ ranh giới `USER` ≠ `DRIVER`: Tài khoản đăng nhập cần được liên kết với hồ sơ tài xế
       (`DRIVER_ID`) thông qua `/auth/me` hoặc `/drivers/me` trước khi cho phép bắt đầu phiên lái xe.
 - **Kiểm thử & Khớp số học (Unit Test & Parity):**
-    - Khi thay đổi logic trong `ai/physical`, `ai/monitoring`, `data` hoặc `ui`, cần đảm bảo bộ kiểm
+    - Khi thay đổi logic trong `ai/physical`, `ai/pipeline`, `ai/monitoring`, `data` hoặc `ui`, cần đảm bảo bộ kiểm
       thử đơn vị (`.\gradlew.bat :app:testDebugUnitTest`) và các bài test parity với golden vectors
       của Python (`physical_fixtures.json`, `hmm_golden.json`, `head_pose_golden.json`) luôn vượt
       qua.
@@ -172,7 +164,7 @@ package:
     - Tổng quan toàn hệ thống & AI: `../../README.md`
     - Hướng dẫn cài đặt & chạy Android / Backend / Oracle DB: `README.md`
     - Phân tích chi tiết kiến trúc Android: `architecture_analysis.md`
-    - Đặc tả tối ưu hóa đa luồng trên phần cứng Snapdragon 680: `snapdragon_680_v2.md`
+    - Đặc tả tối ưu hóa đa luồng trên phần hardware Snapdragon 680: `snapdragon_680_v2.md`
     - Kiến trúc xác thực & Ranh giới AI: `../docs/AUTHENTICATION_AND_AI_BOUNDARY.md`
     - Tài liệu API Backend: `../backend/README.md` và
       `app/src/main/java/com/example/driverguardian/data/remote/DriverGuardianApi.kt`

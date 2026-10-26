@@ -4,7 +4,6 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
@@ -24,7 +23,6 @@ import kotlinx.coroutines.launch
 @Composable
 fun SystemInfoScreen(
     snackbarHostState: SnackbarHostState,
-    onOpenOnnxDemo: () -> Unit,
 ) {
     val scope = rememberCoroutineScope()
     Column(modifier = Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(16.dp)) {
@@ -60,9 +58,5 @@ fun SystemInfoScreen(
                 modifier = Modifier.weight(1f).height(56.dp)
             ) { Text("Thông tin ứng dụng") }
         }
-        OutlinedButton(
-            onClick = onOpenOnnxDemo,
-            modifier = Modifier.fillMaxWidth().height(56.dp)
-        ) { Text("Mở ONNX Runtime Demo") }
     }
 }

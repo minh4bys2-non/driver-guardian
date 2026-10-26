@@ -65,7 +65,6 @@ import com.example.driverguardian.ui.screens.driving.DangerAlertScreen
 import com.example.driverguardian.ui.screens.history.TripDetailScreen
 import com.example.driverguardian.ui.screens.history.TripHistoryScreen
 import com.example.driverguardian.ui.screens.home.HomeScreen
-import com.example.driverguardian.ui.screens.onnxdemo.OnnxDemoScreen
 import com.example.driverguardian.ui.screens.pretrip.PreTripCheckScreen
 import com.example.driverguardian.ui.screens.selection.SelectionScreen
 import com.example.driverguardian.ui.screens.settings.SettingsScreen
@@ -417,12 +416,8 @@ private fun AppNavHost(
         }
         composable(Screen.SystemInfo.route) {
             SystemInfoScreen(
-                snackbarHostState = snackbarHostState,
-                onOpenOnnxDemo = { navController.safeNavigate(Screen.OnnxDemo.route) }
+                snackbarHostState = snackbarHostState
             )
-        }
-        composable(Screen.OnnxDemo.route) {
-            OnnxDemoScreen()
         }
     }
 }

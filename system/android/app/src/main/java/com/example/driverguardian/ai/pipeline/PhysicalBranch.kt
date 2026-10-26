@@ -1,4 +1,4 @@
-package com.example.driverguardian.ai.physical.pipeline
+package com.example.driverguardian.ai.pipeline
 
 import com.example.driverguardian.ai.physical.model.LandmarkPoint
 import com.example.driverguardian.ai.physical.model.PhysicalMetrics

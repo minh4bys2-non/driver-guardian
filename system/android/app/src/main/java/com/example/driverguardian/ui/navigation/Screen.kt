@@ -17,5 +17,5 @@ sealed class Screen(val route: String) {
     data object AlertHistory : Screen("alert_history")
     data object Settings : Screen("settings")
     data object SystemInfo : Screen("system_info")
-    data object OnnxDemo : Screen("onnx_demo")
+
 }

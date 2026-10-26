@@ -1,8 +1,6 @@
-package com.example.driverguardian.ai.physical
+package com.example.driverguardian.ai.pipeline
 
 import com.example.driverguardian.ai.physical.model.LandmarkPoint
-import com.example.driverguardian.ai.physical.pipeline.PhysicalBranchConfig
-import com.example.driverguardian.ai.physical.pipeline.PhysicalBranchProcessor
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull

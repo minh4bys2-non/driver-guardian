@@ -1,4 +1,4 @@
-package com.example.driverguardian.ai.physical.pipeline
+package com.example.driverguardian.ai.pipeline
 
 /**
  * Configuration for the Physical Branch pipeline matching Python CameraMetrics defaults.

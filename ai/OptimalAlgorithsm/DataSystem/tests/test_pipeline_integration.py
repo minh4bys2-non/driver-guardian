@@ -40,6 +40,20 @@ def write_video(path, fps, seconds=2):
         writer.release()
 
 
+def test_short_video_is_rejected_before_face_tracking(tmp_path, monkeypatch):
+    video = tmp_path / 'short.mp4'
+    write_video(video, 5, seconds=10)
+    monkeypatch.setattr(engine, 'NeuralNetwork', Mock())
+    pipeline = engine.Engine(tmp_path)
+    camera = Mock()
+    monkeypatch.setattr(engine, 'CameraMetrics', Mock(return_value=camera))
+    with pytest.raises(ValueError, match='Video too short: 10s < 30s'):
+        list(pipeline.process_video('short.mp4', 0))
+    camera.process.assert_not_called()
+    pipeline.neural.assert_not_called()
+    camera.close.assert_called_once()
+
+
 @pytest.mark.parametrize('source_fps', [25, 30, 60])
 def test_real_checkpoint_video_and_jsonl_match_training(tmp_path, monkeypatch, checkpoint, source_fps):
     path, trained = checkpoint

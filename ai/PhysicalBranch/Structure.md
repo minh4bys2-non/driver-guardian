@@ -90,7 +90,7 @@ lấy mẫu mạng, lọc chất lượng, tổng hợp thời lượng và đư
 
 ## 2. Điều chỉnh cửa sổ thời gian
 
-`window_sec` đặt giá trị chung, mặc định **60 giây**. `windows` ghi đè riêng
+`window_sec` đặt giá trị chung, mặc định **30 giây**. `windows` ghi đè riêng
 cho từng loại thống kê, không buộc tất cả metric dùng cùng một chiều dài.
 
 | Khóa cửa sổ | Các chỉ số sử dụng |
@@ -207,9 +207,9 @@ Các dải thời lượng là cấu hình vận hành kế thừa, không phả
 Ngưỡng phân nhóm thời lượng 400/800 ms khác với giới hạn xác nhận sự kiện.
 
 Mặc định được đồng bộ với `OptimalAlgorithsm/DataSystem`: 30 FPS, cửa sổ
-60 giây, ngáp tối thiểu 4 giây và gật tối thiểu 0,8 giây. Khởi tạo HMM
-5 giây thay cho 15 giây giúp dành khoảng 55/60 giây đầu cho số đo mắt/miệng,
-đủ điều kiện coverage 80% nếu tín hiệu liên tục. FFT vẫn cần đủ 60 giây
+30 giây, ngáp tối thiểu 4 giây và gật tối thiểu 0,8 giây. Khởi tạo HMM
+10 giây để lại khoảng 20/30 giây đầu cho số đo mắt/miệng,
+chưa đủ coverage 80% ở cửa sổ đầu. FFT vẫn cần đủ 30 giây
 liên tục sau hiệu chuẩn đầu; giảm thời gian HMM không bỏ điều kiện này.
 Đây là cấu hình vận hành, chưa phải kết quả tối ưu hóa trên dữ liệu gán nhãn.
 
@@ -257,16 +257,16 @@ Một mẫu mất tín hiệu cũng ngắt sự kiện, kể cả khoảng cách
 
 | Thuộc tính | Mặc định | Ảnh hưởng |
 | --- | --- | --- |
-| `window_sec` | 60 giây | Cửa sổ chung trong `CameraMetrics`. |
-| `window_size_sec` | 60 giây | Cửa sổ đếm sự kiện trong detector mắt/miệng. |
+| `window_sec` | 30 giây | Cửa sổ chung trong `CameraMetrics`. |
+| `window_size_sec` | 30 giây | Cửa sổ đếm sự kiện trong detector mắt/miệng. |
 | `ratio_window_sec` | `None` → dùng `window_size_sec` | Cửa sổ riêng cho PERCLOS hoặc POM. |
 | `windows` | `None` | Ghi đè từng cửa sổ `blink`, `perclos`, `yawn`, `pom`, `nod`, `over_angle`, `head_motion`; ưu tiên hơn các tùy chọn cửa sổ mắt/miệng. |
 
 Cửa sổ ngắn phản ứng nhanh nhưng dao động nhiều; cửa sổ dài ổn định hơn
 nhưng phản ánh thay đổi chậm hơn. Tần suất dùng toàn bộ chiều dài cửa sổ
 làm mẫu số ngay từ đầu, nên lúc mới chạy có thể thấp hơn nhịp sự kiện thực tế.
-`head_motion` mặc định 60 giây khi dùng `CameraMetrics`; lớp
-`HeadMotionWindow` dùng độc lập cũng mặc định 60 giây.
+`head_motion` mặc định 30 giây khi dùng `CameraMetrics`; lớp
+`HeadMotionWindow` dùng độc lập cũng mặc định 30 giây.
 
 #### Hiệu chuẩn và chuyển động đầu
 
@@ -364,7 +364,7 @@ tại có tín hiệu. `head_ready` cần góc hợp lệ đã hiệu chuẩn t�
 
 ### Giải thích từng thông số trên HUD
 
-Các giá trị minh họa dưới đây lấy từ ảnh HUD người dùng cung cấp.
+Các giá trị minh họa dưới đây lấy từ ảnh HUD người dùng cung cấp với cửa sổ 60 giây; mặc định hiện tại là 30 giây.
 HUD thay dấu `_` trong tên trường bằng dấu cách và làm tròn số đến hai chữ
 số thập phân; vì vậy số đếm nguyên cũng hiển thị như `15.00`.
 EAR/MAR không có đơn vị; góc dùng độ, thời lượng sự kiện dùng ms,

@@ -114,7 +114,7 @@ def main(checkpoint_path, *, dataset_dir=None, split="test", output_dir=None,
 if __name__ == "__main__":
     main(
         checkpoint_path="/home/tranmanhduy/Workspace/ptithcm/driver-guardian/ai/LSTM/checkpoints/scratchv1/best.pt",
-        dataset_dir="/home/tranmanhduy/Workspace/dataE/DataLSTM",  # None: dùng đường dẫn dataset trong checkpoint.
+        dataset_dir="/home/tranmanhduy/Workspace/dataE/DataLSTM_v2",  # None: dùng đường dẫn dataset trong checkpoint.
         split="test",
         output_dir="/home/tranmanhduy/Workspace/ptithcm/driver-guardian/runs",  # None: lưu cạnh checkpoint trong evaluation_<split>.
         device="auto",

@@ -1,0 +1,117 @@
+{
+  "fitness_method": "cooccurrence",
+  "input_schema": {
+    "features": [
+      "blink_frequency",
+      "blink_duration",
+      "perclos",
+      "yawn_frequency",
+      "nod_duration",
+      "nod_frequency",
+      "dominant_head_motion_frequency",
+      "neuralnetwork_score"
+    ],
+    "feature_encoding": "physical_v1",
+    "normalization_id": "4c1c8e218c32090b8158ebda143dde01a45e9008ebc1d50f7299dd40e964d447",
+    "normalization_scales": {
+      "blink_frequency": 604.0,
+      "blink_duration": 2000,
+      "perclos": 1.0,
+      "yawn_frequency": 18.0,
+      "nod_duration": 3.5,
+      "nod_frequency": 78.0,
+      "dominant_head_motion_frequency": 15.0,
+      "neuralnetwork_score": 1.0
+    }
+  },
+  "selected_model": {
+    "model": "candidate",
+    "candidate": [
+      0.28328266739845276,
+      0.7402438521385193,
+      0.6389252543449402,
+      0.23968203365802765,
+      0.0,
+      0.7194413542747498,
+      0.4158746302127838,
+      0.028425268828868866,
+      0.07211165130138397
+    ],
+    "num_features": 7,
+    "selected_features": [
+      "blink_frequency",
+      "blink_duration",
+      "perclos",
+      "yawn_frequency",
+      "nod_frequency",
+      "dominant_head_motion_frequency",
+      "neuralnetwork_score"
+    ]
+  },
+  "validation_metrics": {
+    "tp": 179,
+    "tn": 174,
+    "fp": 46,
+    "fn": 45,
+    "recall": 0.7991071428571429,
+    "precision": 0.7955555555555556,
+    "specificity": 0.7909090909090909,
+    "false_positive_rate": 0.20909090909090908,
+    "balanced_accuracy": 0.7950081168831169,
+    "f1": 0.7973273942093542,
+    "accuracy": 0.795045045045045,
+    "predicted_positive": 225,
+    "constant_prediction": false
+  },
+  "validation_beats_constant_baseline": true,
+  "test_metrics": {
+    "tp": 203,
+    "tn": 125,
+    "fp": 115,
+    "fn": 25,
+    "recall": 0.8903508771929824,
+    "precision": 0.6383647798742138,
+    "specificity": 0.5208333333333334,
+    "false_positive_rate": 0.4791666666666667,
+    "balanced_accuracy": 0.705592105263158,
+    "f1": 0.7435897435897436,
+    "accuracy": 0.7008547008547008,
+    "predicted_positive": 318,
+    "constant_prediction": false
+  },
+  "test_baselines": {
+    "constant_0": {
+      "tp": 0,
+      "tn": 240,
+      "fp": 0,
+      "fn": 228,
+      "recall": 0.0,
+      "precision": 0.0,
+      "specificity": 1.0,
+      "false_positive_rate": 0.0,
+      "balanced_accuracy": 0.5,
+      "f1": 0.0,
+      "accuracy": 0.5128205128205128,
+      "predicted_positive": 0,
+      "constant_prediction": true
+    },
+    "constant_1": {
+      "tp": 228,
+      "tn": 0,
+      "fp": 240,
+      "fn": 0,
+      "recall": 1.0,
+      "precision": 0.48717948717948717,
+      "specificity": 0.0,
+      "false_positive_rate": 1.0,
+      "balanced_accuracy": 0.5,
+      "f1": 0.6551724137931034,
+      "accuracy": 0.48717948717948717,
+      "predicted_positive": 468,
+      "constant_prediction": true
+    }
+  },
+  "evaluations": 5000,
+  "elapsed_seconds": 9.998905773000388,
+  "output_dir": "/home/tranmanhduy/Workspace/ptithcm/driver-guardian/ai/OptimalAlgorithsm/TrainingSystem/output/nspsofs/nspsofs_cooccurrence"
+}

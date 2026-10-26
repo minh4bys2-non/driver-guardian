@@ -2,6 +2,7 @@
 
 Chỉnh cấu hình bên dưới rồi chạy: python -m ai.OptimalAlgorithsm.inference
 Một lần chạy neural phục vụ cả ba phép fusion của TrainingSystem.
+Cửa sổ vật lý kế thừa DataSystem (30 giây); neural dùng 10 giây cuối.
 """
 
 from collections import deque
@@ -32,7 +33,7 @@ class CameraConfig:
     camera: int | str = 0
     checkpoint: Path = Path(__file__).resolve().parents[1] / "LSTM/checkpoints/head_landmarkv1/best.pt"
     device: str | None = None  # None: tự chọn CUDA/CPU.
-    interval: float = 1.0
+    interval: float = 1.0  # Chu kỳ dự đoán trên cửa sổ trượt, không phải độ dài cửa sổ.
     duration: float | None = None
     output: str | None = None
     no_display: bool = False
@@ -41,13 +42,23 @@ class CameraConfig:
 CAMERA_CONFIG = CameraConfig()
 # Thứ tự: blink_frequency, blink_duration, perclos, yawn_frequency,
 # nod_duration, nod_frequency, dominant_head_motion_frequency, neuralnetwork_score, threshold.
-# Trọng số thủ công CHƯA TỐI ƯU; w >= 0.5 chọn feature, mặc định dùng cả 8.
+# Trọng số thủ công CHƯA TỐI ƯU; cả 8 feature dùng trọng số liên tục, w = 0 không đóng góp.
 FUSION_CANDIDATES = {
     "weighted_mean": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.5],
     "noisy_or": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.5],
-    "cooccurrence": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.5],
+    "cooccurrence": [
+      0.5003395080566406,
+      0.8887009024620056,
+      0.7320020794868469,
+      0.2563990652561188,
+      0.0,
+      0.6491293907165527,
+      0.4759885370731354,
+      0.0,
+      0.07674604654312134
+    ],
 }
-# Gán đường dẫn evaluation.json physical_v1 để thay trọng số thủ công của từng chế độ.
+# Gán evaluation.json physical_v1 được train lại với trọng số liên tục cho từng chế độ.
 FUSION_REPORTS = {"weighted_mean": None, "noisy_or": None, "cooccurrence": None}
 
 def load_fusion(path, normalizer):
@@ -66,7 +77,6 @@ def load_fusion(path, normalizer):
         raise ValueError("Fusion model không hợp lệ")
     return report
 
-
 def classify(sample, fusion):
     selected = fusion["selected_model"]
     if selected["model"] != "candidate":
@@ -74,7 +84,6 @@ def classify(sample, fusion):
     return int(Fitness([[sample[name] for name in FEATURES]]).predict(
         selected["candidate"], fusion["fitness_method"]
     )[0])
-
 
 def fusion_details(sample, fusion):
     selected = fusion["selected_model"]

@@ -177,12 +177,14 @@ class TemporalTests(unittest.TestCase):
 
 
 class DetectorTests(unittest.TestCase):
-    def test_default_warmup_allows_eighty_percent_coverage(self):
+    def test_default_warmup_allows_eighty_percent_coverage_after_first_window(self):
         detector = AdaptiveHMM_FSM()
         for i in range(1800):
             result = detector.process(.3, i / 30)
+            if i == 899:
+                self.assertLess(result['observed_seconds'], 30 * .8)
         self.assertEqual(detector.init_frames, 300)
-        self.assertGreaterEqual(result['observed_seconds'], 60 * .8)
+        self.assertGreaterEqual(result['observed_seconds'], 30 * .8)
         self.assertEqual(result['perclos'], 0)
 
     def test_implicit_timeline_clears_hmm_at_gaps(self):
@@ -231,11 +233,11 @@ class DetectorTests(unittest.TestCase):
 
 
 class MotionTests(unittest.TestCase):
-    def test_default_fft_waits_for_full_minute(self):
+    def test_default_fft_waits_for_thirty_seconds(self):
         motion = HeadMotionWindow()
-        for t in np.linspace(0, 60, 601):
+        for t in np.linspace(0, 30, 301):
             result = motion.process(5 * np.sin(2 * np.pi * .1 * t), t)
-            if t < 60:
+            if t < 30:
                 self.assertIsNone(result['head_motion_frequency_hz'])
         self.assertAlmostEqual(result['head_motion_frequency_hz'], .1, delta=.002)
 
@@ -366,7 +368,7 @@ class PipelineTests(unittest.TestCase):
             count = monitor.run(display=False, use_video_time=True, max_frames=3, on_metrics=callback)
         self.assertEqual(count, 3)
         self.assertEqual([m['timestamp_sec'] for m in received], [0, 1 / 30, 2 / 30])
-        self.assertEqual([m['windows_sec']['perclos'] for m in received], [60, 15, 15])
+        self.assertEqual([m['windows_sec']['perclos'] for m in received], [30, 15, 15])
         capture.release.assert_called_once()
         tracker.close.assert_called_once()
 

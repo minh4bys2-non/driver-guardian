@@ -72,7 +72,7 @@ mô tả các bin tần số, bao gồm Nyquist khi số mẫu chẵn.
 DataSystem lấy mẫu lại video theo timeline F rồi PhysicalBranch nội suy chuỗi pitch.
 Với cửa sổ FFT W không chia hết cho bước frame, code làm tròn số mẫu nội suy.
 Cận bảo thủ dùng `max(3, ceil(W * F)) / (2 * W)` để bao cả sai lệch làm tròn
-và yêu cầu ít nhất bốn mẫu FFT. Với mặc định W=60, F=30, cận đúng bằng 15 Hz.
+và yêu cầu ít nhất bốn mẫu FFT. Với mặc định W=30, F=30, cận đúng bằng 15 Hz.
 Cận này mô tả miền tính toán; tăng FPS bằng lặp frame không tạo thêm thông tin
 chuyển động hay tăng băng thông thực của video nguồn.
 
@@ -94,7 +94,7 @@ Mỗi dòng JSONL lưu:
 - `normalization_id`: SHA-256 của encoding và toàn bộ cấu hình kế thừa đã áp dụng.
 - `feature_encoding="physical_v1"`, video nguồn, mốc cửa sổ và nhãn manifest.
 
-Output mặc định: `drowsiness_physical_60.jsonl`. Resume từ chối encoding, mã cấu
+Output mặc định: `drowsiness_physical_30.jsonl`. Resume từ chối encoding, mã cấu
 hình hoặc hệ số khác. TrainingSystem đọc phiên bản mới và từ chối trộn cấu hình.
 Hash không bao gồm nội dung checkpoint hoặc mã nguồn; lưu các phiên bản này riêng.
 Dữ liệu `risk_v1/risk_v2` cũ đã mất thông tin do bão hòa và ánh xạ nhiều-một:

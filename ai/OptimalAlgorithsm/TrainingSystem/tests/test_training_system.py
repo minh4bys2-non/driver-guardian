@@ -50,6 +50,63 @@ ALGORITHMS = (
 
 
 class FitnessTests(unittest.TestCase):
+    def test_physical_quadratic_learns_response_direction_and_curvature(self):
+        X = np.zeros((3, 8))
+        X[:, 0] = [0, .5, 1]
+        fitness = Fitness(X)
+        candidate = np.zeros(33)
+        candidate[[0, 8]] = [1, .75]
+        for control, expected in (
+            ([0, .5, 1], [0, .5, 1]),
+            ([1, .5, 0], [1, .5, 0]),
+            ([1, 0, 1], [1, .5, 1]),
+            ([0, 1, 0], [0, .5, 0]),
+        ):
+            candidate[9:12] = control
+            np.testing.assert_allclose(fitness.score(candidate, "physical_quadratic"), expected)
+            np.testing.assert_array_equal(fitness.physical_quadratic(candidate), np.array(expected) >= .75)
+        candidate[9:12] = [1, 0, 1]
+        y = [1, 0, 1]
+        np.testing.assert_array_equal(Fitness.evaluate(candidate, fitness.physical_quadratic(candidate), y), [0, 0])
+        candidate[12:] = 1  # Disabled features must not change the score.
+        np.testing.assert_allclose(fitness.physical_quadratic_score(candidate), [1, .5, 1])
+        candidate[:9] = 0
+        np.testing.assert_array_equal(fitness.physical_quadratic(candidate), [0, 0, 0])
+        np.testing.assert_array_equal(fitness.physical_quadratic_score(candidate), [0, 0, 0])
+        for invalid in (np.zeros(9), np.zeros(32), np.full(33, np.nan), np.full(33, 1.1)):
+            with self.assertRaises(ValueError):
+                fitness.physical_quadratic(invalid)
+        with self.assertRaises(ValueError):
+            fitness.score(candidate, "weighted_mean")
+
+    def test_physical_quadratic_optimizer_support(self):
+        X = np.zeros((3, 8))
+        X[:, 0] = [0, .5, 1]
+        fitness, y = Fitness(X), [1, 0, 1]
+        for optimizer_type, config_type, logger_type in ALGORITHMS:
+            with self.subTest(algorithm=optimizer_type.__name__), tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
+                cfg = config_type(dimensions=33, population_size=6, generations=3, archive_size=8)
+                logger = logger_type(tmp)
+                optimizer = optimizer_type(fitness, y, "physical_quadratic", cfg, logger)
+                with patch.object(logger, "save_plots"):
+                    archive = optimizer.run()
+                self.assertEqual(archive.positions.shape[1], 33)
+                for candidate, objectives in zip(archive.positions, archive.objectives):
+                    expected = (Fitness.evaluate(candidate, fitness.physical_quadratic(candidate), y)
+                                if candidate[:8].any() else np.ones(2))
+                    np.testing.assert_allclose(objectives, expected)
+                rows = score_candidates(archive.positions, fitness, y, "physical_quadratic")
+                self.assertTrue(rows)
+                saved = [json.loads(line) for line in logger.final_archive.read_text().splitlines()]
+                self.assertTrue(saved)
+                for row in saved:
+                    self.assertEqual(len(row["candidate"]), 33)
+                    self.assertEqual(row["classification_threshold"], row["candidate"][8])
+                with self.assertRaises(ValueError):
+                    optimizer_type(fitness, y, "physical_quadratic", config_type(), None)
+                with self.assertRaises(ValueError):
+                    optimizer_type(fitness, y, "weighted_mean", cfg, None)
+
     def test_neuralnetwork_score_loads_and_drives_predictions(self):
         values = dict(blink_frequency=0., blink_duration=0., perclos=0.,
                       yawn_frequency=0., nod_duration=0., nod_frequency=0.,
@@ -59,7 +116,7 @@ class FitnessTests(unittest.TestCase):
         rows = [values | schema | dict(neuralnetwork_score=score, label=label)
                 for score, label in ((.1, 0), (.9, 1))]
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "drowsiness_physical_60.jsonl"
+            path = Path(tmp) / "drowsiness_physical_30.jsonl"
             path.write_text("\n".join(json.dumps(row) for row in rows))
             X, y, metadata = load_jsonl(path, include_metadata=True)
             np.testing.assert_allclose(X[:, 7], [.1, .9])
@@ -83,7 +140,7 @@ class FitnessTests(unittest.TestCase):
         self.assertEqual(metrics["false_positive_rate"], 1)
         self.assertTrue(metrics["constant_prediction"])
 
-    def test_prediction_formulas_and_selection_boundary(self):
+    def test_prediction_formulas_and_classification_threshold(self):
         X = np.zeros((3, 8))
         X[:, :2] = [[0.2, 0.8], [0.8, 0.2], [1, 1]]
         fitness = Fitness(X)
@@ -111,7 +168,7 @@ class FitnessTests(unittest.TestCase):
         np.testing.assert_array_equal(
             fitness.predict(candidate, "cooccurrence"), [1, 0, 1, 0, 0, 1]
         )
-        candidate[1:8] = 0.49
+        candidate[1:8] = 0
         np.testing.assert_array_equal(
             fitness.cooccurrence(candidate), [1, 0, 0, 0, 0, 1]
         )
@@ -121,14 +178,50 @@ class FitnessTests(unittest.TestCase):
         candidate[8] = 0
         np.testing.assert_array_equal(fitness.cooccurrence(candidate), np.zeros(6))
 
+    def test_weights_below_half_contribute_without_selection_threshold(self):
+        X = np.zeros((2, 8))
+        X[1, :2] = [1, 0.5]
+        candidate = np.zeros(9)
+        candidate[:2] = [0.2, 0.4]
+        candidate[8] = 0.1
+        fitness = Fitness(X)
+        for method, score in (("weighted_mean", 2 / 3), ("noisy_or", 0.36),
+                              ("cooccurrence", 0.232)):
+            with self.subTest(method=method):
+                np.testing.assert_allclose(fitness.score(candidate, method), [0, score], atol=1e-7)
+                np.testing.assert_array_equal(fitness.predict(candidate, method), [0, 1])
+                row = score_candidates([candidate], fitness, [0, 1], method)[0]
+                self.assertEqual(row["selected_features"], FEATURES[:2])
+                self.assertEqual(row["num_features"], 2)
+                for optimizer_type, config_type, _ in ALGORITHMS:
+                    optimizer = optimizer_type(fitness, [0, 1], method, config_type(), None)
+                    np.testing.assert_array_equal(optimizer._evaluate(candidate), [0, 0])
+        for method in ("weighted_mean", "noisy_or", "cooccurrence"):
+            np.testing.assert_array_equal(fitness.score(np.zeros(9), method), [0, 0])
+            np.testing.assert_array_equal(fitness.predict(np.zeros(9), method), [0, 0])
+
     def test_known_confusion_matrix(self):
         candidate = np.zeros(9)
         candidate[:2] = 0.5
         actual = Fitness.evaluate(candidate, [1, 0, 1, 1, 0], [1, 1, 0, 1, 0])
-        np.testing.assert_allclose(actual, [1 / 3, 1 / 3, 2 / 8])
+        np.testing.assert_allclose(actual, [1 / 3, 1 / 3])
         np.testing.assert_array_equal(
-            Fitness.evaluate(candidate, [0, 0], [0, 0]), [1, 1, 0.25]
+            Fitness.evaluate(candidate, [0, 0], [0, 0]), [1, 1]
         )
+
+    def test_feature_count_does_not_affect_objectives_or_selection(self):
+        sparse = np.zeros(9)
+        sparse[0] = 1
+        dense = np.ones(9)
+        predictions, labels = [1, 0, 1, 1], [1, 0, 0, 1]
+        np.testing.assert_array_equal(
+            Fitness.evaluate(sparse, predictions, labels),
+            Fitness.evaluate(dense, predictions, labels),
+        )
+        metrics = classification_metrics(labels, predictions)
+        rows = [{"metrics": metrics, "num_features": n} for n in (8, 1)]
+        self.assertEqual(selection_key(rows[0]), selection_key(rows[1]))
+        self.assertIs(max(rows, key=selection_key), rows[0])
 
     def test_invalid_inputs_are_rejected_before_casting(self):
         for X in ([], np.zeros((2, 7)), np.full((2, 8), np.nan), np.full((2, 8), 1.1)):
@@ -245,7 +338,7 @@ class ParetoTests(unittest.TestCase):
 
     def test_archive_keeps_only_nondominated_solutions(self):
         rng = np.random.default_rng(9)
-        positions, objectives = rng.random((20, 9)), rng.random((20, 3))
+        positions, objectives = rng.random((20, 9)), rng.random((20, 2))
         archive = ParetoArchive(20)
         archive.update(positions[:10], objectives[:10])
         archive.update(positions, objectives)
@@ -325,6 +418,7 @@ class OptimizerTests(unittest.TestCase):
                         with patch.object(logger, "save_plots"):
                             archive = optimizer.run()
                         self.assertTrue(0 < len(archive) <= 8)
+                        self.assertEqual(archive.objectives.shape[1], 2)
                         self.assertEqual(len(logger.history), 4)
                         expected = 42 if optimizer_type is IBGWO4 else 24
                         if optimizer_type is MOHHO:
@@ -367,6 +461,9 @@ class OptimizerTests(unittest.TestCase):
                                 r["num_features"] == len(r["selected_features"])
                                 for r in rows
                             )
+                        )
+                        np.testing.assert_array_equal(
+                            optimizer._evaluate(np.zeros(9)), [1, 1]
                         )
                         results.append(
                             (archive.positions.copy(), archive.objectives.copy())
@@ -467,7 +564,32 @@ class ExperimentTests(unittest.TestCase):
         self.assertEqual(selected["candidate"], separating.tolist())
         self.assertEqual(selected["metrics"]["balanced_accuracy"], 1)
         results = score_candidates([always_positive], Fitness(X), y, "noisy_or")
-        self.assertEqual(max(results, key=selection_key)["model"], "constant_1")
+        self.assertEqual(max(results, key=selection_key)["model"], "candidate")
+
+    def test_physical_quadratic_pipeline_exports_reusable_candidates(self):
+        schema = dict(feature_encoding="physical_v1", normalization_id="a" * 64,
+                      normalization_scales=dict.fromkeys(FEATURES, 1.))
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
+            path = Path(tmp) / "data.jsonl"
+            path.write_text("\n".join(json.dumps(row | schema) for row in self.records()))
+            for optimizer_type, config_type, logger_type in ALGORITHMS:
+                with self.subTest(algorithm=optimizer_type.__name__), patch.object(logger_type, "save_plots"):
+                    report = run_experiment(
+                        optimizer_type, logger_type,
+                        config_type(dimensions=33, population_size=6, generations=3),
+                        path, tmp, method="physical_quadratic",
+                    )
+                    run_dir = Path(report["output_dir"])
+                    exported = json.loads((run_dir / "evaluation.json").read_text())
+                    self.assertEqual(exported["fitness_method"], "physical_quadratic")
+                    manifest = json.loads((run_dir / "split.json").read_text())
+                    X, y = load_jsonl(path)
+                    test = manifest["splits"]["test"]["sample_indices"]
+                    selected = exported["selected_model"]
+                    prediction = (Fitness(X[test]).physical_quadratic(selected["candidate"])
+                                  if selected["model"] == "candidate"
+                                  else np.full(len(test), selected["constant_label"]))
+                    self.assertEqual(exported["test_metrics"], classification_metrics(y[test], prediction))
 
     def test_all_entrypoint_pipelines_report_held_out_metrics(self):
         records = self.records()
@@ -503,6 +625,7 @@ class ExperimentTests(unittest.TestCase):
                 self.assertEqual(report['fitness_method'], 'cooccurrence')
                 config = json.loads((run_dir / 'config.json').read_text())
                 self.assertEqual(config['input_schema'], expected_schema)
+                self.assertEqual(config['objectives'], ['1 - recall', '1 - precision'])
                 X, y = load_jsonl(path)
                 test = manifest["splits"]["test"]["sample_indices"]
                 selected = report["selected_model"]
@@ -633,7 +756,7 @@ class TrainingRegressionTests(unittest.TestCase):
 
     def test_random_pareto_order_never_places_dominated_point_before_dominator(self):
         rng = np.random.default_rng(7)
-        objectives = rng.random((50, 3))
+        objectives = rng.random((50, 2))
         order = pareto_order(objectives)
         self.assertEqual(sorted(order.tolist()), list(range(50)))
         rank = np.argsort(order)

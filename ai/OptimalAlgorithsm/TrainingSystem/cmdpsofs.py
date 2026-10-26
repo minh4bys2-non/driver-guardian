@@ -46,7 +46,7 @@ def crowding_distance(objectives: np.ndarray) -> np.ndarray:
 class CMDPSOFSConfig:
     population_size: int = 50
     generations: int = 100
-    dimensions: int = 9
+    dimensions: int = 33
     inertia: float = 0.729
     cognitive: float = 1.49445
     social: float = 1.49445
@@ -61,9 +61,9 @@ class CMDPSOFSConfig:
             raise ValueError(
                 "population_size, generations and archive_size must be positive integers"
             )
-        if type(self.dimensions) is not int or self.dimensions != 9:
+        if type(self.dimensions) is not int or self.dimensions not in (9, 33):
             raise ValueError(
-                "Fitness requires 8 weights and 1 classification threshold"
+                "Fitness requires 9 parameters, or 33 for physical_quadratic"
             )
         coefficients = (self.inertia, self.cognitive, self.social, self.velocity_limit)
         if not np.isfinite(coefficients).all() or min(coefficients) < 0:
@@ -89,7 +89,7 @@ class ParetoArchive:
             raise ValueError("Archive size must be a positive integer")
         self.max_size = max_size
         self.positions = np.empty((0, 9), dtype=np.float32)
-        self.objectives = np.empty((0, 3), dtype=np.float32)
+        self.objectives = np.empty((0, 2), dtype=np.float32)
 
     def __len__(self):
         return len(self.positions)
@@ -99,13 +99,14 @@ class ParetoArchive:
         objectives = np.asarray(objectives, dtype=np.float32)
         if (
             positions.ndim != 2
-            or positions.shape[1] != 9
-            or objectives.shape != (len(positions), 3)
+            or positions.shape[1] not in (9, 33)
+            or (len(self) > 0 and positions.shape[1] != self.positions.shape[1])
+            or objectives.shape != (len(positions), 2)
             or not np.isfinite(positions).all()
             or not np.isfinite(objectives).all()
         ):
             raise ValueError(
-                "Archive requires finite positions [N,9] and objectives [N,3]"
+                "Archive requires finite positions [N,9] or [N,33] of consistent width and objectives [N,2]"
             )
         if len(self) == 0:
             all_positions = positions
@@ -171,7 +172,7 @@ class RunLogger:
         self.fitness, self.y_true, self.method = fitness, y_true, method
 
     def candidate_result(self, candidate):
-        mask = candidate[:8] >= 0.5
+        mask = candidate[:8] > 0
         return {
             "candidate": candidate.tolist(),
             "num_features": int(mask.sum()),
@@ -203,8 +204,8 @@ class RunLogger:
             "fitness_method": fitness_method,
             "n_samples": n_samples,
             "features": FEATURES,
-            "feature_selection_threshold": 0.5,
-            "objectives": ["1 - recall", "1 - precision", "num_feature / 8"],
+            "feature_weighting": "continuous; zero weight contributes nothing",
+            "objectives": ["1 - recall", "1 - precision"],
             "config": asdict(config),
         }
         with open(self.output_dir / "config.json", "w", encoding="utf-8") as f:
@@ -213,7 +214,7 @@ class RunLogger:
     def log_population(self, generation: int, particles: list[Particle]):
         with open(self.population_log, "a", encoding="utf-8") as f:
             for i, p in enumerate(particles):
-                mask = p.position[:8] >= 0.5
+                mask = p.position[:8] > 0
                 row = {
                     "generation": generation,
                     "particle": i,
@@ -233,7 +234,7 @@ class RunLogger:
         pop_obj = np.vstack([p.objectives for p in particles])
         recall = 1.0 - archive.objectives[:, 0]
         precision = 1.0 - archive.objectives[:, 1]
-        num_features = (archive.positions[:, :8] >= 0.5).sum(axis=1)
+        num_features = (archive.positions[:, :8] > 0).sum(axis=1)
         ideal_distance = np.linalg.norm(archive.objectives, axis=1)
 
         row = {
@@ -266,7 +267,7 @@ class RunLogger:
             for idx in order:
                 candidate = archive.positions[idx]
                 obj = archive.objectives[idx]
-                mask = candidate[:8] >= 0.5
+                mask = candidate[:8] > 0
                 row = {
                     "evaluation_scope": "train; archive order is not final model selection",
                     "metrics": results[idx]["metrics"],
@@ -275,7 +276,7 @@ class RunLogger:
                     "recall": float(1.0 - obj[0]),
                     "precision": float(1.0 - obj[1]),
                     "num_features": int(mask.sum()),
-                    "num_feature_ratio": float(obj[2]),
+                    "num_feature_ratio": float(mask.mean()),
                     "selected_features": [FEATURES[j] for j in np.flatnonzero(mask)],
                     "classification_threshold": float(candidate[8]),
                 }
@@ -302,7 +303,7 @@ class RunLogger:
         self._line_plot(
             generations,
             [x["representative"]["num_features"] for x in self.history],
-            "Train representative selected features",
+            "Train representative nonzero feature weights",
             "Number of features",
             "convergence_num_features.png",
         )
@@ -330,28 +331,27 @@ class RunLogger:
     def _pareto_plot(self, archive):
         recall = 1.0 - archive.objectives[:, 0]
         precision = 1.0 - archive.objectives[:, 1]
-        num_features = (archive.positions[:, :8] >= 0.5).sum(axis=1)
-        fig = plt.figure(figsize=(8, 6))
-        ax = fig.add_subplot(111, projection="3d")
-        ax.scatter(recall, precision, num_features)
+        num_features = (archive.positions[:, :8] > 0).sum(axis=1)
+        fig, ax = plt.subplots(figsize=(8, 6))
+        points = ax.scatter(recall, precision, c=num_features)
+        fig.colorbar(points, ax=ax, label="Num features (diagnostic)")
         ax.set_xlabel("Recall")
         ax.set_ylabel("Precision")
-        ax.set_zlabel("Num features")
         ax.set_title("Final Pareto archive")
         fig.tight_layout()
-        fig.savefig(self.output_dir / "pareto_final_3d.png", dpi=160)
+        fig.savefig(self.output_dir / "pareto_final_2d.png", dpi=160)
         plt.close(fig)
 
     def _feature_frequency_plot(self, archive):
-        selected = archive.positions[:, :8] >= 0.5
+        selected = archive.positions[:, :8] > 0
         frequency = selected.mean(axis=0)
         fig, ax = plt.subplots(figsize=(10, 5))
         ax.bar(np.arange(8), frequency)
         ax.set_xticks(np.arange(8))
         ax.set_xticklabels(FEATURES, rotation=35, ha="right")
         ax.set_ylim(0.0, 1.0)
-        ax.set_ylabel("Selection frequency")
-        ax.set_title("Feature selection frequency in Pareto archive")
+        ax.set_ylabel("Nonzero weight frequency")
+        ax.set_title("Nonzero feature weight frequency in Pareto archive")
         fig.tight_layout()
         fig.savefig(self.output_dir / "feature_selection_frequency.png", dpi=160)
         plt.close(fig)
@@ -360,8 +360,8 @@ class RunLogger:
 class CMDPSOFS:
     """
     Candidate: [w1, ..., w8, T_cls] in [0, 1]^9.
-    Feature j is active iff wj >= 0.5.
-    Objectives (minimize): [1-Recall, 1-Precision, NumFeature/8].
+    All eight features contribute according to their weights.
+    Objectives (minimize): [1-Recall, 1-Precision].
 
     Mutation groups:
       group 0: no mutation
@@ -372,8 +372,10 @@ class CMDPSOFS:
     def __init__(self, fitness, y_true, method, config, logger):
         self.fitness = fitness
         self.y_true = validate_labels(y_true, len(fitness.X))
-        if method not in ("weighted_mean", "noisy_or", "cooccurrence"):
+        if method not in ("weighted_mean", "noisy_or", "cooccurrence", "physical_quadratic"):
             raise ValueError(f"Unknown fitness method: {method}")
+        if config.dimensions != (33 if method == "physical_quadratic" else 9):
+            raise ValueError("Candidate dimensions do not match fitness method")
         self.method = method
         self.cfg = config
         self.logger = logger
@@ -386,10 +388,9 @@ class CMDPSOFS:
 
     def _evaluate(self, candidate):
         self.evaluations += 1
-        # Invalid: no selected feature. Penalize all objectives so it cannot
-        # exploit NumFeature=0 and survive on the Pareto front.
-        if not np.any(candidate[:8] >= 0.5):
-            return np.ones(3, dtype=np.float32)
+        # All-zero weights provide no signal.
+        if not np.any(candidate[:8] > 0):
+            return np.ones(2, dtype=np.float32)
         y_pred = self.fitness.predict(candidate, method=self.method)
         return self.fitness.evaluate(candidate, y_pred, self.y_true)
 
@@ -511,9 +512,9 @@ if __name__ == "__main__":
     # ============================================================
 
     OUTPUT_DIR = Path(__file__).resolve().parent / "output" / "cmdpsofs"
-
+    # cooccurrence, weighted_mean, noisy_or
     # Must match a method implemented in Fitness.
-    FITNESS_METHOD = "cooccurrence"
+    FITNESS_METHOD = "physical_quadratic"
 
     CONFIG = CMDPSOFSConfig(
         population_size=50,

@@ -37,6 +37,16 @@ Resume khôi phục weights, optimizer, scheduler, AMP scaler, best weights và 
 
 Dataset dùng `dataset_merged_split.csv` với các cột `processed_path`, `binary_label`, `clip_id`, `split`, `subject_id`, hoặc thư mục `train|val|test/0_alert|1_drowsy/*.mp4`. Manifest trên máy chủ cũng được hỗ trợ với các cột `rel_path`, `label`, `video_id`, `split` và tùy chọn `subject_id`, `orig_path`. `rel_path` trỏ tới clip đã xử lý, tương đối với `dataset_dir`; `orig_path` dùng làm định danh video gốc để kiểm tra leakage, không dùng để mở clip. Đường dẫn Windows được đổi dấu phân cách khi đọc trên Linux. Train/val/test phải khác subject. Video quá ngắn hoặc FPS thấp bị loại trước khi train; lỗi decode khi đọc sẽ dừng run và ghi traceback vào log.
 
+Finetune trên dataset mới cùng cấu trúc: sửa `CHECKPOINT`, `DATASET_DIR`, `SAVE_DIR` trực tiếp trong `src/finetune.py`, rồi chạy từ thư mục gốc dự án:
+
+`FINETUNE_CONFIG` cho phép chỉnh `batch_size`, `epochs`, `warmup_epochs`, `num_workers`, `accumulation`, `device`, `amp`. Giá trị `None` giữ cấu hình checkpoint; ví dụ `batch_size=2`, `epochs=20`, `warmup_epochs=2`. LR vẫn tự lấy bằng 1/10 LR cũ và CNN luôn đóng băng.
+
+```bash
+python -m ai.LSTM.src.finetune
+```
+
+Nạp toàn bộ trọng số classifier từ `best.pt` hoặc `last.pt` định dạng hiện tại, giữ backbone/neck và BatchNorm đóng băng. LR bằng **1/10 LR trong checkpoint** (ví dụ `3e-4` → `3e-5`); optimizer, scheduler, AMP scaler và epoch bắt đầu mới. Kiến trúc, preprocessing và các thiết lập train khác kế thừa checkpoint. Không cần file detector pretrained gốc. `save_dir` phải mới/rỗng; muốn tiếp tục run finetune bị gián đoạn, dùng `training --resume /path/to/finetuned/last.pt`.
+
 Mặc định lấy cửa sổ 10 giây ở 5 FPS (50 frame), RGB uint8, letterbox 224 px rồi chia 255 trong model. Train chọn cửa sổ ngẫu nhiên thiên về cuối video; val/test lấy cửa sổ giữa cố định. Augmentation nhất quán giữa các frame, chỉ dùng cho train.
 
 Gradient accumulation chuẩn hóa theo số mẫu thực tế, kể cả batch cuối nhỏ hơn. `gradient_checkpointing` không dùng khi scratch vì recompute sẽ cập nhật BatchNorm lần thứ hai; frozen không cần giữ đồ thị backbone. `chunk_size` giới hạn số frame đi qua backbone trong mỗi lượt forward.

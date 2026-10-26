@@ -1,0 +1,114 @@
+{
+  "fitness_method": "cooccurrence",
+  "input_schema": {
+    "features": [
+      "blink_frequency",
+      "blink_duration",
+      "perclos",
+      "yawn_frequency",
+      "nod_duration",
+      "nod_frequency",
+      "dominant_head_motion_frequency",
+      "neuralnetwork_score"
+    ],
+    "feature_encoding": "physical_v1",
+    "normalization_id": "4c1c8e218c32090b8158ebda143dde01a45e9008ebc1d50f7299dd40e964d447",
+    "normalization_scales": {
+      "blink_frequency": 604.0,
+      "blink_duration": 2000,
+      "perclos": 1.0,
+      "yawn_frequency": 18.0,
+      "nod_duration": 3.5,
+      "nod_frequency": 78.0,
+      "dominant_head_motion_frequency": 15.0,
+      "neuralnetwork_score": 1.0
+    }
+  },
+  "selected_model": {
+    "model": "candidate",
+    "candidate": [
+      0.004448125138878822,
+      1.0,
+      0.08867932856082916,
+      0.0,
+      0.0,
+      0.964985728263855,
+      0.0,
+      0.0,
+      0.08379761874675751
+    ],
+    "num_features": 4,
+    "selected_features": [
+      "blink_frequency",
+      "blink_duration",
+      "perclos",
+      "nod_frequency"
+    ]
+  },
+  "validation_metrics": {
+    "tp": 194,
+    "tn": 159,
+    "fp": 61,
+    "fn": 30,
+    "recall": 0.8660714285714286,
+    "precision": 0.7607843137254902,
+    "specificity": 0.7227272727272728,
+    "false_positive_rate": 0.2772727272727273,
+    "balanced_accuracy": 0.7943993506493507,
+    "f1": 0.8100208768267223,
+    "accuracy": 0.795045045045045,
+    "predicted_positive": 255,
+    "constant_prediction": false
+  },
+  "validation_beats_constant_baseline": true,
+  "test_metrics": {
+    "tp": 203,
+    "tn": 106,
+    "fp": 134,
+    "fn": 25,
+    "recall": 0.8903508771929824,
+    "precision": 0.6023738872403561,
+    "specificity": 0.44166666666666665,
+    "false_positive_rate": 0.5583333333333333,
+    "balanced_accuracy": 0.6660087719298246,
+    "f1": 0.7185840707964601,
+    "accuracy": 0.6602564102564102,
+    "predicted_positive": 337,
+    "constant_prediction": false
+  },
+  "test_baselines": {
+    "constant_0": {
+      "tp": 0,
+      "tn": 240,
+      "fp": 0,
+      "fn": 228,
+      "recall": 0.0,
+      "precision": 0.0,
+      "specificity": 1.0,
+      "false_positive_rate": 0.0,
+      "balanced_accuracy": 0.5,
+      "f1": 0.0,
+      "accuracy": 0.5128205128205128,
+      "predicted_positive": 0,
+      "constant_prediction": true
+    },
+    "constant_1": {
+      "tp": 228,
+      "tn": 0,
+      "fp": 240,
+      "fn": 0,
+      "recall": 1.0,
+      "precision": 0.48717948717948717,
+      "specificity": 0.0,
+      "false_positive_rate": 1.0,
+      "balanced_accuracy": 0.5,
+      "f1": 0.6551724137931034,
+      "accuracy": 0.48717948717948717,
+      "predicted_positive": 468,
+      "constant_prediction": true
+    }
+  },
+  "evaluations": 7074,
+  "elapsed_seconds": 10.918919567000103,
+  "output_dir": "/home/tranmanhduy/Workspace/ptithcm/driver-guardian/ai/OptimalAlgorithsm/TrainingSystem/output/mohho/mohho_cooccurrence"
+}

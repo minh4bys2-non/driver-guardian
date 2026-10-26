@@ -1,4 +1,6 @@
-"""Giữ cửa sổ [0,60), [60,120), ... có sẵn trong JSONL bước 10 giây."""
+"""Tiện ích dữ liệu cũ 60 giây, không chuyển số đo thành cửa sổ 30 giây.
+
+Giữ cửa sổ [0,60), [60,120), ... có sẵn trong JSONL bước 10 giây."""
 
 import json
 import math

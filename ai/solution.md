@@ -69,7 +69,7 @@ Các tham số quan trọng mặc định:
 
 | Nhóm | Tham số | Giá trị |
 | --- | --- | --- |
-| Timeline | `fps`, `window_sec`, `max_gap_sec` | 30 FPS; 60 giây; 0,25 giây |
+| Timeline | `fps`, `window_sec`, `max_gap_sec` | 30 FPS; 30 giây; 0,25 giây |
 | Khởi tạo HMM | `init_duration_sec` | 5 giây quy đổi thành 150 mẫu hợp lệ |
 | Cập nhật HMM | `adapt_interval`, `learning_rate` | 300 mẫu; 0,01 |
 | Thời lượng sự kiện | `blink_duration_ms` | 100–2.000 ms |
@@ -79,7 +79,7 @@ Các tham số quan trọng mặc định:
 | Gật đầu | `nod_pitch_deg`, `nod_release_deg` | Vào ở trên 14°; giữ khi còn trên 8° |
 | Vượt góc | `angle_limits` | Pitch 20°, yaw 25°, roll 20° |
 | FFT | `head_motion_min_amplitude_deg` | Biên độ đỉnh–đỉnh phải lớn hơn 0,1° |
-| DataSystem | `stride_sec`, `min_observed_ratio` | 60 giây; 0,8 |
+| DataSystem | `stride_sec`, `min_observed_ratio` | 30 giây; 0,8 |
 | Nhánh mạng | `neural_sec`, `neural_fps`, `neural_size` | 10 giây; 5 FPS; 224 |
 | Tổng hợp | `blink_duration_percentile`, `nod_duration_percentile` | P90; P100, tức max |
 
@@ -370,11 +370,11 @@ Chỉ khi cửa sổ đạt điều kiện chất lượng, `NeuralNetwork` mớ
 
 ### 9.3. Cửa sổ và stride
 
-Mặc định `window_sec=60`, `stride_sec=60`:
+Mặc định `window_sec=30`, `stride_sec=30`:
 
 ```text
-Mẫu 1: frame thuộc [0,60),   ảnh mạng thuộc [50,60)
-Mẫu 2: frame thuộc [60,120), ảnh mạng thuộc [110,120)
+Mẫu 1: frame thuộc [0,30),   ảnh mạng thuộc [20,30)
+Mẫu 2: frame thuộc [30,60), ảnh mạng thuộc [50,60)
 Mẫu 3: frame thuộc [120,180), ảnh mạng thuộc [170,180)
 ```
 
@@ -397,12 +397,12 @@ Trước suy luận mạng, Engine yêu cầu:
 
 1. HMM mắt và miệng đã khởi tạo; đầu đã hiệu chuẩn.
 2. PERCLOS tồn tại.
-3. Thời gian quan sát mắt, miệng, đầu đều hữu hạn và đạt ít nhất `window_sec × min_observed_ratio` — mặc định 48 giây.
+3. Thời gian quan sát mắt, miệng, đầu đều hữu hạn và đạt ít nhất `window_sec × min_observed_ratio` — mặc định 24 giây.
 4. Tần số FFT và độ phân giải hữu hạn, dương; thời gian quan sát FFT liên tục đủ cửa sổ chuyển động đầu.
 
 Sau suy luận, score mạng phải hữu hạn trong `[0,1]`. Các số đo đưa vào chuẩn hóa phải hợp lệ và trong cận bộ đo.
 
-Cửa sổ đầu `[0,60)` thường chưa đủ điều kiện FFT: frame cuối mới ở 59,9667 giây và còn thời gian hiệu chuẩn đầu. Với stride 60 giây, `[60,120)` là cửa sổ tiếp theo có thể được giữ nếu tín hiệu liên tục.
+Cửa sổ đầu `[0,30)` thường chưa đủ điều kiện FFT: frame cuối mới ở 29,9667 giây và còn thời gian hiệu chuẩn đầu. Với stride 30 giây, `[30,60)` là cửa sổ tiếp theo có thể được giữ nếu tín hiệu liên tục.
 
 Đầu đứng yên hoặc chuyển động quá nhỏ cũng có thể không có tần số FFT và khiến cả mẫu bị loại. Đây là hạn chế của bộ lọc hiện tại; không có tần số không đồng nghĩa nguy hiểm hoặc không nguy hiểm. Khi so sánh dataset cần báo cáo số cửa sổ bị loại để thấy ảnh hưởng của điều kiện này.
 
@@ -457,7 +457,7 @@ U_fft = max(3, ceil(W_motion × F)) / (2 × W_motion)
 z_fft = frequency_hz / U_fft
 ```
 
-Công thức bao trường hợp ít nhất bốn điểm FFT và việc làm tròn lưới nội suy. Với W=60 giây, F=30 FPS, U vẫn là 15 Hz; tần số 0,1 Hz được đổi thành khoảng 0,006667.
+Công thức bao trường hợp ít nhất bốn điểm FFT và việc làm tròn lưới nội suy. Với W=30 giây, F=30 FPS, U vẫn là 15 Hz; tần số 0,1 Hz được đổi thành khoảng 0,006667.
 
 Đây là cận của phép tính trên lưới lấy mẫu. Video nguồn FPS thấp được lặp frame lên 30 FPS không tự có thêm thông tin chuyển động thật.
 
@@ -483,7 +483,7 @@ Mỗi dòng đầu ra có tám đặc trưng chuẩn hóa và metadata:
 | `start_second`, `end_second` | Biên đoạn frame theo lịch xuất mẫu |
 | `label` | Nhãn 0/1 từ manifest |
 
-Output mặc định là `ai/OptimalAlgorithsm/drowsiness_physical_60.jsonl`. Resume kiểm tra encoding, mã cấu hình, hệ số, lịch cửa sổ, nhãn và trùng lặp trước khi nối dữ liệu. Nó đọc lại video từ đầu để tái lập trạng thái detector, bỏ qua suy luận mạng ở các cửa sổ đã lưu.
+Output mặc định là `ai/OptimalAlgorithsm/drowsiness_physical_30.jsonl`. Resume kiểm tra encoding, mã cấu hình, hệ số, lịch cửa sổ, nhãn và trùng lặp trước khi nối dữ liệu. Nó đọc lại video từ đầu để tái lập trạng thái detector, bỏ qua suy luận mạng ở các cửa sổ đã lưu.
 
 `normalization_id` không bao gồm nội dung checkpoint hoặc mã nguồn. Để tái lập đầy đủ cần lưu thêm phiên bản mã, checkpoint và manifest. Không thể phục hồi chính xác số đo từ JSONL risk cũ vì ánh xạ cũ có bão hòa và nhiều giá trị chung một điểm; cần trích xuất lại từ video.
 

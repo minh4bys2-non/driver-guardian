@@ -1,0 +1,62 @@
+{
+  "algorithm": "MOHHO-style continuous multi-objective Harris hawks optimization",
+  "reference": "https://bseujert.bilecik.edu.tr/index.php/bseujert/article/view/14",
+  "leader_selection": "archive crowding-distance roulette",
+  "archive_truncation": "remove minimum crowding distance",
+  "dive_selection": "uniform among nondominated parent, Y and Z",
+  "data_path": "/home/tranmanhduy/Workspace/ptithcm/driver-guardian/ai/OptimalAlgorithsm/DataSystem/drowsiness_physical_30.jsonl",
+  "evaluation_scope": "train optimization; validation model selection; held-out test",
+  "fitness_method": "weighted_mean",
+  "n_samples": 1369,
+  "features": [
+    "blink_frequency",
+    "blink_duration",
+    "perclos",
+    "yawn_frequency",
+    "nod_duration",
+    "nod_frequency",
+    "dominant_head_motion_frequency",
+    "neuralnetwork_score"
+  ],
+  "feature_weighting": "continuous; zero weight contributes nothing",
+  "objectives": [
+    "1 - recall",
+    "1 - precision"
+  ],
+  "config": {
+    "population_size": 50,
+    "generations": 100,
+    "dimensions": 9,
+    "archive_size": 100,
+    "levy_beta": 1.5,
+    "levy_scale": 0.01,
+    "seed": 42
+  },
+  "n_samples_total": 2281,
+  "split_manifest": "split.json",
+  "input_schema": {
+    "features": [
+      "blink_frequency",
+      "blink_duration",
+      "perclos",
+      "yawn_frequency",
+      "nod_duration",
+      "nod_frequency",
+      "dominant_head_motion_frequency",
+      "neuralnetwork_score"
+    ],
+    "feature_encoding": "physical_v1",
+    "normalization_id": "4c1c8e218c32090b8158ebda143dde01a45e9008ebc1d50f7299dd40e964d447",
+    "normalization_scales": {
+      "blink_frequency": 604.0,
+      "blink_duration": 2000,
+      "perclos": 1.0,
+      "yawn_frequency": 18.0,
+      "nod_duration": 3.5,
+      "nod_frequency": 78.0,
+      "dominant_head_motion_frequency": 15.0,
+      "neuralnetwork_score": 1.0
+    }
+  },
+  "selection_rule": "validation balanced_accuracy, then f1; includes constant baselines"
+}

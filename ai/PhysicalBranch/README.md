@@ -898,7 +898,7 @@ Khoảng cách bin không phải sai số ước lượng được bảo đảm,
 
 `min_amplitude_deg` được so với `np.ptp(signal)=max(signal)-min(signal)`, không phải biên độ một phía $a$ trong công thức sin. Khi cửa sổ đã đầy nhưng tín hiệu gần như đứng yên, độ phân giải được trả về và tần số bằng `0 Hz`. `None` chỉ dùng khi chưa đủ dữ liệu; 0 biểu thị không phát hiện dao động trên ngưỡng biên độ.
 
-Mặc định phải có khoảng 60 giây pitch liên tục **sau khi** hiệu chuẩn đầu hoàn tất. Một lần mất pose làm FFT phải tích lũy lại; HMM mắt sẵn sàng sau 300 mẫu không đồng nghĩa FFT cũng đã sẵn sàng.
+Mặc định phải có khoảng 30 giây pitch liên tục **sau khi** hiệu chuẩn đầu hoàn tất. Một lần mất pose làm FFT phải tích lũy lại; HMM mắt sẵn sàng sau 300 mẫu không đồng nghĩa FFT cũng đã sẵn sàng.
 
 ### 11.8. Vì sao dùng pitch có dấu?
 

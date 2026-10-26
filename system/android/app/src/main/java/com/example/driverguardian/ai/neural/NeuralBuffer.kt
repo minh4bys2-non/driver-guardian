@@ -91,6 +91,7 @@ class NeuralBuffer(
     private var previousRawBytes = ByteArray(config.defaultSourceRgbaBytes)
     private var previousWidth = config.defaultSourceWidth
     private var previousHeight = config.defaultSourceHeight
+    private var previousRotationDegrees = 0
     private var previousChwCache: ByteArray? = null
     private var hasPrevious = false
     private var previousTime: Double? = null
@@ -110,6 +111,7 @@ class NeuralBuffer(
         previousChwCache = null
         hasPrevious = false
         previousTime = null
+        previousRotationDegrees = 0
         nextTime = 0.0
         generation += 1L
         seqCounter = 0L
@@ -119,7 +121,13 @@ class NeuralBuffer(
      * Cập nhật từ khung hình RGBA trên Luồng 1B.
      * Trả về số lần thực thi `letterbox` trong lời gọi này (0 nếu không chạm mốc lưới 5.0 FPS).
      */
-    fun updateFromRgba(rgbaBytes: ByteArray, width: Int, height: Int, timestamp: Double): Int {
+    fun updateFromRgba(
+        rgbaBytes: ByteArray,
+        width: Int,
+        height: Int,
+        timestamp: Double,
+        rotationDegrees: Int = 0
+    ): Int {
         if (previousTime == null || timestamp - previousTime!! > config.maxGapSec) {
             frames.clear()
             nextTime = timestamp
@@ -140,7 +148,8 @@ class NeuralBuffer(
                     previousChwCache = letterboxProcessor.convertRgbaToRgbCHW(
                         previousRawBytes,
                         previousWidth,
-                        previousHeight
+                        previousHeight,
+                        previousRotationDegrees
                     )
                     conversionsThisStep++
                     totalLetterboxConversions++
@@ -148,7 +157,12 @@ class NeuralBuffer(
                 previousChwCache!!
             } else {
                 if (currentChwCache == null) {
-                    currentChwCache = letterboxProcessor.convertRgbaToRgbCHW(rgbaBytes, width, height)
+                    currentChwCache = letterboxProcessor.convertRgbaToRgbCHW(
+                        rgbaBytes,
+                        width,
+                        height,
+                        rotationDegrees
+                    )
                     conversionsThisStep++
                     totalLetterboxConversions++
                 }
@@ -171,6 +185,7 @@ class NeuralBuffer(
         System.arraycopy(rgbaBytes, 0, previousRawBytes, 0, copyLen)
         previousWidth = width
         previousHeight = height
+        previousRotationDegrees = rotationDegrees
         previousChwCache = currentChwCache
         hasPrevious = true
         previousTime = timestamp
@@ -187,7 +202,7 @@ class NeuralBuffer(
         height: Int,
         timestampSec: Double,
         rotationDegrees: Int = 0,
-    ): Boolean = updateFromRgba(rgbaBytes, width, height, timestampSec) > 0
+    ): Boolean = updateFromRgba(rgbaBytes, width, height, timestampSec, rotationDegrees) > 0
 
     fun snapshot(): NeuralWindowSnapshot = NeuralWindowSnapshot(
         generation = generation,

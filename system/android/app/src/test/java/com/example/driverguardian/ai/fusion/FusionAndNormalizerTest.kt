@@ -22,7 +22,7 @@ class FusionAndNormalizerTest {
             FusionConfig.FEATURE_BLINK_FREQUENCY to 301.0, // 301 / 602 = 0.5
             FusionConfig.FEATURE_BLINK_DURATION to 1000.0, // 1000 / 2000 = 0.5
             FusionConfig.FEATURE_PERCLOS to 0.25, // 0.25 / 1.0 = 0.25
-            FusionConfig.FEATURE_YAWN_FREQUENCY to 34.0, // 34 / 17 = 2.0 -> clipped to 1.0
+            FusionConfig.FEATURE_YAWN_FREQUENCY to 17.0, // 17 / 17 = 1.0
             FusionConfig.FEATURE_NOD_DURATION to 1.75, // 1.75 / 3.5 = 0.5
             FusionConfig.FEATURE_NOD_FREQUENCY to 77.0, // 77 / 77 = 1.0
             FusionConfig.FEATURE_DOMINANT_HEAD_MOTION_FREQUENCY to 3.0, // 3 / 15 = 0.2
@@ -40,6 +40,22 @@ class FusionAndNormalizerTest {
         assertEquals(0.8, norm.getValue(FusionConfig.FEATURE_NEURALNETWORK_SCORE), 1e-9)
     }
 
+    @Test(expected = IllegalArgumentException::class)
+    fun `PhysicalNormalizer throws when raw feature exceeds detector bound`() {
+        val normalizer = PhysicalNormalizer()
+        val raw = mapOf(
+            FusionConfig.FEATURE_BLINK_FREQUENCY to 301.0,
+            FusionConfig.FEATURE_BLINK_DURATION to 1000.0,
+            FusionConfig.FEATURE_PERCLOS to 0.25,
+            FusionConfig.FEATURE_YAWN_FREQUENCY to 34.0, // 34.0 > 17.0 + 1e-6 -> must throw
+            FusionConfig.FEATURE_NOD_DURATION to 1.75,
+            FusionConfig.FEATURE_NOD_FREQUENCY to 77.0,
+            FusionConfig.FEATURE_DOMINANT_HEAD_MOTION_FREQUENCY to 3.0,
+            FusionConfig.FEATURE_NEURALNETWORK_SCORE to 0.8,
+        )
+        normalizer.transform(raw)
+    }
+
     @Test
     fun `FitnessEvaluator computes exact weighted_mean, noisy_or, and cooccurrence`() {
         val evaluator = FitnessEvaluator()
@@ -50,16 +66,48 @@ class FusionAndNormalizerTest {
         val no = evaluator.score(x, candidate, FusionConfig.FUSION_NOISY_OR)
         val co = evaluator.score(x, candidate, FusionConfig.FUSION_COOCCURRENCE)
 
-        // All x_i = 0.5, w_i = 1.0:
+        // All x_i = 0.5, w_i = 1.0 -> z_i = 0.5 for all i in M (all 8 features selected)
         // weighted_mean = 0.5
         // noisy_or = 1 - (1 - 0.5)^8 = 1 - 1/256 = 0.99609375
-        // cooccurrence = each pair x_i * x_j = 0.25 -> weighted average of pairs = 0.25
+        // cooccurrence = s1 + (1 - s1) * (s1 * s2) = 0.5 + (1 - 0.5) * (0.5 * 0.5) = 0.5 + 0.125 = 0.625
         assertEquals(0.5, wm, 1e-9)
         assertEquals(1.0 - (1.0 / 256.0), no, 1e-9)
-        assertEquals(0.25, co, 1e-9)
+        assertEquals(0.625, co, 1e-9)
         assertEquals(1, evaluator.predict(x, candidate, FusionConfig.FUSION_WEIGHTED_MEAN))
         assertEquals(1, evaluator.predict(x, candidate, FusionConfig.FUSION_NOISY_OR))
-        assertEquals(0, evaluator.predict(x, candidate, FusionConfig.FUSION_COOCCURRENCE))
+        assertEquals(1, evaluator.predict(x, candidate, FusionConfig.FUSION_COOCCURRENCE))
+    }
+
+    @Test
+    fun `FitnessEvaluator respects selection mask w at least 0_5 and returns 0 when no features selected`() {
+        val evaluator = FitnessEvaluator()
+        val x = doubleArrayOf(0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8)
+        // Only feature 0 has w >= 0.5
+        val singleCandidate = doubleArrayOf(0.6, 0.2, 0.1, 0.0, 0.4, 0.3, 0.2, 0.1, 0.5)
+        // z_0 = 0.8 * 0.6 = 0.48, |M| == 1 -> s1 = 0.48, s2 = 0.0 -> score = 0.48
+        val coSingle = evaluator.score(x, singleCandidate, FusionConfig.FUSION_COOCCURRENCE)
+        assertEquals(0.48, coSingle, 1e-9)
+
+        // No features with w >= 0.5
+        val emptyCandidate = doubleArrayOf(0.4, 0.3, 0.2, 0.1, 0.4, 0.3, 0.2, 0.1, 0.5)
+        assertEquals(0.0, evaluator.score(x, emptyCandidate, FusionConfig.FUSION_COOCCURRENCE), 1e-9)
+        assertEquals(0, evaluator.predict(x, emptyCandidate, FusionConfig.FUSION_COOCCURRENCE))
+    }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun `PhysicalNormalizer throws when feature exceeds bound plus tolerance`() {
+        val normalizer = PhysicalNormalizer()
+        val invalidRaw = mapOf(
+            FusionConfig.FEATURE_BLINK_FREQUENCY to 602.1, // exceeds 602.0 + 1e-6
+            FusionConfig.FEATURE_BLINK_DURATION to 100.0,
+            FusionConfig.FEATURE_PERCLOS to 0.1,
+            FusionConfig.FEATURE_YAWN_FREQUENCY to 1.0,
+            FusionConfig.FEATURE_NOD_DURATION to 1.0,
+            FusionConfig.FEATURE_NOD_FREQUENCY to 1.0,
+            FusionConfig.FEATURE_DOMINANT_HEAD_MOTION_FREQUENCY to 1.0,
+            FusionConfig.FEATURE_NEURALNETWORK_SCORE to 0.5,
+        )
+        normalizer.transform(invalidRaw)
     }
 
     @Test
@@ -177,5 +225,24 @@ class FusionAndNormalizerTest {
         assertNotNull(activeEval.normalizedFeatures)
         assertNotNull(activeEval.fusionSummary)
         assertEquals(3, activeEval.fusionSummary!!.fusionDetails.size)
+
+        // 3. Post-60s but neural buffer has fewer than 50 frames -> WAITING_FOR_CAMERA_CLIP
+        val shortNeuralSnap = NeuralWindowSnapshot(
+            generation = 1L,
+            latestSeqId = 30L,
+            frames = List(30) { ByteArray(10) },
+        )
+        val shortEval = engine.evaluateWindow(
+            nowSec = 62.0,
+            elapsedSec = 62.0,
+            physicalMetrics = readyPhysical,
+            blinkDurationsMs = doubleArrayOf(150.0, 200.0, 300.0),
+            nodDurationsMs = doubleArrayOf(1200.0),
+            pitchSnapshot = pitchSnap,
+            neuralSnapshot = shortNeuralSnap,
+            neuralClassifier = fakeClassifier,
+        )
+        assertEquals(PipelineStatus.WAITING_FOR_CAMERA_CLIP, shortEval.status)
+        assertNull(shortEval.fusionSummary)
     }
 }

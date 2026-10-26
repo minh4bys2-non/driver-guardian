@@ -13,7 +13,7 @@ data class PhysicalBranchConfig(
     val angleLimits: DoubleArray = PhysicalConfig.DEFAULT_ANGLE_LIMITS_DEG.clone(), // Pitch, Yaw, Roll limits
     val nodPitchDeg: Double = PhysicalConfig.DEFAULT_NOD_PITCH_DEG,
     val nodReleaseDeg: Double = PhysicalConfig.DEFAULT_NOD_RELEASE_DEG,
-    val nodDirection: Int = PhysicalConfig.DEFAULT_NOD_DIRECTION,
+    val nodDirection: Int? = PhysicalConfig.DEFAULT_NOD_DIRECTION,
     val nodDurationMinMs: Double = PhysicalConfig.DEFAULT_NOD_DURATION_MIN_MS,
     val nodDurationMaxMs: Double = PhysicalConfig.DEFAULT_NOD_DURATION_MAX_MS,
     val maxGapSec: Double = PhysicalConfig.DEFAULT_MAX_GAP_SEC,
@@ -26,7 +26,7 @@ data class PhysicalBranchConfig(
 ) {
     init {
         require(calibrationFrames >= 1) { "Calibration frames must be >= 1" }
-        require(nodDirection == 1 || nodDirection == -1) { "Nod direction must be 1 or -1" }
+        require(nodDirection == null || nodDirection == 1 || nodDirection == -1) { "Nod direction must be null, 1 or -1" }
         require(nodReleaseDeg in 0.0..<nodPitchDeg) { "Nod release must be below the pitch threshold" }
         require(angleLimits.size == 3 && angleLimits.all { it > 0.0 && it.isFinite() }) {
             "Angle limits must contain three positive finite values"
@@ -66,7 +66,7 @@ data class PhysicalBranchConfig(
         result = 31 * result + angleLimits.contentHashCode()
         result = 31 * result + nodPitchDeg.hashCode()
         result = 31 * result + nodReleaseDeg.hashCode()
-        result = 31 * result + nodDirection
+        result = 31 * result + (nodDirection ?: 0)
         result = 31 * result + nodDurationMinMs.hashCode()
         result = 31 * result + nodDurationMaxMs.hashCode()
         result = 31 * result + maxGapSec.hashCode()

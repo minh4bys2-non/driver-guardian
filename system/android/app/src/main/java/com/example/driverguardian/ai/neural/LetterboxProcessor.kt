@@ -31,6 +31,7 @@ class LetterboxProcessor(
 
     private var openCvReady: Boolean = false
     private var srcRgbaMat: Mat? = null
+    private var rotatedRgbaMat: Mat? = null
     private var resizedRgbaMat: Mat? = null
     private var resizedRgbMat: Mat? = null
     private var canvasRgbMat: Mat? = null
@@ -41,6 +42,7 @@ class LetterboxProcessor(
             openCvReady = OpenCvInitializer.ensureInitialized()
             if (openCvReady) {
                 srcRgbaMat = Mat()
+                rotatedRgbaMat = Mat()
                 resizedRgbaMat = Mat()
                 resizedRgbMat = Mat()
                 canvasRgbMat = Mat(newSize, newSize, CvType.CV_8UC3, padScalar)
@@ -52,15 +54,23 @@ class LetterboxProcessor(
 
     /**
      * Biến đổi 1 frame RGBA (`width x height`) sang mảng phẳng RGB CHW `[3, newSize, newSize]` `uint8`.
-     * Tối ưu thứ tự: Resize RGBA (`640x480 -> 224x168`) trước rồi mới bỏ kênh Alpha!
+     * Tối ưu thứ tự: Xoay (nếu rotationDegrees != 0) -> Resize RGBA -> bỏ kênh Alpha -> Pad ROI.
      */
-    fun convertRgbaToRgbCHW(rgbaBytes: ByteArray, width: Int, height: Int): ByteArray {
+    fun convertRgbaToRgbCHW(
+        rgbaBytes: ByteArray,
+        width: Int,
+        height: Int,
+        rotationDegrees: Int = 0
+    ): ByteArray {
         val planeSize = config.planeSize
         val chwOut = ByteArray(config.chwBytesPerFrame)
 
-        val scale = min(newSize.toDouble() / height.toDouble(), newSize.toDouble() / width.toDouble())
-        val newW = max(1, (width * scale).roundToInt())
-        val newH = max(1, (height * scale).roundToInt())
+        val effWidth = if (rotationDegrees == 90 || rotationDegrees == 270) height else width
+        val effHeight = if (rotationDegrees == 90 || rotationDegrees == 270) width else height
+
+        val scale = min(newSize.toDouble() / effHeight.toDouble(), newSize.toDouble() / effWidth.toDouble())
+        val newW = max(1, (effWidth * scale).roundToInt())
+        val newH = max(1, (effHeight * scale).roundToInt())
         val padLeft = (newSize - newW) / 2
         val padTop = (newSize - newH) / 2
 
@@ -76,8 +86,27 @@ class LetterboxProcessor(
                 }
                 src.put(0, 0, rgbaBytes)
 
+                val effectiveSrc = when (rotationDegrees) {
+                    90 -> {
+                        val rotated = rotatedRgbaMat ?: Mat().also { rotatedRgbaMat = it }
+                        org.opencv.core.Core.rotate(src, rotated, org.opencv.core.Core.ROTATE_90_CLOCKWISE)
+                        rotated
+                    }
+                    180 -> {
+                        val rotated = rotatedRgbaMat ?: Mat().also { rotatedRgbaMat = it }
+                        org.opencv.core.Core.rotate(src, rotated, org.opencv.core.Core.ROTATE_180)
+                        rotated
+                    }
+                    270 -> {
+                        val rotated = rotatedRgbaMat ?: Mat().also { rotatedRgbaMat = it }
+                        org.opencv.core.Core.rotate(src, rotated, org.opencv.core.Core.ROTATE_90_COUNTERCLOCKWISE)
+                        rotated
+                    }
+                    else -> src
+                }
+
                 Imgproc.resize(
-                    src,
+                    effectiveSrc,
                     resizedRgba,
                     Size(newW.toDouble(), newH.toDouble()),
                     0.0,
@@ -105,7 +134,7 @@ class LetterboxProcessor(
             }
         }
 
-        return convertPureKotlinBilinear(rgbaBytes, width, height, newW, newH, padLeft, padTop, chwOut)
+        return convertPureKotlinBilinear(rgbaBytes, width, height, newW, newH, padLeft, padTop, chwOut, rotationDegrees)
     }
 
     private fun convertPureKotlinBilinear(
@@ -116,33 +145,49 @@ class LetterboxProcessor(
         newH: Int,
         padLeft: Int,
         padTop: Int,
-        chwOut: ByteArray
+        chwOut: ByteArray,
+        rotationDegrees: Int = 0
     ): ByteArray {
         val planeSize = config.planeSize
         chwOut.fill(padByte)
 
-        val scaleX = width.toDouble() / newW.toDouble()
-        val scaleY = height.toDouble() / newH.toDouble()
+        val effWidth = if (rotationDegrees == 90 || rotationDegrees == 270) height else width
+        val effHeight = if (rotationDegrees == 90 || rotationDegrees == 270) width else height
+
+        val scaleX = effWidth.toDouble() / newW.toDouble()
+        val scaleY = effHeight.toDouble() / newH.toDouble()
 
         for (dy in 0 until newH) {
             val fy = (dy + 0.5) * scaleY - 0.5
-            val y0 = fy.toInt().coerceIn(0, height - 1)
-            val y1 = (y0 + 1).coerceIn(0, height - 1)
-            val wy = (fy - y0).coerceIn(0.0, 1.0)
+            val ey0 = fy.toInt().coerceIn(0, effHeight - 1)
+            val ey1 = (ey0 + 1).coerceIn(0, effHeight - 1)
+            val wy = (fy - ey0).coerceIn(0.0, 1.0)
             val wy0 = 1.0 - wy
 
             val dstRow = (padTop + dy) * newSize
             for (dx in 0 until newW) {
                 val fx = (dx + 0.5) * scaleX - 0.5
-                val x0 = fx.toInt().coerceIn(0, width - 1)
-                val x1 = (x0 + 1).coerceIn(0, width - 1)
-                val wx = (fx - x0).coerceIn(0.0, 1.0)
+                val ex0 = fx.toInt().coerceIn(0, effWidth - 1)
+                val ex1 = (ex0 + 1).coerceIn(0, effWidth - 1)
+                val wx = (fx - ex0).coerceIn(0.0, 1.0)
                 val wx0 = 1.0 - wx
 
-                val i00 = (y0 * width + x0) * 4
-                val i01 = (y0 * width + x1) * 4
-                val i10 = (y1 * width + x0) * 4
-                val i11 = (y1 * width + x1) * 4
+                fun mapCoord(ex: Int, ey: Int): Pair<Int, Int> = when (rotationDegrees) {
+                    90 -> (width - 1 - ey) to ex
+                    180 -> (width - 1 - ex) to (height - 1 - ey)
+                    270 -> ey to (height - 1 - ex)
+                    else -> ex to ey
+                }
+
+                val (x00, y00) = mapCoord(ex0, ey0)
+                val (x01, y01) = mapCoord(ex1, ey0)
+                val (x10, y10) = mapCoord(ex0, ey1)
+                val (x11, y11) = mapCoord(ex1, ey1)
+
+                val i00 = (y00 * width + x00) * 4
+                val i01 = (y01 * width + x01) * 4
+                val i10 = (y10 * width + x10) * 4
+                val i11 = (y11 * width + x11) * 4
 
                 val dstIdx = dstRow + padLeft + dx
                 for (c in 0 until 3) {
@@ -164,6 +209,7 @@ class LetterboxProcessor(
     override fun close() {
         try {
             srcRgbaMat?.release()
+            rotatedRgbaMat?.release()
             resizedRgbaMat?.release()
             resizedRgbMat?.release()
             canvasRgbMat?.release()

@@ -56,6 +56,7 @@ class WindowEvaluationEngine(
     private val headMotionMinObservedSec: Double = FusionConfig.DEFAULT_HEAD_MOTION_MIN_OBSERVED_SEC,
     private val blinkDurationPercentile: Double = FusionConfig.DEFAULT_BLINK_DURATION_PERCENTILE,
     private val nodDurationPercentile: Double = FusionConfig.DEFAULT_NOD_DURATION_PERCENTILE,
+    private val requiredNeuralFrames: Int = FusionConfig.DEFAULT_REQUIRED_NEURAL_FRAMES,
     private val normalizer: PhysicalNormalizer = PhysicalNormalizer(),
     private val fitnessEvaluator: FitnessEvaluator = FitnessEvaluator(),
 ) {
@@ -118,14 +119,14 @@ class WindowEvaluationEngine(
             )
         }
 
-        if (neuralSnapshot.size == 0) {
+        if (neuralSnapshot.size < requiredNeuralFrames) {
             val workerTotalMs = (System.nanoTime() - workerStartNs) / 1_000_000.0
             return WindowEvaluationSnapshot(
                 evaluatedAtSec = nowSec,
                 elapsedSec = elapsedSec,
                 windowSec = windowSec,
                 status = PipelineStatus.WAITING_FOR_CAMERA_CLIP,
-                neuralBufferSize = 0,
+                neuralBufferSize = neuralSnapshot.size,
                 cachedP4Count = cachedP4Count,
                 latestDeltaFramesCount = deltaFramesCount,
                 latestNeuralScore = null,
@@ -137,7 +138,12 @@ class WindowEvaluationEngine(
                 rawFeatures = null,
                 normalizedFeatures = null,
                 fusionSummary = null,
-                lastSkipReason = "neural buffer empty",
+                lastSkipReason = String.format(
+                    java.util.Locale.US,
+                    "neural buffer frames (%d) < required (%d)",
+                    neuralSnapshot.size,
+                    requiredNeuralFrames,
+                ),
             )
         }
 
@@ -306,8 +312,9 @@ class WindowEvaluationEngine(
         if (metrics.perclosPct == null) {
             return "PERCLOS is null"
         }
+        val eps = FusionConfig.GATE_COVERAGE_EPSILON_SEC
         val eyeObs = metrics.eyeObservedSec ?: 0.0
-        if (eyeObs < minObservedSec) {
+        if (!eyeObs.isFinite() || eyeObs < minObservedSec - eps) {
             return String.format(
                 java.util.Locale.US,
                 "eye coverage %.1fs < %.1fs",
@@ -316,7 +323,7 @@ class WindowEvaluationEngine(
             )
         }
         val mouthObs = metrics.mouthObservedSec ?: 0.0
-        if (mouthObs < minObservedSec) {
+        if (!mouthObs.isFinite() || mouthObs < minObservedSec - eps) {
             return String.format(
                 java.util.Locale.US,
                 "mouth coverage %.1fs < %.1fs",
@@ -325,7 +332,7 @@ class WindowEvaluationEngine(
             )
         }
         val headObs = metrics.headObservedSec ?: 0.0
-        if (headObs < minObservedSec) {
+        if (!headObs.isFinite() || headObs < minObservedSec - eps) {
             return String.format(
                 java.util.Locale.US,
                 "head coverage %.1fs < %.1fs",
@@ -340,7 +347,8 @@ class WindowEvaluationEngine(
         if (headMotion == null) {
             return "head motion FFT snapshot unavailable"
         }
-        if (headMotion.observed < headMotionMinObservedSec) {
+        val eps = FusionConfig.GATE_COVERAGE_EPSILON_SEC
+        if (!headMotion.observed.isFinite() || headMotion.observed < headMotionMinObservedSec - eps) {
             return String.format(
                 java.util.Locale.US,
                 "head_motion.observed %.1fs < %.1fs",
@@ -349,12 +357,12 @@ class WindowEvaluationEngine(
             )
         }
         val freq = headMotion.frequency
-        if (freq == null || freq < 0.0) {
-            return "head_motion.frequency is null or negative"
+        if (freq == null || !freq.isFinite() || freq < 0.0) {
+            return "head_motion.frequency is null, non-finite, or negative"
         }
         val res = headMotion.resolution
-        if (res == null || res <= 0.0) {
-            return "head_motion.resolution is null or non-positive"
+        if (res == null || !res.isFinite() || res <= 0.0) {
+            return "head_motion.resolution is null, non-finite, or non-positive"
         }
         return null
     }

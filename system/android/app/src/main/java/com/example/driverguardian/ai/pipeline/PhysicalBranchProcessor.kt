@@ -204,7 +204,11 @@ class PhysicalBranchProcessor(
                 abs(normalizedAngles[2]) > config.angleLimits[2]
             overAngle = isOver
 
-            val pitchDown = config.nodDirection * normalizedAngles[0]
+            val pitchDown = if (config.nodDirection == null) {
+                abs(normalizedAngles[0])
+            } else {
+                config.nodDirection * normalizedAngles[0]
+            }
             val threshold = if (nodding) config.nodReleaseDeg else config.nodPitchDeg
             nodding = pitchDown > threshold
             nodState = if (nodding) 1 else 0

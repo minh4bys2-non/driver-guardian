@@ -84,6 +84,7 @@ class DriverMonitoringEngine(private val context: Context) : MonitoringEngineCon
     private val frameChannel = Channel<RgbaFramePacket>(Channel.CONFLATED)
     private val heavyEvalChannel = Channel<HeavyEvaluationRequest>(Channel.CONFLATED)
     private val inFlightPacketRef = AtomicReference<RgbaFramePacket?>(null)
+    private val isHeavyWorkerBusy = java.util.concurrent.atomic.AtomicBoolean(false)
 
     private var physicalConsumerJob: Job? = null
     private var heavyWorkerJob: Job? = null
@@ -102,13 +103,16 @@ class DriverMonitoringEngine(private val context: Context) : MonitoringEngineCon
         heavyWorkerJob = heavyWorkerScope.launch {
             ensureNeuralClassifierLoaded()
             for (request in heavyEvalChannel) {
-                runCatching {
+                isHeavyWorkerBusy.set(true)
+                try {
                     val classifier = ensureNeuralClassifierLoaded()
                     coordinator.runHeavyEvaluation(request, classifier)
-                }.onFailure { error ->
+                } catch (error: Throwable) {
                     ThreadDebugLogger.logHeavyWorker(
                         "Heavy evaluation failed: ${error.message ?: error.javaClass.simpleName}",
                     )
+                } finally {
+                    isHeavyWorkerBusy.set(false)
                 }
             }
         }
@@ -234,7 +238,9 @@ class DriverMonitoringEngine(private val context: Context) : MonitoringEngineCon
             inferenceMs = result.inferenceMs,
             ingestLatencyMs = packet?.ingestLatencyMs,
             onHeavyEvaluationDue = { request ->
-                heavyEvalChannel.trySend(request)
+                if (!isHeavyWorkerBusy.get()) {
+                    heavyEvalChannel.trySend(request)
+                }
             },
         )
     }

@@ -72,50 +72,62 @@ class FitnessEvaluator(
             }
         }
 
-        var weightSum = 0.0
+        // Selection mask M = { i in 0 until f | w[i] >= 0.5 } matching snapdragon_680_v2.md Section 6.3 & fitnessFunction.py
+        val selectedIndices = IntArray(f)
+        var selectedCount = 0
         for (i in 0 until f) {
-            weightSum += candidate[i]
+            if (candidate[i] >= FusionConfig.DEFAULT_CANDIDATE_SELECTION_THRESHOLD) {
+                selectedIndices[selectedCount++] = i
+            }
         }
-        if (weightSum <= FusionConfig.FITNESS_WEIGHT_EPSILON) {
+        if (selectedCount == 0) {
             return 0.0
         }
 
         return when (method) {
             FusionConfig.FUSION_WEIGHTED_MEAN -> {
-                var weightedSum = 0.0
-                for (i in 0 until f) {
-                    weightedSum += x[i] * candidate[i]
+                var zSum = 0.0
+                var wSum = 0.0
+                for (k in 0 until selectedCount) {
+                    val idx = selectedIndices[k]
+                    val w = candidate[idx]
+                    zSum += x[idx] * w
+                    wSum += w
                 }
-                weightedSum / max(weightSum, FusionConfig.FITNESS_WEIGHT_EPSILON)
+                if (wSum <= FusionConfig.FITNESS_WEIGHT_EPSILON) 0.0 else zSum / max(wSum, FusionConfig.FITNESS_WEIGHT_EPSILON)
             }
 
             FusionConfig.FUSION_NOISY_OR -> {
                 var survivalProduct = 1.0
-                for (i in 0 until f) {
-                    val clampedTerm = (1.0 - candidate[i] * x[i]).coerceIn(
+                for (k in 0 until selectedCount) {
+                    val idx = selectedIndices[k]
+                    val z = (x[idx] * candidate[idx]).coerceIn(
                         FusionConfig.NORMALIZER_LOWER_BOUND,
                         FusionConfig.NORMALIZER_UPPER_CLIP,
                     )
-                    survivalProduct *= clampedTerm
+                    survivalProduct *= (1.0 - z)
                 }
                 1.0 - survivalProduct
             }
 
             FusionConfig.FUSION_COOCCURRENCE -> {
-                var pairInteractionSum = 0.0
-                var pairWeightSum = 0.0
-                for (i in 0 until f) {
-                    for (j in (i + 1) until f) {
-                        val pairWeight = FusionConfig.COOCCURRENCE_PAIR_WEIGHT_FACTOR * (candidate[i] + candidate[j])
-                        pairInteractionSum += (x[i] * x[j]) * pairWeight
-                        pairWeightSum += pairWeight
+                // z_i = x_i * w_i for i in M.
+                // s1 = max(z), s2 = second_max(z) (or 0.0 if |M| == 1).
+                // score = s1 + (1.0 - s1) * (s1 * s2)
+                var strongest = 0.0
+                var secondStrongest = 0.0
+                for (k in 0 until selectedCount) {
+                    val idx = selectedIndices[k]
+                    val z = x[idx] * candidate[idx]
+                    if (z >= strongest) {
+                        secondStrongest = strongest
+                        strongest = z
+                    } else if (z > secondStrongest) {
+                        secondStrongest = z
                     }
                 }
-                if (pairWeightSum <= FusionConfig.FITNESS_WEIGHT_EPSILON) {
-                    0.0
-                } else {
-                    pairInteractionSum / max(pairWeightSum, FusionConfig.FITNESS_WEIGHT_EPSILON)
-                }
+                val joint = if (selectedCount > 1) strongest * secondStrongest else 0.0
+                strongest + (1.0 - strongest) * joint
             }
 
             else -> throw IllegalArgumentException("Unsupported fusion method: '$method'")

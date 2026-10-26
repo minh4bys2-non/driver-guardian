@@ -93,7 +93,7 @@ data class PhysicalConfig(
     val angleLimitsDeg: DoubleArray = DEFAULT_ANGLE_LIMITS_DEG.clone(),
     val nodPitchDeg: Double = DEFAULT_NOD_PITCH_DEG,
     val nodReleaseDeg: Double = DEFAULT_NOD_RELEASE_DEG,
-    val nodDirection: Int = DEFAULT_NOD_DIRECTION,
+    val nodDirection: Int? = DEFAULT_NOD_DIRECTION,
     val angleWrapPeriodDeg: Double = DEFAULT_ANGLE_WRAP_PERIOD_DEG,
     val angleWrapHalfPeriodDeg: Double = DEFAULT_ANGLE_WRAP_HALF_PERIOD_DEG,
 ) {
@@ -145,7 +145,7 @@ data class PhysicalConfig(
         const val DEFAULT_HMM_MIN_ADAPT_STATE_WEIGHT = 2.0
         const val DEFAULT_HMM_LOG_FLOOR = 1e-300
         const val DEFAULT_HMM_WEIGHT_FLOOR = 1e-12
-        const val DEFAULT_INIT_DURATION_SEC = 5.0
+        const val DEFAULT_INIT_DURATION_SEC = 10.0
         const val DEFAULT_MIN_INIT_FRAMES = 4
         const val DEFAULT_INIT_LOW_PERCENTILE = 5.0
         const val DEFAULT_INIT_HIGH_PERCENTILE = 95.0
@@ -172,7 +172,7 @@ data class PhysicalConfig(
         const val DEFAULT_MAX_GAP_SEC = 0.5
         const val DEFAULT_BLINK_DURATION_MIN_MS = 100.0
         const val DEFAULT_BLINK_DURATION_MAX_MS = 2000.0
-        const val DEFAULT_YAWN_DURATION_MIN_MS = 3500.0
+        const val DEFAULT_YAWN_DURATION_MIN_MS = 4000.0
         const val DEFAULT_YAWN_DURATION_MAX_MS = 7500.0
         const val DEFAULT_NOD_DURATION_MIN_MS = 800.0
         const val DEFAULT_NOD_DURATION_MAX_MS = 3500.0
@@ -194,7 +194,7 @@ data class PhysicalConfig(
         val DEFAULT_ANGLE_LIMITS_DEG = doubleArrayOf(20.0, 25.0, 20.0)
         const val DEFAULT_NOD_PITCH_DEG = 14.0
         const val DEFAULT_NOD_RELEASE_DEG = 8.0
-        const val DEFAULT_NOD_DIRECTION = 1
+        val DEFAULT_NOD_DIRECTION: Int? = 1
         const val DEFAULT_ANGLE_WRAP_PERIOD_DEG = 360.0
         const val DEFAULT_ANGLE_WRAP_HALF_PERIOD_DEG = 180.0
 

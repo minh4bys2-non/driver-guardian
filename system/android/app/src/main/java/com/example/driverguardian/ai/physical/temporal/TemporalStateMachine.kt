@@ -55,6 +55,8 @@ class TemporalStateMachine(
         private set
     var lastValidDuration: Double? = null
         private set
+    var armed: Boolean = false
+        private set
     val events = ArrayDeque<Double>()
 
     fun reset() {
@@ -62,6 +64,7 @@ class TemporalStateMachine(
         start = null
         lastDuration = 0.0
         lastValidDuration = null
+        armed = false
         events.clear()
     }
 
@@ -74,23 +77,28 @@ class TemporalStateMachine(
 
         if (time != null && now - time!! > maxGapSec) {
             start = null
+            armed = false
         }
         time = now
 
         var done = false
         if (state == null) {
             start = null
+            armed = false
         } else if (state == 1 && start == null) {
             start = now
         } else if (state == 0 && start != null) {
             lastDuration = (now - start!!) * config.millisecondsPerSecond
             val eps = config.durationBoundaryEpsilonMs
-            done = lastDuration >= (minimum - eps) && lastDuration <= (maximum + eps)
+            done = armed && lastDuration >= (minimum - eps) && lastDuration <= (maximum + eps)
             if (done) {
                 events.addLast(now)
                 lastValidDuration = lastDuration
             }
             start = null
+        }
+        if (state == 0) {
+            armed = true
         }
 
         while (events.isNotEmpty() && events.first() <= now - window) {

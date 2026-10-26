@@ -32,6 +32,9 @@ class PhysicalNormalizer(
                 "Feature '$name' must be finite and non-negative, got $value"
             }
             val upper = scales.getValue(name)
+            require(value <= upper + FusionConfig.NORMALIZER_BOUND_TOLERANCE) {
+                "Raw feature exceeds detector bound: $name (got $value > upper $upper + 1e-6)"
+            }
             normalized[name] = min(value / upper, FusionConfig.NORMALIZER_UPPER_CLIP)
         }
         return normalized

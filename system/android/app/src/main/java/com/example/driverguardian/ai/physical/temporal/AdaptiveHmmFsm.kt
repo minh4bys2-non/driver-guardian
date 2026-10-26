@@ -187,7 +187,7 @@ class AdaptiveHmmFsm(
         }
 
         val active: Boolean? = if (mode == "eye") {
-            if (validValue == null || threshold == null) null else validValue < threshold
+            if (validValue == null || threshold == null) null else validValue <= threshold
         } else {
             if (state == null) null else state == 1
         }

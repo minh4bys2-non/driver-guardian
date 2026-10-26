@@ -54,6 +54,9 @@ object FusionConfig {
     // Numerical constants for Normalization & Fitness (Section 6.2 & 6.3)
     const val NORMALIZER_UPPER_CLIP = 1.0
     const val NORMALIZER_LOWER_BOUND = 0.0
+    const val NORMALIZER_BOUND_TOLERANCE = 1e-6
+    const val GATE_COVERAGE_EPSILON_SEC = 1e-9
+    const val DEFAULT_REQUIRED_NEURAL_FRAMES = 50
     const val RATE_BOUND_DURATION_EPSILON_MS = 1e-6
     const val RATE_BOUND_SECONDS_PER_MINUTE = 60.0
     const val DEFAULT_NORMALIZER_FPS = 30.0
@@ -83,15 +86,16 @@ object FusionConfig {
 
     // Default 9D candidate vectors: 8 weights + 1 decision threshold (Section 5.1 & 6.3)
     val DEFAULT_CANDIDATE_VECTOR: DoubleArray = doubleArrayOf(
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        DEFAULT_CANDIDATE_SELECTION_THRESHOLD,
+        0.5003395080566406,
+        0.8887009024620056,
+        0.7320020794868469,
+        0.2563990652561188,
+        0.0,
+        0.6491293907165527,
+        0.4759885370731354,
+        0.0,
+        0.07674604654312134
+//        DEFAULT_CANDIDATE_SELECTION_THRESHOLD,
     )
 
     val DEFAULT_FUSION_CANDIDATES: Map<String, DoubleArray> = mapOf(

@@ -335,7 +335,10 @@ class DriverMonitoringCoordinator(
         }
 
         // Check if a 1Hz evaluation tick is due
-        if (onHeavyEvaluationDue != null && timestampSec + MonitoringConfig.EVALUATION_TICK_EPSILON_SEC >= nextEvaluationSec) {
+        // Snapdragon 680 v2 Spec Section 2.4 & 2.5:
+        // Do not trigger evaluation on the exact frame HMM EM initialization ran on Thread 1B during WARMING_UP
+        val skipDueToHmmInit = physical.hmmJustInitialized && elapsedSec < MonitoringConfig.WINDOW_SEC
+        if (!skipDueToHmmInit && onHeavyEvaluationDue != null && timestampSec + MonitoringConfig.EVALUATION_TICK_EPSILON_SEC >= nextEvaluationSec) {
             while (nextEvaluationSec <= timestampSec + MonitoringConfig.EVALUATION_TICK_EPSILON_SEC) {
                 nextEvaluationSec += MonitoringConfig.EVALUATION_INTERVAL_SEC
             }

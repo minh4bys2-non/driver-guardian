@@ -1,5 +1,7 @@
 package com.example.driverguardian.ai.physical.temporal
 
+import com.example.driverguardian.ai.physical.PhysicalConfig
+
 /**
  * Result produced by TemporalStateMachine after processing a state observation.
  */
@@ -9,34 +11,33 @@ data class FsmResult(
     val eventDone: Boolean,
     val currentDurationMs: Double,
     val lastEventDurationMs: Double,
+    val lastValidDurationMs: Double? = null,
+    val eventCount: Int = 0,
     val ratePerMinute: Double,
     val prolonged: Boolean
 )
 
 /**
  * Temporal Finite State Machine accumulating event durations and frequencies.
- *
- * Modes:
- * - "eye": 100 - 2000 ms (blinks vs prolonged closure)
- * - "mouth": 3500 - 7500 ms (yawns)
- * - "pitch": 800 - 3500 ms (drowsy head nods)
  */
 class TemporalStateMachine(
     val mode: String = "eye",
-    val fps: Int = 30,
-    val windowSizeSec: Double = 60.0,
+    val fps: Int = PhysicalConfig.DEFAULT_FPS,
+    val windowSizeSec: Double = PhysicalConfig.DEFAULT_WINDOW_SEC,
     minDurationMs: Double? = null,
     maxDurationMs: Double? = null,
-    val maxGapSec: Double = 0.25
+    val maxGapSec: Double = PhysicalConfig.DEFAULT_MAX_GAP_SEC,
+    val config: PhysicalConfig = PhysicalConfig.DEFAULT
 ) {
     val minimum: Double
     val maximum: Double
+    var window: Double = windowSizeSec
 
     init {
         val limits = mapOf(
-            "eye" to (100.0 to 2000.0),
-            "mouth" to (3500.0 to 7500.0),
-            "pitch" to (800.0 to 3500.0)
+            "eye" to (config.blinkDurationMinMs to config.blinkDurationMaxMs),
+            "mouth" to (config.yawnDurationMinMs to config.yawnDurationMaxMs),
+            "pitch" to (config.nodDurationMinMs to config.nodDurationMaxMs)
         )
         val defaultLimits = limits[mode] ?: throw IllegalArgumentException("Invalid mode: $mode")
         require(fps > 0 && windowSizeSec > 0.0 && maxGapSec > 0.0) { "Invalid FSM configuration" }
@@ -52,12 +53,18 @@ class TemporalStateMachine(
         private set
     var lastDuration: Double = 0.0
         private set
+    var lastValidDuration: Double? = null
+        private set
+    var armed: Boolean = false
+        private set
     val events = ArrayDeque<Double>()
 
     fun reset() {
         time = null
         start = null
         lastDuration = 0.0
+        lastValidDuration = null
+        armed = false
         events.clear()
     }
 
@@ -70,29 +77,36 @@ class TemporalStateMachine(
 
         if (time != null && now - time!! > maxGapSec) {
             start = null
+            armed = false
         }
         time = now
 
         var done = false
         if (state == null) {
             start = null
+            armed = false
         } else if (state == 1 && start == null) {
             start = now
         } else if (state == 0 && start != null) {
-            lastDuration = (now - start!!) * 1000.0
-            done = lastDuration in minimum..maximum
+            lastDuration = (now - start!!) * config.millisecondsPerSecond
+            val eps = config.durationBoundaryEpsilonMs
+            done = armed && lastDuration >= (minimum - eps) && lastDuration <= (maximum + eps)
             if (done) {
                 events.addLast(now)
+                lastValidDuration = lastDuration
             }
             start = null
         }
+        if (state == 0) {
+            armed = true
+        }
 
-        while (events.isNotEmpty() && events.first() <= now - windowSizeSec) {
+        while (events.isNotEmpty() && events.first() <= now - window) {
             events.removeFirst()
         }
 
-        val duration = if (start == null) 0.0 else (now - start!!) * 1000.0
-        val rate = events.size * 60.0 / windowSizeSec
+        val duration = if (start == null) 0.0 else (now - start!!) * config.millisecondsPerSecond
+        val rate = events.size * config.secondsPerMinute / window
         val prolonged = duration > maximum
 
         return FsmResult(
@@ -101,6 +115,8 @@ class TemporalStateMachine(
             eventDone = done,
             currentDurationMs = duration,
             lastEventDurationMs = lastDuration,
+            lastValidDurationMs = lastValidDuration,
+            eventCount = events.size,
             ratePerMinute = rate,
             prolonged = prolonged
         )

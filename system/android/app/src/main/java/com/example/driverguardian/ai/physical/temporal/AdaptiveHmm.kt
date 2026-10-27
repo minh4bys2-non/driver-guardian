@@ -1,5 +1,7 @@
 package com.example.driverguardian.ai.physical.temporal
 
+import com.example.driverguardian.ai.physical.PhysicalConfig
+import kotlin.math.abs
 import kotlin.math.exp
 import kotlin.math.ln
 import kotlin.math.max
@@ -11,12 +13,13 @@ import kotlin.math.max
  * online adaptation with Exponential Moving Average, and state sorting.
  */
 class AdaptiveHmm(
-    val nStates: Int = 2,
-    val learningRate: Double = 0.01,
-    val adaptInterval: Int = 300,
+    val nStates: Int = PhysicalConfig.DEFAULT_HMM_STATES,
+    val learningRate: Double = PhysicalConfig.DEFAULT_HMM_LEARNING_RATE,
+    val adaptInterval: Int = PhysicalConfig.DEFAULT_HMM_ADAPT_INTERVAL,
     val positiveState: String = "low",
-    val minVariance: Double = 1e-5,
-    val emIterations: Int = 20
+    val minVariance: Double = PhysicalConfig.DEFAULT_HMM_MIN_VARIANCE,
+    val emIterations: Int = PhysicalConfig.DEFAULT_HMM_EM_ITERATIONS,
+    val config: PhysicalConfig = PhysicalConfig.DEFAULT
 ) {
     init {
         require(positiveState == "low" || positiveState == "high") { "positiveState must be 'low' or 'high'" }
@@ -79,7 +82,7 @@ class AdaptiveHmm(
 
         val logB = logEmissionProbSingle(value)
         val logP = DoubleArray(nStates) { k ->
-            ln(max(prior[k], 1e-300)) + logB[k]
+            ln(max(prior[k], config.hmmLogFloor)) + logB[k]
         }
 
         val lse = logSumExp1D(logP)
@@ -107,7 +110,7 @@ class AdaptiveHmm(
 
         val gammaSum0 = gamma.sumOf { it[0] }
         val gammaSum1 = gamma.sumOf { it[1] }
-        if (gammaSum0 < 2.0 || gammaSum1 < 2.0) {
+        if (gammaSum0 < config.hmmMinAdaptStateWeight || gammaSum1 < config.hmmMinAdaptStateWeight) {
             buffer.clear()
             return false
         }
@@ -115,7 +118,7 @@ class AdaptiveHmm(
         mStep(x, gamma, xi, alpha = learningRate)
 
         val lastGamma = gamma.last()
-        val lastSum = max(lastGamma[0] + lastGamma[1], 1e-12)
+        val lastSum = max(lastGamma[0] + lastGamma[1], config.hmmWeightFloor)
         posterior = doubleArrayOf(lastGamma[0] / lastSum, lastGamma[1] / lastSum)
 
         sortStates()
@@ -131,12 +134,12 @@ class AdaptiveHmm(
         return data.clone()
     }
 
-    private fun kMeans1D(x: DoubleArray, iterations: Int = 25): IntArray {
+    private fun kMeans1D(x: DoubleArray, iterations: Int = config.hmmKMeansIterations): IntArray {
         val sorted = x.clone().apply { sort() }
         val p33 = percentile(sorted, 100.0 / 3.0)
         val p66 = percentile(sorted, 200.0 / 3.0)
 
-        val centers = if (kotlin.math.abs(p33 - p66) > 1e-6) {
+        val centers = if (abs(p33 - p66) > config.hmmKMeansConvergenceTol) {
             doubleArrayOf(p33, p66)
         } else {
             doubleArrayOf(sorted.first(), sorted.last())
@@ -145,8 +148,8 @@ class AdaptiveHmm(
         val labels = IntArray(x.size)
         for (iter in 0 until iterations) {
             for (i in x.indices) {
-                val d0 = kotlin.math.abs(x[i] - centers[0])
-                val d1 = kotlin.math.abs(x[i] - centers[1])
+                val d0 = abs(x[i] - centers[0])
+                val d1 = abs(x[i] - centers[1])
                 labels[i] = if (d0 <= d1) 0 else 1
             }
 
@@ -167,7 +170,9 @@ class AdaptiveHmm(
             val newC0 = if (count0 > 0) sum0 / count0 else centers[0]
             val newC1 = if (count1 > 0) sum1 / count1 else centers[1]
 
-            if (kotlin.math.abs(centers[0] - newC0) < 1e-6 && kotlin.math.abs(centers[1] - newC1) < 1e-6) {
+            if (abs(centers[0] - newC0) < config.hmmKMeansConvergenceTol &&
+                abs(centers[1] - newC1) < config.hmmKMeansConvergenceTol
+            ) {
                 break
             }
             centers[0] = newC0
@@ -177,7 +182,7 @@ class AdaptiveHmm(
     }
 
     private fun estimateFromLabels(x: DoubleArray, labels: IntArray) {
-        val eps = 1e-3
+        val eps = config.hmmTransitionSmoothing
         var c0 = eps
         var c1 = eps
         for (l in labels) {
@@ -239,8 +244,8 @@ class AdaptiveHmm(
     private fun forwardBackward(x: DoubleArray): Pair<Array<DoubleArray>, Array<Array<DoubleArray>>> {
         val t = x.size
         val logB = Array(t) { i -> logEmissionProbSingle(x[i]) }
-        val logPi = DoubleArray(nStates) { k -> ln(max(pi[k], 1e-300)) }
-        val logA = Array(nStates) { i -> DoubleArray(nStates) { j -> ln(max(a[i][j], 1e-300)) } }
+        val logPi = DoubleArray(nStates) { k -> ln(max(pi[k], config.hmmLogFloor)) }
+        val logA = Array(nStates) { i -> DoubleArray(nStates) { j -> ln(max(a[i][j], config.hmmLogFloor)) } }
 
         val logAlpha = Array(t) { DoubleArray(nStates) }
         val logBeta = Array(t) { DoubleArray(nStates) }
@@ -291,7 +296,7 @@ class AdaptiveHmm(
     }
 
     private fun mStep(x: DoubleArray, gamma: Array<DoubleArray>, xi: Array<Array<DoubleArray>>, alpha: Double) {
-        val eps = 1e-12
+        val eps = config.hmmWeightFloor
         val t = x.size
 
         var gSum0 = 0.0
@@ -413,18 +418,18 @@ class AdaptiveHmm(
 
     private fun logSumExpPair(a: Double, b: Double): Double {
         val m = max(a, b)
-        return m + ln(max(exp(a - m) + exp(b - m), 1e-300))
+        return m + ln(max(exp(a - m) + exp(b - m), config.hmmLogFloor))
     }
 
     private fun logSumExp4(a: Double, b: Double, c: Double, d: Double): Double {
         val m = max(max(a, b), max(c, d))
-        return m + ln(max(exp(a - m) + exp(b - m) + exp(c - m) + exp(d - m), 1e-300))
+        return m + ln(max(exp(a - m) + exp(b - m) + exp(c - m) + exp(d - m), config.hmmLogFloor))
     }
 
     private fun logSumExp1D(v: DoubleArray): Double {
         val m = v.maxOrNull() ?: 0.0
         var sum = 0.0
         for (x in v) sum += exp(x - m)
-        return m + ln(max(sum, 1e-300))
+        return m + ln(max(sum, config.hmmLogFloor))
     }
 }

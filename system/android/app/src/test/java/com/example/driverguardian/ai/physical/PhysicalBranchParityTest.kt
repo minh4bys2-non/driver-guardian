@@ -3,8 +3,8 @@ package com.example.driverguardian.ai.physical
 import com.example.driverguardian.ai.physical.geometry.AspectRatioCalculator
 import com.example.driverguardian.ai.physical.geometry.HeadPoseEstimator
 import com.example.driverguardian.ai.physical.model.LandmarkPoint
-import com.example.driverguardian.ai.physical.pipeline.PhysicalBranchConfig
-import com.example.driverguardian.ai.physical.pipeline.PhysicalBranchProcessor
+import com.example.driverguardian.ai.pipeline.PhysicalBranchConfig
+import com.example.driverguardian.ai.pipeline.PhysicalBranchProcessor
 import com.example.driverguardian.ai.physical.temporal.AdaptiveHmm
 import com.google.gson.Gson
 import com.google.gson.JsonArray

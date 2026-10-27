@@ -65,7 +65,6 @@ import com.example.driverguardian.ui.screens.driving.DangerAlertScreen
 import com.example.driverguardian.ui.screens.history.TripDetailScreen
 import com.example.driverguardian.ui.screens.history.TripHistoryScreen
 import com.example.driverguardian.ui.screens.home.HomeScreen
-import com.example.driverguardian.ui.screens.onnxdemo.OnnxDemoScreen
 import com.example.driverguardian.ui.screens.pretrip.PreTripCheckScreen
 import com.example.driverguardian.ui.screens.selection.SelectionScreen
 import com.example.driverguardian.ui.screens.settings.SettingsScreen
@@ -276,32 +275,10 @@ private fun AppNavHost(
         modifier = modifier
     ) {
         composable(Screen.Login.route) {
-            // Auto bottom-sheet flow on screen launch (try authorized accounts -> fallback all accounts)
-            androidx.compose.runtime.LaunchedEffect(Unit) {
-                if (authUiState is AuthUiState.Initial || authUiState is AuthUiState.Unauthenticated) {
-                    val result = googleAuthManager.getGoogleIdTokenFromBottomSheet()
-                    result.onSuccess { idToken ->
-                        authViewModel.loginWithGoogle(idToken)
-                    }.onFailure {
-                        // Dismissal or no accounts for bottom sheet is handled gracefully;
-                        // user clicks the persistent "Tiếp tục với Google" button.
-                    }
-                }
-            }
-
             LoginScreen(
                 state = authUiState,
                 onLoginWithGoogle = {
-                    coroutineScope.launch {
-                        val result = googleAuthManager.getGoogleIdTokenFromButton()
-                        result.onSuccess { idToken ->
-                            authViewModel.loginWithGoogle(idToken)
-                        }.onFailure { error ->
-                            val msg = error.localizedMessage ?: "Đăng nhập Google thất bại"
-                            authViewModel.clearError()
-                            snackbarHostState.showSnackbar(msg)
-                        }
-                    }
+                    authViewModel.bypassLogin()
                 },
                 onLogout = { authViewModel.logout() },
                 onRetry = { authViewModel.clearError() }
@@ -348,6 +325,11 @@ private fun AppNavHost(
             )
         }
         composable(Screen.Selection.route) {
+            androidx.compose.runtime.LaunchedEffect(Unit) {
+                if (sessionUiState.vehicles.isEmpty() || sessionUiState.activeModel == null) {
+                    sessionViewModel.setupBypassPreparation()
+                }
+            }
             SelectionScreen(
                 state = sessionUiState,
                 onSelectDriver = sessionViewModel::selectDriver,
@@ -356,7 +338,10 @@ private fun AppNavHost(
                 onEditVehicle = sessionViewModel::updateVehicle,
                 onRetry = sessionViewModel::refresh,
                 onCancel = { navController.safeNavigate(Screen.Home.route) },
-                onContinue = { navController.safeNavigate(Screen.PreTripCheck.route) }
+                onContinue = {
+                    sessionViewModel.startBypassSession()
+                    navController.safeNavigate(Screen.ActiveDriving.route)
+                }
             )
         }
         composable(Screen.PreTripCheck.route) {
@@ -431,12 +416,8 @@ private fun AppNavHost(
         }
         composable(Screen.SystemInfo.route) {
             SystemInfoScreen(
-                snackbarHostState = snackbarHostState,
-                onOpenOnnxDemo = { navController.safeNavigate(Screen.OnnxDemo.route) }
+                snackbarHostState = snackbarHostState
             )
-        }
-        composable(Screen.OnnxDemo.route) {
-            OnnxDemoScreen()
         }
     }
 }

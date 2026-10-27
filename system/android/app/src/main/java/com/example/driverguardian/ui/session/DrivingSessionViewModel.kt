@@ -6,6 +6,9 @@ import androidx.lifecycle.viewModelScope
 import com.example.driverguardian.data.repository.DriverGuardianRepository
 import com.example.driverguardian.data.repository.RepositoryResult
 import com.example.driverguardian.domain.model.DriverSummary
+import com.example.driverguardian.domain.model.DrivingSession
+import com.example.driverguardian.domain.model.ModelVersion
+import com.example.driverguardian.domain.model.Vehicle
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -316,6 +319,65 @@ class DrivingSessionViewModel(
 
     fun consumeCompletion() {
         mutableUiState.update { it.copy(completionState = CompletionState.Idle) }
+    }
+
+    fun setupBypassPreparation() {
+        val mockVehicles = listOf(
+            Vehicle(
+                id = 1,
+                plateNumber = "51A-99999",
+                name = "VinFast VF 8 (Demo)",
+                type = "SUV",
+                deviceCode = "DEV001",
+                status = "ACTIVE",
+                createdAt = ""
+            )
+        )
+        val mockModel = ModelVersion(
+            id = 1,
+            versionName = "v1.0.0-edge",
+            modelType = "PHYSICAL",
+            fileName = "face_landmarker.task",
+            description = "Edge AI DMS",
+            isActive = "Y",
+            deployedAt = ""
+        )
+        val fallbackDriver = currentAuthDriver ?: DriverSummary(1, "DRV001", "Tài xế Demo")
+        mutableUiState.update { current ->
+            current.copy(
+                loadState = LoadState.Success,
+                authenticatedDriver = current.authenticatedDriver ?: fallbackDriver,
+                vehicles = mockVehicles,
+                activeModel = mockModel,
+                selectedVehicleId = 1,
+                selectedDriverId = currentAuthDriver?.driverId ?: current.selectedDriverId ?: 1
+            )
+        }
+    }
+
+    fun startBypassSession() {
+        setupBypassPreparation()
+        val state = mutableUiState.value
+        val driverId = state.selectedDriverId ?: 1
+        val vehicleId = state.selectedVehicleId ?: 1
+        val modelId = state.activeModel?.id ?: 1
+        val mockSession = DrivingSession(
+            id = 1001,
+            driverId = driverId,
+            vehicleId = vehicleId,
+            modelVersionId = modelId,
+            startTime = "2026-10-25T00:00:00Z",
+            durationSeconds = 0,
+            totalAlerts = 0,
+            status = "ACTIVE",
+            syncStatus = "OFFLINE"
+        )
+        mutableUiState.update {
+            it.copy(
+                activeSession = mockSession,
+                sessionSubmissionState = SessionSubmissionState.Success
+            )
+        }
     }
 }
 

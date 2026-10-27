@@ -63,20 +63,41 @@ class TemporalStateMachineTest {
     @Test
     fun testGapExceedingMaxGapResetsStart() {
         val fsm = TemporalStateMachine(mode = "eye", maxGapSec = 0.25)
-        fsm.process(1, 0.0)
+        fsm.process(0, 0.0)
+        fsm.process(1, 0.05)
         // Next frame is 0.5s later (> 0.25s gap)
         val res = fsm.process(1, 0.5)
         // start should have been reset to 0.5
         assertEquals(0.0, res.currentDurationMs, 1e-4)
+        assertFalse("Gap > maxGap must reset armed to false", fsm.armed)
     }
 
     @Test
     fun testMissingSignalResetsStart() {
         val fsm = TemporalStateMachine(mode = "eye")
-        fsm.process(1, 0.0)
+        fsm.process(0, 0.0)
+        fsm.process(1, 0.05)
         fsm.process(null, 0.1) // missing face
         val res = fsm.process(0, 0.2)
         assertFalse("Missing signal between open and close must reset event", res.eventDone)
         assertEquals(0.0, res.currentDurationMs, 1e-4)
+        assertTrue(fsm.armed)
+    }
+
+    @Test
+    fun testUnarmedSequenceDoesNotTriggerEvent() {
+        val fsm = TemporalStateMachine(mode = "eye", fps = 30)
+        // Starts directly at state = 1 without prior state = 0 -> armed is false
+        fsm.process(1, 0.0)
+        fsm.process(1, 0.15)
+        val resUnarmed = fsm.process(0, 0.25) // 250ms would be valid if armed
+        assertFalse("Unarmed transition to 0 must not trigger eventDone", resUnarmed.eventDone)
+        assertTrue("State 0 now arms the FSM", fsm.armed)
+
+        // Subsequent valid blink is now armed -> must trigger eventDone
+        fsm.process(1, 0.35)
+        val resArmed = fsm.process(0, 0.55) // 200ms in [100, 2000]
+        assertTrue("Armed blink must trigger eventDone", resArmed.eventDone)
+        assertEquals(200.0, resArmed.lastValidDurationMs!!, 1e-4)
     }
 }

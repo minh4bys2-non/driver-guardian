@@ -1,7 +1,9 @@
 package com.example.driverguardian.ai.physical.geometry
 
+import com.example.driverguardian.ai.physical.PhysicalConfig
 import com.example.driverguardian.ai.physical.model.HeadPose
 import com.example.driverguardian.ai.physical.model.LandmarkPoint
+import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.cos
 import kotlin.math.hypot
@@ -16,25 +18,19 @@ import kotlin.math.sqrt
  */
 class HeadPoseEstimator(
     val imageWidth: Int,
-    val imageHeight: Int
+    val imageHeight: Int,
+    val config: PhysicalConfig = PhysicalConfig.DEFAULT
 ) {
     init {
         require(imageWidth > 0 && imageHeight > 0) { "Image dimensions must be positive" }
     }
 
     companion object {
-        val LANDMARKS = intArrayOf(1, 152, 263, 33, 291, 61)
-
-        val MODEL = arrayOf(
-            doubleArrayOf(0.0, 0.0, 0.0),        // 1: Nose tip
-            doubleArrayOf(0.0, 330.0, 65.0),     // 152: Chin
-            doubleArrayOf(225.0, -170.0, 135.0), // 263: Left eye outer corner
-            doubleArrayOf(-225.0, -170.0, 135.0),// 33: Right eye outer corner
-            doubleArrayOf(150.0, 150.0, 125.0),  // 291: Left mouth corner
-            doubleArrayOf(-150.0, 150.0, 125.0)  // 61: Right mouth corner
-        )
+        val LANDMARKS: IntArray get() = PhysicalConfig.DEFAULT_POSE_LANDMARK_INDICES
+        val MODEL: Array<DoubleArray> get() = PhysicalConfig.DEFAULT_FACE_MODEL_3D
     }
 
+    private val model3d = config.faceModel3d
     private val fx = imageWidth.toDouble()
     private val fy = imageWidth.toDouble()
     private val cx = imageWidth / 2.0
@@ -79,32 +75,25 @@ class HeadPoseEstimator(
         }
         val det = cxx * cyy - cxy * cxy
         val trace = cxx + cyy
-        if (trace < 1e-8 || det / (trace * trace) < 1e-5) {
+        if (trace < config.degeneracyTraceEpsilon || det / (trace * trace) < config.degeneracyDetRatioEpsilon) {
             throw IllegalArgumentException("Degenerate landmarks")
         }
 
-        // Initial depth estimate from outer eye distance (model width = 450.0)
+        // Initial depth estimate from outer eye distance (model width = config.modelEyeOuterDistance)
         val eyeDist = hypot(pts2d[2][0] - pts2d[3][0], pts2d[2][1] - pts2d[3][1])
-        require(eyeDist > 1e-4) { "Degenerate eye distance" }
-        val tzInit = (450.0 * fx) / eyeDist
+        require(eyeDist > config.degeneracyEyeDistEpsilon) { "Degenerate eye distance" }
+        val tzInit = (config.modelEyeOuterDistance * fx) / eyeDist
         val txInit = (pts2d[0][0] - cx) * tzInit / fx
         val tyInit = (pts2d[0][1] - cy) * tzInit / fy
-
-        // Multi-seed Levenberg-Marquardt to avoid local minima
-        val seeds = arrayOf(
-            doubleArrayOf(0.0, 0.0, 0.0),
-            doubleArrayOf(0.2, 0.0, 0.0),
-            doubleArrayOf(-0.2, 0.0, 0.0)
-        )
 
         var bestX: DoubleArray? = null
         var bestCost = Double.MAX_VALUE
 
-        for (rInit in seeds) {
+        for (rInit in config.lmSeeds) {
             val x = doubleArrayOf(rInit[0], rInit[1], rInit[2], txInit, tyInit, tzInit)
-            var lambda = 1e-3
+            var lambda = config.lmInitialLambda
 
-            for (iter in 0 until 35) {
+            for (iter in 0 until config.lmMaxIterations) {
                 val r = doubleArrayOf(x[0], x[1], x[2])
                 val t = doubleArrayOf(x[3], x[4], x[5])
                 val proj = project(r, t)
@@ -120,7 +109,7 @@ class HeadPoseEstimator(
 
                 // Numerical Jacobian (12 x 6)
                 val jac = Array(12) { DoubleArray(6) }
-                val eps = 1e-6
+                val eps = config.lmJacobianEps
                 for (j in 0 until 6) {
                     val xPlus = x.clone()
                     xPlus[j] += eps
@@ -146,13 +135,16 @@ class HeadPoseEstimator(
                 }
 
                 for (i in 0 until 6) {
-                    h[i][i] += lambda * (h[i][i] + 1e-6)
+                    h[i][i] += lambda * (h[i][i] + config.lmDiagonalDampingEps)
                 }
 
                 val dx = solve6x6(h, g) ?: break
 
                 val xNew = DoubleArray(6) { k -> x[k] - dx[k] }
-                val projNew = project(doubleArrayOf(xNew[0], xNew[1], xNew[2]), doubleArrayOf(xNew[3], xNew[4], xNew[5]))
+                val projNew = project(
+                    doubleArrayOf(xNew[0], xNew[1], xNew[2]),
+                    doubleArrayOf(xNew[3], xNew[4], xNew[5])
+                )
                 var costNew = 0.0
                 for (i in 0 until 6) {
                     val du = projNew[i][0] - pts2d[i][0]
@@ -162,16 +154,16 @@ class HeadPoseEstimator(
 
                 if (costNew < cost) {
                     System.arraycopy(xNew, 0, x, 0, 6)
-                    lambda /= 10.0
+                    lambda /= config.lmLambdaScaleFactor
                     var maxDx = 0.0
                     for (v in dx) {
-                        val av = kotlin.math.abs(v)
+                        val av = abs(v)
                         if (av > maxDx) maxDx = av
                     }
-                    if (maxDx < 1e-8) break
+                    if (maxDx < config.lmConvergenceTol) break
                 } else {
-                    lambda *= 10.0
-                    if (lambda > 1e12) break
+                    lambda *= config.lmLambdaScaleFactor
+                    if (lambda > config.lmMaxLambda) break
                 }
             }
 
@@ -199,7 +191,7 @@ class HeadPoseEstimator(
 
         // Check if all model points are in front of the camera (Z > 0)
         for (i in 0 until 6) {
-            val z = MODEL[i][0] * rotMatrix[2][0] + MODEL[i][1] * rotMatrix[2][1] + MODEL[i][2] * rotMatrix[2][2] + t[2]
+            val z = model3d[i][0] * rotMatrix[2][0] + model3d[i][1] * rotMatrix[2][1] + model3d[i][2] * rotMatrix[2][2] + t[2]
             if (z <= 0.0) {
                 throw IllegalArgumentException("Pose behind camera")
             }
@@ -217,17 +209,17 @@ class HeadPoseEstimator(
     private fun project(r: DoubleArray, t: DoubleArray): Array<DoubleArray> {
         val rot = rodrigues(r)
         return Array(6) { i ->
-            val x3 = MODEL[i][0] * rot[0][0] + MODEL[i][1] * rot[0][1] + MODEL[i][2] * rot[0][2] + t[0]
-            val y3 = MODEL[i][0] * rot[1][0] + MODEL[i][1] * rot[1][1] + MODEL[i][2] * rot[1][2] + t[1]
-            val z3 = MODEL[i][0] * rot[2][0] + MODEL[i][1] * rot[2][1] + MODEL[i][2] * rot[2][2] + t[2]
-            val safeZ = if (z3 != 0.0) z3 else 1e-6
+            val x3 = model3d[i][0] * rot[0][0] + model3d[i][1] * rot[0][1] + model3d[i][2] * rot[0][2] + t[0]
+            val y3 = model3d[i][0] * rot[1][0] + model3d[i][1] * rot[1][1] + model3d[i][2] * rot[1][2] + t[1]
+            val z3 = model3d[i][0] * rot[2][0] + model3d[i][1] * rot[2][1] + model3d[i][2] * rot[2][2] + t[2]
+            val safeZ = if (z3 != 0.0) z3 else config.safeProjectionZEps
             doubleArrayOf(fx * x3 / safeZ + cx, fy * y3 / safeZ + cy)
         }
     }
 
     private fun rodrigues(r: DoubleArray): Array<DoubleArray> {
         val th = sqrt(r[0] * r[0] + r[1] * r[1] + r[2] * r[2])
-        if (th < 1e-12) {
+        if (th < config.rodriguesMinThetaEps) {
             return Array(3) { i -> DoubleArray(3) { j -> if (i == j) 1.0 else 0.0 } }
         }
         val kx = r[0] / th
@@ -250,15 +242,15 @@ class HeadPoseEstimator(
 
         for (i in 0 until n) {
             var maxRow = i
-            var maxVal = kotlin.math.abs(aug[i][i])
+            var maxVal = abs(aug[i][i])
             for (k in i + 1 until n) {
-                val av = kotlin.math.abs(aug[k][i])
+                val av = abs(aug[k][i])
                 if (av > maxVal) {
                     maxVal = av
                     maxRow = k
                 }
             }
-            if (maxVal < 1e-14) return null
+            if (maxVal < config.pivotMinEps) return null
             val temp = aug[i]
             aug[i] = aug[maxRow]
             aug[maxRow] = temp

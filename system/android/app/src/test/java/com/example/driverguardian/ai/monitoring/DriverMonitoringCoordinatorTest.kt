@@ -5,7 +5,7 @@ import com.example.driverguardian.ai.monitoring.model.CameraRuntimeState
 import com.example.driverguardian.ai.monitoring.model.SensorRuntimeState
 import com.example.driverguardian.ai.monitoring.time.*
 import com.example.driverguardian.ai.physical.model.*
-import com.example.driverguardian.ai.physical.pipeline.PhysicalBranch
+import com.example.driverguardian.ai.pipeline.PhysicalBranch
 import org.junit.Assert.*
 import org.junit.Test
 import java.util.concurrent.CountDownLatch

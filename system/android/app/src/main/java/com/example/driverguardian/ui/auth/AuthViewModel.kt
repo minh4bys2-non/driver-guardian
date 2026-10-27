@@ -6,6 +6,7 @@ import androidx.lifecycle.viewModelScope
 import com.example.driverguardian.data.auth.AuthState
 import com.example.driverguardian.data.repository.AuthRepository
 import com.example.driverguardian.data.repository.RepositoryResult
+import com.example.driverguardian.domain.model.DriverSummary
 import com.example.driverguardian.domain.model.UserProfile
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -89,6 +90,22 @@ class AuthViewModel(
 
     fun clearError() {
         _uiState.value = AuthUiState.Unauthenticated
+    }
+
+    fun bypassLogin() {
+        val mockUser = UserProfile(
+            userId = 1,
+            email = "demo.driver@driverguardian.com",
+            displayName = "Tài xế Demo",
+            avatarUrl = null,
+            role = "DRIVER",
+            driver = DriverSummary(
+                driverId = 1,
+                driverCode = "DRV001",
+                fullName = "Tài xế Demo"
+            )
+        )
+        _uiState.value = AuthUiState.Authenticated(mockUser)
     }
 }
 

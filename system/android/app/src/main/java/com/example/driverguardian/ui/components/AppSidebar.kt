@@ -57,7 +57,7 @@ private val sidebarItems = listOf(
     SidebarItem("Cảnh báo", Screen.AlertHistory.route, Icons.Default.Notifications),
     SidebarItem("Cài đặt", Screen.Settings.route, Icons.Default.Settings),
     SidebarItem("Hệ thống", Screen.SystemInfo.route, Icons.Default.Info),
-    SidebarItem("ONNX Demo", Screen.OnnxDemo.route, Icons.Default.Analytics),
+
 )
 
 @Composable

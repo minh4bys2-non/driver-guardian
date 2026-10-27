@@ -1,4 +1,5 @@
 import json
+import os
 import sys
 import time
 from contextlib import ExitStack
@@ -25,23 +26,84 @@ class FaceTracker:
         finally:
             if skip_audio:
                 sys.modules.pop("sounddevice", None)
-        self.mesh = mp.solutions.face_mesh.FaceMesh(
-            max_num_faces=config.max_num_faces, refine_landmarks=config.refine_landmarks,
-            min_detection_confidence=config.detection_confidence if detection_confidence is None else detection_confidence,
-            min_tracking_confidence=config.tracking_confidence if tracking_confidence is None else tracking_confidence)
+
+        det_conf = config.detection_confidence if detection_confidence is None else detection_confidence
+        track_conf = config.tracking_confidence if tracking_confidence is None else tracking_confidence
+
+        if hasattr(mp, "solutions") and hasattr(mp.solutions, "face_mesh"):
+            self._mode = "legacy"
+            self.mesh = mp.solutions.face_mesh.FaceMesh(
+                max_num_faces=config.max_num_faces,
+                refine_landmarks=config.refine_landmarks,
+                min_detection_confidence=det_conf,
+                min_tracking_confidence=track_conf,
+            )
+        else:
+            from mediapipe.tasks.python import BaseOptions
+            from mediapipe.tasks.python.vision import FaceLandmarker, FaceLandmarkerOptions, RunningMode
+
+            model_path = getattr(config, "face_landmarker_model_path", None)
+            if not model_path or not os.path.isfile(model_path):
+                base_dir = os.path.dirname(__file__)
+                candidates = [
+                    os.path.join(base_dir, "models", "face_landmarker.task"),
+                    os.path.join(base_dir, "face_landmarker.task"),
+                    os.path.abspath(os.path.join(base_dir, "..", "..", "system", "android", "app", "src", "main", "assets", "face_landmarker.task")),
+                    "face_landmarker.task",
+                ]
+                for candidate in candidates:
+                    if os.path.isfile(candidate):
+                        model_path = candidate
+                        break
+
+            if not model_path or not os.path.isfile(model_path):
+                raise FileNotFoundError(
+                    "Không tìm thấy file model 'face_landmarker.task'. "
+                    "Vui lòng đặt file tại ai/PhysicalBranch/models/face_landmarker.task "
+                    "hoặc chỉ định qua config.face_landmarker_model_path."
+                )
+
+            options = FaceLandmarkerOptions(
+                base_options=BaseOptions(model_asset_path=model_path),
+                running_mode=RunningMode.IMAGE,
+                num_faces=config.max_num_faces,
+                min_face_detection_confidence=det_conf,
+                min_face_presence_confidence=det_conf,
+                min_tracking_confidence=track_conf,
+                output_face_blendshapes=False,
+                output_facial_transformation_matrixes=False,
+            )
+            self._mode = "tasks"
+            self.detector = FaceLandmarker.create_from_options(options)
 
     def process(self, frame):
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        rgb.flags.writeable = False
-        result = self.mesh.process(rgb)
-        if not result.multi_face_landmarks:
-            return None
-        height, width = frame.shape[:2]
-        return np.array([(p.x * width, p.y * height)
-                         for p in result.multi_face_landmarks[0].landmark])
+        if self._mode == "legacy":
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            rgb.flags.writeable = False
+            result = self.mesh.process(rgb)
+            if not result.multi_face_landmarks:
+                return None
+            height, width = frame.shape[:2]
+            return np.array([(p.x * width, p.y * height)
+                             for p in result.multi_face_landmarks[0].landmark])
+        else:
+            import mediapipe as mp
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            result = self.detector.detect(mp_image)
+            if not result.face_landmarks:
+                return None
+            height, width = frame.shape[:2]
+            return np.array([(p.x * width, p.y * height)
+                             for p in result.face_landmarks[0]])
 
     def close(self):
-        self.mesh.close()
+        if self._mode == "legacy" and hasattr(self, "mesh") and self.mesh is not None:
+            self.mesh.close()
+            self.mesh = None
+        elif self._mode == "tasks" and hasattr(self, "detector") and self.detector is not None:
+            self.detector.close()
+            self.detector = None
 
 
 class TensorBoardLogger:

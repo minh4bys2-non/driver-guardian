@@ -71,6 +71,7 @@ class PhysicalConfig:
                          (-225, -170, 135), (150, 150, 125), (-150, 150, 125))
     distortion_coeffs: tuple = (0, 0, 0, 0)  # Hệ số méo ống kính theo quy ước OpenCV; mặc định giả định không méo.
     camera_matrix: tuple | None = None  # Ma trận nội tại K 3×3; None dùng tiêu cự xấp xỉ chiều rộng ảnh.
+    face_landmarker_model_path: str | None = r"D:\Project\DATN\tempt\driver-guardian\ai\PhysicalBranch\models\face_landmarker.task"  # Đường dẫn tới face_landmarker.task; None để tự động dò tìm.
 
 
 DEFAULT_CONFIG = PhysicalConfig()

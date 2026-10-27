@@ -10,6 +10,14 @@ import com.example.driverguardian.ai.monitoring.model.MonitoringRuntimeState
 import com.example.driverguardian.ai.monitoring.model.MonitoringSnapshot
 import java.util.Locale
 
+data class FeatureScoreItem(
+    val key: String,
+    val displayName: String,
+    val rawValueText: String,
+    val normalizedScore: Double?,
+    val scoreText: String,
+)
+
 data class MonitoringPresentation(
     val cameraStatus: String,
     val faceStatus: String,
@@ -42,6 +50,7 @@ data class MonitoringPresentation(
     val lastSkipReason: String? = null,
     val balanceBrightnessEnabled: Boolean = MonitoringConfig.DEFAULT_BALANCE_BRIGHTNESS_ENABLED,
     val isDrowsyPrediction: Boolean = false,
+    val featureScores: List<FeatureScoreItem> = emptyList(),
 ) {
     companion object {
         fun from(
@@ -211,6 +220,74 @@ data class MonitoringPresentation(
                 diagnostics.workerTotalMs?.let { "2 WorkerTotal ${number(it, 1)} ms" },
             ).joinToString(" • ").ifBlank { "—" }
 
+            val isValidWindow = (status == PipelineStatus.ALERT || status == PipelineStatus.DROWSY) &&
+                eval?.normalizedFeatures != null
+
+            val featureScores = FusionConfig.FEATURES.map { key ->
+                val displayName = when (key) {
+                    FusionConfig.FEATURE_BLINK_FREQUENCY -> "Tần số chớp mắt"
+                    FusionConfig.FEATURE_BLINK_DURATION -> "Thời lượng chớp (P90)"
+                    FusionConfig.FEATURE_PERCLOS -> "Tỷ lệ nhắm mắt (PERCLOS)"
+                    FusionConfig.FEATURE_YAWN_FREQUENCY -> "Tần số ngáp"
+                    FusionConfig.FEATURE_NOD_DURATION -> "Thời lượng gật (P100)"
+                    FusionConfig.FEATURE_NOD_FREQUENCY -> "Tần số gật đầu"
+                    FusionConfig.FEATURE_DOMINANT_HEAD_MOTION_FREQUENCY -> "Dao động đầu (FFT)"
+                    FusionConfig.FEATURE_NEURALNETWORK_SCORE -> "Mô hình học sâu (CNN-ConvGRU)"
+                    else -> key
+                }
+
+                val rawValueText = when (key) {
+                    FusionConfig.FEATURE_BLINK_FREQUENCY -> {
+                        val raw = eval?.rawFeatures?.get(key) ?: physical?.blinkFreqPerMin
+                        raw?.let { "${number(it, 1)} /min" } ?: "—"
+                    }
+                    FusionConfig.FEATURE_BLINK_DURATION -> {
+                        val raw = eval?.rawFeatures?.get(key) ?: physical?.blinkDurationMs
+                        raw?.let { "${number(it, 0)} ms" } ?: "—"
+                    }
+                    FusionConfig.FEATURE_PERCLOS -> {
+                        val raw = eval?.rawFeatures?.get(key)?.let { it * 100.0 } ?: physical?.perclosPct
+                        raw?.let { "${number(it, 1)}%" } ?: "—"
+                    }
+                    FusionConfig.FEATURE_YAWN_FREQUENCY -> {
+                        val raw = eval?.rawFeatures?.get(key) ?: physical?.yawnFreqPerMin
+                        raw?.let { "${number(it, 1)} /min" } ?: "—"
+                    }
+                    FusionConfig.FEATURE_NOD_DURATION -> {
+                        val raw = eval?.rawFeatures?.get(key)
+                            ?: physical?.nodEventDurationMs?.let { it / 1000.0 }
+                            ?: physical?.nodDurationMs?.let { it / 1000.0 }
+                        raw?.let { "${number(it, 2)} s" } ?: "—"
+                    }
+                    FusionConfig.FEATURE_NOD_FREQUENCY -> {
+                        val raw = eval?.rawFeatures?.get(key) ?: physical?.nodFreqPerMin
+                        raw?.let { "${number(it, 1)} /min" } ?: "—"
+                    }
+                    FusionConfig.FEATURE_DOMINANT_HEAD_MOTION_FREQUENCY -> {
+                        val raw = eval?.rawFeatures?.get(key)
+                            ?: eval?.headMotionMetrics?.frequency
+                            ?: physical?.headMotionFrequencyHz
+                        raw?.let { "${number(it, 2)} Hz" } ?: "—"
+                    }
+                    FusionConfig.FEATURE_NEURALNETWORK_SCORE -> {
+                        val raw = eval?.rawFeatures?.get(key) ?: eval?.latestNeuralScore
+                        raw?.let { number(it, 3) } ?: "—"
+                    }
+                    else -> "—"
+                }
+
+                val score = if (isValidWindow) eval?.normalizedFeatures?.get(key) else null
+                val scoreText = score?.let { number(it, 3) } ?: "-"
+
+                FeatureScoreItem(
+                    key = key,
+                    displayName = displayName,
+                    rawValueText = rawValueText,
+                    normalizedScore = score,
+                    scoreText = scoreText,
+                )
+            }
+
             return MonitoringPresentation(
                 cameraStatus = when (state.camera) {
                     CameraRuntimeState.IDLE -> "Chưa khởi động"
@@ -259,6 +336,7 @@ data class MonitoringPresentation(
                 lastSkipReason = eval?.lastSkipReason,
                 balanceBrightnessEnabled = diagnostics.balanceBrightnessEnabled,
                 isDrowsyPrediction = fusion?.isDrowsy == true,
+                featureScores = featureScores,
             )
         }
 

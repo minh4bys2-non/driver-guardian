@@ -44,5 +44,14 @@ class CameraXFrameSourceTest {
         assertFalse(balancer.enabled.get())
 
         assertEquals(3, pool.capacity)
+
+        // Mặc định: đúng kích thước 640x480x4
+        val defaultBuffer = pool.acquireNextBuffer()
+        assertEquals(640 * 480 * 4, defaultBuffer.size)
+
+        // Khi camera fallback sang độ phân giải lớn hơn (vd: 720x480)
+        val largerBytes = 720 * 480 * 4
+        val resizedBuffer = pool.acquireNextBuffer(largerBytes)
+        assertEquals(largerBytes, resizedBuffer.size)
     }
 }

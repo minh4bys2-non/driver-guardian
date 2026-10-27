@@ -1,6 +1,7 @@
 package com.example.driverguardian.ai.monitoring.camera
 
 import android.util.Size
+import android.view.Surface
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.resolutionselector.AspectRatioStrategy
@@ -17,6 +18,7 @@ object CameraXHardwareConfig {
 
     fun buildImageAnalysis(
         ingestExecutor: Executor,
+        targetRotation: Int = Surface.ROTATION_90,
         analyzer: ImageAnalysis.Analyzer
     ): ImageAnalysis {
         val resolutionSelector = ResolutionSelector.Builder()
@@ -31,10 +33,27 @@ object CameraXHardwareConfig {
 
         return ImageAnalysis.Builder()
             .setResolutionSelector(resolutionSelector)
+            .setTargetRotation(targetRotation)
             .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
             .build()
             .also { it.setAnalyzer(ingestExecutor, analyzer) }
+    }
+
+    /**
+     * Chuẩn hóa hướng màn hình cho ứng dụng chạy ở chế độ sensorLandscape.
+     * Luôn giữ ROTATION_90 hoặc ROTATION_270 khi người dùng xoay ngang điện thoại/máy tính bảng.
+     * Chống hiện tượng ghim nhầm ROTATION_0 (Portrait) khi vừa chuyển từ màn hình khóa.
+     */
+    fun resolveLandscapeTargetRotation(
+        displayRotation: Int,
+        isNaturalLandscapeDevice: Boolean = false,
+    ): Int = when (displayRotation) {
+        Surface.ROTATION_90, Surface.ROTATION_270 -> displayRotation
+        Surface.ROTATION_0, Surface.ROTATION_180 -> {
+            if (isNaturalLandscapeDevice) displayRotation else Surface.ROTATION_90
+        }
+        else -> Surface.ROTATION_90
     }
 
     /**

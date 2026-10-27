@@ -59,7 +59,8 @@ data class PhysicalConfig(
     val eventSeparationMultiplier: Double = DEFAULT_EVENT_SEPARATION_MULTIPLIER,
     val fallbackSigmaDivisor: Double = DEFAULT_FALLBACK_SIGMA_DIVISOR,
     val fallbackMinSigma: Double = DEFAULT_FALLBACK_MIN_SIGMA,
-    val fallbackTransition: Array<DoubleArray> = DEFAULT_FALLBACK_TRANSITION.map { it.clone() }.toTypedArray(),
+    val fallbackTransition: Array<DoubleArray> = DEFAULT_FALLBACK_TRANSITION.map { it.clone() }
+        .toTypedArray(),
     val restingPrior: DoubleArray = DEFAULT_RESTING_PRIOR.clone(),
     val perclosClosedFraction: Double = DEFAULT_PERCLOS_CLOSED_FRACTION,
 
@@ -179,7 +180,6 @@ data class PhysicalConfig(
         const val DEFAULT_DURATION_BOUNDARY_EPSILON_MS = 1e-6
         const val DEFAULT_SECONDS_PER_MINUTE = 60.0
         const val DEFAULT_MILLISECONDS_PER_SECOND = 1000.0
-
         const val DEFAULT_WINDOW_RATIO_INITIAL_CAPACITY = 2048
         const val DEFAULT_WINDOW_RATIO_RECALC_INTERVAL_STEPS = 1800
         const val DEFAULT_WINDOW_RATIO_MIN_VALID_EPSILON = 1e-12

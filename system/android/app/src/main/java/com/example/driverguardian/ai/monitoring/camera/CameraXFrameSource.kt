@@ -2,8 +2,13 @@ package com.example.driverguardian.ai.monitoring.camera
 
 import android.content.Context
 import android.hardware.camera2.CameraCharacteristics
+import android.hardware.display.DisplayManager
+import android.os.Handler
+import android.os.Looper
 import android.os.Process
 import android.os.SystemClock
+import android.view.Display
+import android.view.Surface
 import androidx.camera.camera2.interop.Camera2CameraInfo
 import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.CameraSelector
@@ -49,6 +54,8 @@ class CameraXFrameSource(
 ) : AutoCloseable {
     private var provider: ProcessCameraProvider? = null
     private var analysis: ImageAnalysis? = null
+    private var preview: Preview? = null
+    private var displayListener: DisplayManager.DisplayListener? = null
     private var executor: ExecutorService? = null
     private val startGate = StartGenerationGate()
 
@@ -99,18 +106,43 @@ class CameraXFrameSource(
                         cameraProvider.hasCamera(CameraSelector.DEFAULT_BACK_CAMERA) -> CameraSelector.DEFAULT_BACK_CAMERA.also { isFrontCamera = false }
                         else -> throw IllegalStateException("No usable CameraX camera")
                     }
-                    val preview = Preview.Builder().build().also { it.setSurfaceProvider(surfaceProvider) }
-                    val imageAnalysis = CameraXHardwareConfig.buildImageAnalysis(localExecutor) { proxy ->
+                    val displayManager = context.getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager
+                    val rawDisplayRotation = displayManager?.getDisplay(Display.DEFAULT_DISPLAY)?.rotation ?: Surface.ROTATION_90
+                    val targetRotation = CameraXHardwareConfig.resolveLandscapeTargetRotation(rawDisplayRotation)
+
+                    val previewInstance = Preview.Builder()
+                        .setTargetRotation(targetRotation)
+                        .build()
+                        .also { it.setSurfaceProvider(surfaceProvider) }
+                    preview = previewInstance
+
+                    val imageAnalysis = CameraXHardwareConfig.buildImageAnalysis(localExecutor, targetRotation) { proxy ->
                         analyze(proxy, generation)
                     }
                     analysis = imageAnalysis
                     cameraProvider.unbindAll()
-                    val camera = cameraProvider.bindToLifecycle(lifecycleOwner, selector, preview, imageAnalysis)
+                    val camera = cameraProvider.bindToLifecycle(lifecycleOwner, selector, previewInstance, imageAnalysis)
+
+                    val listener = object : DisplayManager.DisplayListener {
+                        override fun onDisplayAdded(displayId: Int) = Unit
+                        override fun onDisplayRemoved(displayId: Int) = Unit
+                        override fun onDisplayChanged(displayId: Int) {
+                            if (displayId == Display.DEFAULT_DISPLAY) {
+                                val newRaw = displayManager?.getDisplay(displayId)?.rotation ?: return
+                                val newRotation = CameraXHardwareConfig.resolveLandscapeTargetRotation(newRaw)
+                                analysis?.targetRotation = newRotation
+                                preview?.targetRotation = newRotation
+                            }
+                        }
+                    }
+                    displayListener = listener
+                    displayManager?.registerDisplayListener(listener, Handler(Looper.getMainLooper()))
+
                     timestampSource = readTimestampSource(camera.cameraInfo)
                     onTimestampSource(timestampSource)
                     ThreadDebugLogger.logIngest(
                         "CameraX bound: target=${MonitoringConfig.TARGET_WIDTH}x${MonitoringConfig.TARGET_HEIGHT} " +
-                            "RGBA_8888, front=$isFrontCamera, timestampSource=$timestampSource, generation=$generation"
+                            "RGBA_8888, targetRotation=$targetRotation, front=$isFrontCamera, timestampSource=$timestampSource, generation=$generation"
                     )
                 } catch (error: Exception) {
                     if (startGate.isCurrent(startToken)) {
@@ -131,8 +163,9 @@ class CameraXFrameSource(
         val rotationDegrees = proxy.imageInfo.rotationDegrees
         val cameraTimestampNs = proxy.imageInfo.timestamp
 
-        // Lấy buffer tĩnh từ pool (Zero-GC Triple-Buffering)
-        val dstBuffer = pool.acquireNextBuffer()
+        // Lấy buffer tĩnh từ pool (Zero-GC Triple-Buffering, an toàn kích thước fallback)
+        val requiredBytes = width * height * CameraXHardwareConfig.CHANNELS_RGBA
+        val dstBuffer = pool.acquireNextBuffer(requiredBytes)
         try {
             CameraXHardwareConfig.extractTightRgbaBytesInto(proxy, dstBuffer)
         } catch (error: Exception) {
@@ -223,8 +256,13 @@ class CameraXFrameSource(
 
     @Synchronized fun stop() {
         startGate.invalidate()
+        displayListener?.let { listener ->
+            (context.getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager)?.unregisterDisplayListener(listener)
+        }
+        displayListener = null
         analysis?.clearAnalyzer()
         analysis = null
+        preview = null
         provider?.unbindAll()
         provider = null
         executor?.shutdownNow()

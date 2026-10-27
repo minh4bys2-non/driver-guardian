@@ -5,6 +5,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -37,7 +38,7 @@ fun MonitoringDebugPanel(
     balanceBrightnessEnabled: Boolean = presentation.balanceBrightnessEnabled,
     onToggleBalanceBrightness: (Boolean) -> Unit = {},
 ) {
-    var expanded by remember { mutableStateOf(false) }
+    var expanded by remember { mutableStateOf(true) }
     val statusColor = when (presentation.pipelineStatus) {
         PipelineStatus.ALERT -> SafeGreen
         PipelineStatus.DROWSY -> DangerRed
@@ -161,15 +162,24 @@ fun MonitoringDebugPanel(
 
                 HorizontalDivider()
 
-                // 3. Hiệu năng hệ thống (Telemetry)
+                // 3. Điểm số các Feature (Vector 8D)
                 Text(
-                    text = "3. HIỆU NĂNG HỆ THỐNG",
+                    text = "3. ĐIỂM SỐ CÁC FEATURE (VECTOR 8D)",
                     style = MaterialTheme.typography.labelMedium,
                     color = AccentBlue,
                     fontWeight = FontWeight.SemiBold,
                 )
-                Text(text = "FPS & Độ trễ: ${presentation.performance}", style = MaterialTheme.typography.bodySmall)
-                Text(text = "Đa luồng: ${presentation.threadTelemetrySummary}", style = MaterialTheme.typography.bodySmall)
+                if (presentation.featureScores.isEmpty()) {
+                    Text(
+                        text = "Chưa có thông tin feature",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                } else {
+                    presentation.featureScores.forEach { item ->
+                        FeatureScoreRow(item = item)
+                    }
+                }
 
                 presentation.error?.let {
                     Text(
@@ -180,5 +190,37 @@ fun MonitoringDebugPanel(
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun FeatureScoreRow(item: FeatureScoreItem) {
+    val score = item.normalizedScore
+    val scoreColor = when {
+        score == null -> MaterialTheme.colorScheme.onSurfaceVariant
+        score < 0.4 -> SafeGreen
+        score < 0.7 -> WarningYellow
+        else -> DangerRed
+    }
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 2.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = item.displayName,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurface,
+            modifier = Modifier.weight(1f),
+        )
+        Text(
+            text = if (score != null) item.scoreText else "-",
+            style = MaterialTheme.typography.bodySmall,
+            fontWeight = FontWeight.Bold,
+            color = scoreColor,
+        )
     }
 }

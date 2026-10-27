@@ -173,9 +173,9 @@ class LetterboxProcessor(
                 val wx0 = 1.0 - wx
 
                 fun mapCoord(ex: Int, ey: Int): Pair<Int, Int> = when (rotationDegrees) {
-                    90 -> (width - 1 - ey) to ex
+                    90 -> ey to (height - 1 - ex)
                     180 -> (width - 1 - ex) to (height - 1 - ey)
-                    270 -> ey to (height - 1 - ex)
+                    270 -> (width - 1 - ey) to ex
                     else -> ex to ey
                 }
 

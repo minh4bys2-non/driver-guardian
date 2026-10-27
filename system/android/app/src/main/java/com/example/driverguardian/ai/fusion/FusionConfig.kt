@@ -94,7 +94,8 @@ object FusionConfig {
         0.6491293907165527,
         0.4759885370731354,
         0.0,
-        0.07674604654312134
+        0.07674604654312134,
+//        0.5,
 //        DEFAULT_CANDIDATE_SELECTION_THRESHOLD,
     )
 

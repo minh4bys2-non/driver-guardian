@@ -19,9 +19,16 @@ class RgbaFramePool(
     private val buffers: Array<ByteArray> = Array(poolSize) { ByteArray(frameBytesSize) }
     private val writeCursor = AtomicInteger(0)
 
-    fun acquireNextBuffer(): ByteArray {
+    fun acquireNextBuffer(requiredBytes: Int = frameBytesSize): ByteArray {
+        require(requiredBytes > 0) { "Required buffer size must be positive" }
         val idx = (writeCursor.getAndIncrement() and Int.MAX_VALUE) % poolSize
-        return buffers[idx]
+        val current = buffers[idx]
+        if (current.size < requiredBytes) {
+            val resized = ByteArray(requiredBytes)
+            buffers[idx] = resized
+            return resized
+        }
+        return current
     }
 
     fun getBufferAt(index: Int): ByteArray = buffers[index % poolSize]

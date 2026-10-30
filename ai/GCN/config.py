@@ -95,7 +95,13 @@ class TrainConfig:
     lr: float = 1e-3
     weight_decay: float = 1e-4
     epochs: int = 50
+    warmup_epochs: int = 5
+    min_lr_ratio: float = 0.05
+    max_grad_norm: float = 1.0
+    amp: bool = True
     save_dir: str = "ai/GCN/checkpoints"
+    log_dir: Optional[str] = None
+    resume: Optional[str] = None
     seed: int = 42
 
     def __post_init__(self):

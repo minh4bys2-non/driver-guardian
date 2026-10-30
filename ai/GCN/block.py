@@ -83,6 +83,7 @@ class KinematicFeatureExtractor(nn.Module):
     1. Đưa tọa độ tĩnh (x, y) về Hệ tọa độ Cục bộ Tâm mũi (điểm 30) & chia cho khoảng cách 2 mắt (36 <-> 45).
     2. Tính Vận tốc (dx, dy) và Gia tốc (d2x, d2y) đã chuẩn hóa theo kích thước khuôn mặt
        (giữ nguyên được quỹ đạo rơi của đầu khi tài xế ngủ gật).
+    Hỗ trợ temporal mask để triệt tiêu cú sốc số học tại biên zero-padding khi batch có độ dài thay đổi.
     """
     def __init__(
         self,
@@ -97,19 +98,44 @@ class KinematicFeatureExtractor(nn.Module):
         self.right_eye_idx = right_eye_idx
         self.eps = eps
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    @staticmethod
+    def build_temporal_mask(
+        x: torch.Tensor,
+        lengths: Optional[torch.Tensor] = None,
+        eps: float = 1e-6,
+    ) -> torch.Tensor:
+        """
+        Tạo binary float mask kích thước (B, 1, T, 1) biểu diễn các frame hợp lệ (1.0) và frame đệm (0.0).
+        - Nếu lengths được truyền vào: tạo mask chính xác từ lengths.
+        - Nếu lengths is None: tự động nhận diện từ biên độ tọa độ (frame hợp lệ có tọa độ khác 0).
+        """
+        B, _, T, _ = x.shape
+        device = x.device
+        if lengths is not None:
+            t_idx = torch.arange(T, device=device).unsqueeze(0)  # (1, T)
+            mask = (t_idx < lengths.to(device).unsqueeze(1)).float()  # (B, T)
+            return mask.view(B, 1, T, 1)
+        else:
+            # Tự nhận diện frame hợp lệ (tổng tọa độ x, y khác 0)
+            frame_activity = x[:, :2].abs().sum(dim=(1, 3), keepdim=True)  # (B, 1, T, 1)
+            return (frame_activity > eps).float()
+
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Input : (B, 2, T, V=68) - Tọa độ pixel hoặc [0, 1] trong Hệ tọa độ Khung ảnh.
+        mask  : (B, 1, T, 1)    - Float mask (1.0 = valid, 0.0 = padded)
         Output: (B, 6, T, V=68) - [x_norm, y_norm, dx_norm, dy_norm, d2x_norm, d2y_norm]
         """
         if x.size(1) == 6:
-            return x
+            return x * mask if mask is not None else x
 
         # 1. Tính khoảng cách giải phẫu chuẩn d_t (Inter-Ocular Distance giữa điểm 36 và 45)
         # eye_dist shape: (B, 1, T, 1)
         p_left_eye = x[:, :, :, self.left_eye_idx : self.left_eye_idx + 1]   # (B, 2, T, 1)
         p_right_eye = x[:, :, :, self.right_eye_idx : self.right_eye_idx + 1] # (B, 2, T, 1)
-        iod_scale = torch.norm(p_right_eye - p_left_eye, p=2, dim=1, keepdim=True) + self.eps
+        raw_iod = torch.norm(p_right_eye - p_left_eye, p=2, dim=1, keepdim=True)
+        # Tránh chia cho eps=1e-6 tại các frame pad gây spike số học khổng lồ
+        iod_scale = raw_iod.clamp(min=self.eps)
 
         # 2. Chuẩn hóa tọa độ hình thái tĩnh theo Tâm mũi (điểm 30) và tỷ lệ IOD
         nose_pos = x[:, :, :, self.nose_idx : self.nose_idx + 1]              # (B, 2, T, 1)
@@ -119,13 +145,32 @@ class KinematicFeatureExtractor(nn.Module):
         # (Tính diff trên x trước khi trừ mũi để giữ được vận tốc gật đầu của cả khuôn mặt)
         vel_raw = torch.diff(x, n=1, dim=2)
         vel_raw = F.pad(vel_raw, (0, 0, 1, 0), mode='replicate')
+
+        if mask is not None:
+            # Triệt tiêu bước nhảy biên giữa frame hợp lệ cuối cùng và frame pad đầu tiên
+            pair_valid_vel = mask[:, :, 1:, :] * mask[:, :, :-1, :]
+            pair_valid_vel = F.pad(pair_valid_vel, (0, 0, 1, 0), mode='constant', value=1.0)
+            vel_raw = vel_raw * pair_valid_vel
+
         vel_norm = vel_raw / iod_scale                                        # (B, 2, T, V)
 
-        acc_norm = torch.diff(vel_norm, n=1, dim=2)
-        acc_norm = F.pad(acc_norm, (0, 0, 1, 0), mode='replicate')            # (B, 2, T, V)
+        acc_raw = torch.diff(vel_norm, n=1, dim=2)
+        acc_raw = F.pad(acc_raw, (0, 0, 1, 0), mode='replicate')
+
+        if mask is not None:
+            pair_valid_acc = mask[:, :, 1:, :] * mask[:, :, :-1, :]
+            pair_valid_acc = F.pad(pair_valid_acc, (0, 0, 1, 0), mode='constant', value=1.0)
+            acc_raw = acc_raw * pair_valid_acc
+
+        acc_norm = acc_raw                                                    # (B, 2, T, V)
 
         # Ghép thành 6 kênh đặc trưng chuẩn hóa hoàn chỉnh
-        return torch.cat([pos_norm, vel_norm, acc_norm], dim=1)               # (B, 6, T, V)
+        out = torch.cat([pos_norm, vel_norm, acc_norm], dim=1)               # (B, 6, T, V)
+
+        if mask is not None:
+            out = out * mask
+
+        return out
 
 
 class PyGSpatialGraphConv(nn.Module):
@@ -238,6 +283,7 @@ class MultiScaleTemporalConv(nn.Module):
 class STGCNBlock(nn.Module):
     """
     Khối ST-GCN hoàn chỉnh: PyGSpatialGraphConv -> MultiScaleTemporalConv -> Residual Connection.
+    Hỗ trợ temporal mask để triệt tiêu bias rò rỉ tại các frame zero-padding.
     """
 
     def __init__(
@@ -253,6 +299,7 @@ class STGCNBlock(nn.Module):
         dilations: Tuple[int, int] = (1, 2),
     ):
         super().__init__()
+        self.stride = stride
         self.sgcn = PyGSpatialGraphConv(
             in_channels,
             out_channels,
@@ -279,8 +326,19 @@ class STGCNBlock(nn.Module):
 
         self.act = nn.GELU()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        x   : (B, C_in, T_in, V)
+        mask: Optional (B, 1, T_in, 1) - Float mask (1.0 = valid, 0.0 = padded)
+        """
         res = self.residual(x)
         x = self.sgcn(x)
+        if mask is not None:
+            # Triệt tiêu bias của GCN/GAT/BN ở vùng pad trước khi tích chập thời gian
+            x = x * mask
         x = self.tgcn(x)
-        return self.act(x + res)
+        out = self.act(x + res)
+        if mask is not None:
+            mask_out = mask[:, :, ::self.stride, :][:, :, :out.size(2), :]
+            out = out * mask_out
+        return out

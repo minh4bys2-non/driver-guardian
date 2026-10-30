@@ -1,7 +1,8 @@
 # File: model.py
-from typing import List, Optional
+from typing import List, Optional, Tuple
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from block import (
     FacialGraphBuilder,
     KinematicFeatureExtractor,
@@ -81,28 +82,63 @@ class DriverSTGCN(nn.Module):
             nn.Linear(cls_mid, num_classes)
         )
 
-    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
-        """Trích xuất đặc trưng không gian - thời gian trước khi Pooling."""
-        x = self.kinematics(x)  # Đảm bảo đầu vào có đủ 6 kênh [x, y, dx, dy, d2x, d2y]
+    def _forward_features_with_mask(
+        self,
+        x: torch.Tensor,
+        lengths: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Trích xuất đặc trưng kèm theo mask thời gian đã downsample tương ứng.
+        Trả về (feat, mask) trong đó:
+          - feat: (B, C_last, T_out, V)
+          - mask: (B, 1, T_out, 1)
+        """
+        mask = self.kinematics.build_temporal_mask(x, lengths=lengths)
+        x = self.kinematics(x, mask=mask)  # Đảm bảo đầu vào có đủ 6 kênh [x, y, dx, dy, d2x, d2y]
         B, C, T, V = x.shape
 
         # Chuẩn hóa đầu vào dọc theo (C * V)
         x = x.permute(0, 1, 3, 2).contiguous().view(B, C * V, T)
         x = self.input_bn(x)
         x = x.view(B, C, V, T).permute(0, 1, 3, 2).contiguous()
+        x = x * mask  # Triệt tiêu bias của BatchNorm tại các frame zero-padding
 
+        curr_mask = mask
         for block in self.backbone:
-            x = block(x)
-        return x
+            x = block(x, mask=curr_mask)
+            curr_mask = curr_mask[:, :, ::block.stride, :][:, :, :x.size(2), :]
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x, curr_mask
+
+    def forward_features(
+        self,
+        x: torch.Tensor,
+        lengths: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Trích xuất đặc trưng không gian - thời gian trước khi Pooling."""
+        feat, _ = self._forward_features_with_mask(x, lengths=lengths)
+        return feat
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        lengths: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
-        x shape: (B, 2, T, V) hoặc (B, 6, T, V)
+        x      : (B, 2, T, V) hoặc (B, 6, T, V)
+        lengths: LongTensor (B,) [Tùy chọn - số frame hợp lệ trước khi pad của từng mẫu]
         Output : (B, num_classes)
         """
-        feat = self.forward_features(x)         # (B, C_last, T_out, V)
-        pooled = self.global_pool(feat)         # (B, C_last, 1, 1)
-        return self.classifier(pooled)          # (B, num_classes)
+        feat, mask = self._forward_features_with_mask(x, lengths=lengths)  # (B, C_last, T_out, V), (B, 1, T_out, 1)
+
+        # Masked Global Average Pooling:
+        # 1. Trung bình trên 68 đỉnh không gian
+        feat_spatial = feat.mean(dim=-1, keepdim=True)                     # (B, C_last, T_out, 1)
+        # 2. Trung bình trên đúng số lượng frame hợp lệ L_out (loại bỏ hoàn toàn ảnh hưởng của frame pad)
+        valid_t = mask.sum(dim=2, keepdim=True).clamp(min=1.0)             # (B, 1, 1, 1)
+        pooled = (feat_spatial * mask).sum(dim=2, keepdim=True) / valid_t  # (B, C_last, 1, 1)
+
+        return self.classifier(pooled)                                     # (B, num_classes)
 
 
 class DriverSTGCNTransformer(nn.Module):
@@ -150,10 +186,10 @@ class DriverSTGCNTransformer(nn.Module):
         self.input_bn = nn.BatchNorm1d(in_channels * num_nodes)
 
         # 1. Tầng ST-GCN Stem rút trích đặc trưng đồ thị khuôn mặt
-        self.stgcn_stem = nn.Sequential(
+        self.stgcn_stem = nn.ModuleList([
             STGCNBlock(in_channels, stem_channels[0], adj_prior, stride=stem_strides[0], dropout=dropout),
             STGCNBlock(stem_channels[0], stem_channels[1], adj_prior, stride=stem_strides[1], dropout=dropout)
-        )
+        ])
 
         # 2. Trọng số chú ý không gian (Spatial Node Attention Pooling) gộp V=68 đỉnh về 1 vector/frame
         self.node_attention = nn.Sequential(
@@ -182,20 +218,31 @@ class DriverSTGCNTransformer(nn.Module):
             nn.Linear(d_model, num_classes)
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        lengths: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
-        x shape: (B, 2, T, V) hoặc (B, 6, T, V)
+        x      : (B, 2, T, V) hoặc (B, 6, T, V)
+        lengths: LongTensor (B,) [Tùy chọn - số frame hợp lệ trước khi pad]
         Output : (B, num_classes)
         """
-        x = self.kinematics(x)
+        mask = self.kinematics.build_temporal_mask(x, lengths=lengths)
+        x = self.kinematics(x, mask=mask)
         B, C, T, V = x.shape
 
         x = x.permute(0, 1, 3, 2).contiguous().view(B, C * V, T)
         x = self.input_bn(x)
         x = x.view(B, C, V, T).permute(0, 1, 3, 2).contiguous()
+        x = x * mask
 
-        # Qua ST-GCN: (B, d_model, T'=T/2, V=68)
-        x = self.stgcn_stem(x)
+        # Qua ST-GCN Stem:
+        curr_mask = mask
+        for block in self.stgcn_stem:
+            x = block(x, mask=curr_mask)
+            curr_mask = curr_mask[:, :, ::block.stride, :][:, :, :x.size(2), :]
+
         _, D, T_prime, _ = x.shape
 
         # Gộp 68 đỉnh bằng Node Attention cho mỗi bước thời gian
@@ -205,11 +252,28 @@ class DriverSTGCNTransformer(nn.Module):
         seq = x_spatial_pooled.view(B, T_prime, D)                  # (B, T', D)
 
         # Ghép [CLS] token và Positional Embedding rồi đưa qua TransformerEncoder
-        cls_tokens = self.cls_token.expand(B, -1, -1)
+        cls_tokens = self.cls_token.expand(B, -1, -1)               # (B, 1, D)
         seq = torch.cat([cls_tokens, seq], dim=1)                   # (B, T'+1, D)
-        seq = seq + self.pos_embedding[:, : seq.size(1), :]
 
-        encoded = self.transformer(seq)                             # (B, T'+1, D)
+        seq_len = seq.size(1)
+        if seq_len <= self.pos_embedding.size(1):
+            pos_emb = self.pos_embedding[:, :seq_len, :]
+        else:
+            pos_emb = F.interpolate(
+                self.pos_embedding.permute(0, 2, 1),
+                size=seq_len,
+                mode='linear',
+                align_corners=False
+            ).permute(0, 2, 1)
+
+        seq = seq + pos_emb
+
+        # Xây dựng padding mask cho Transformer: True = bỏ qua (vùng pad), False = hợp lệ
+        padding_mask = torch.zeros((B, seq_len), dtype=torch.bool, device=x.device)
+        is_pad = (curr_mask.squeeze(1).squeeze(-1) <= 0.5)          # (B, T_prime) bool
+        padding_mask[:, 1:1 + T_prime] = is_pad
+
+        encoded = self.transformer(seq, src_key_padding_mask=padding_mask)  # (B, T'+1, D)
         cls_out = encoded[:, 0]                                     # Lấy đặc trưng tại [CLS] token
 
         return self.head(cls_out)
@@ -247,3 +311,20 @@ if __name__ == "__main__":
     pure_out = pure_model(raw_landmarks)
     print("\n--- Test khoi tao thuan tuy (tham so doc lap, khong config) ---")
     print(f"[DriverSTGCN Pure]       Output shape: {pure_out.shape}")
+
+    # 3. Test batch có Padding và tensor lengths (mô phỏng collate_gcn từ dataset.py)
+    print("\n--- Test voi batch co Padding & lengths ---")
+    lengths = torch.tensor([30, 45, 60, 20], dtype=torch.long, device=device)
+    padded_input = raw_landmarks.clone()
+    for b, l in enumerate(lengths):
+        padded_input[b, :, l:, :] = 0.0
+
+    out_pad_light = model_light(padded_input, lengths=lengths)
+    out_pad_trans = model_trans(padded_input, lengths=lengths)
+    print(f"[DriverSTGCN with Pad]   Output shape: {out_pad_light.shape}")
+    print(f"[DriverTrans with Pad]   Output shape: {out_pad_trans.shape}")
+
+    # Backward check:
+    loss = out_pad_light.sum() + out_pad_trans.sum()
+    loss.backward()
+    print("Backward pass thanh cong, gradient hop le (khong co NaN/Inf)!")

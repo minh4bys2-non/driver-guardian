@@ -486,27 +486,48 @@ def visualize_video_landmarks(
 # =====================================================================
 # 5. HÀM COLLATE VÀ BUILD DATALOADER
 # =====================================================================
-def collate_gcn(batch: List[Tuple[torch.Tensor, torch.Tensor, Dict[str, Any]]]):
+def collate_gcn(batch: List[Tuple[Any, ...]]):
     """
     Gom các mẫu vào batch.
-    Khi window_sec=None (số frame T giữa các video có thể khác nhau),
-    tự động pad thêm frame 0 ở chiều thời gian T về max_T của batch.
+    Khi window_sec=None (số frame T giữa các video có thể khác nhau) hoặc các video có độ dài khác nhau,
+    tự động pad thêm frame 0 ở chiều thời gian T về max_T của batch và trả về tensor lengths.
+
+    Returns:
+        - padded_landmarks: Tensor (B, 2, max_T, 68)
+        - labels          : LongTensor (B,)
+        - lengths         : LongTensor (B,) chứa số frame thực tế trước khi pad của từng mẫu
+        - metas           : List[Dict[str, Any]]
+        - frames (tùy chọn): List[List[np.ndarray]] nếu dataset bật return_frames=True
     """
-    landmarks, labels, metas = zip(*batch)
+    has_frames = len(batch[0]) == 4
+    if has_frames:
+        landmarks, labels, metas, frames_list = zip(*batch)
+    else:
+        landmarks, labels, metas = zip(*batch)
+
     lengths = [lm.shape[1] for lm in landmarks]
     max_len = max(lengths)
 
     padded_landmarks = []
-    for lm in landmarks:
-        t = lm.shape[1]
+    updated_metas = []
+    for lm, meta, t in zip(landmarks, metas, lengths):
         if t < max_len:
-            pad_tensor = torch.zeros((2, max_len, 68), dtype=lm.dtype)
+            pad_tensor = torch.zeros((lm.shape[0], max_len, lm.shape[2]), dtype=lm.dtype)
             pad_tensor[:, :t, :] = lm
             padded_landmarks.append(pad_tensor)
         else:
             padded_landmarks.append(lm)
 
-    return torch.stack(padded_landmarks), torch.stack(labels), list(metas)
+        meta_copy = dict(meta)
+        meta_copy["valid_frames"] = t
+        meta_copy["padded_frames"] = max_len
+        updated_metas.append(meta_copy)
+
+    lengths_tensor = torch.tensor(lengths, dtype=torch.long)
+
+    if has_frames:
+        return torch.stack(padded_landmarks), torch.stack(labels), lengths_tensor, updated_metas, list(frames_list)
+    return torch.stack(padded_landmarks), torch.stack(labels), lengths_tensor, updated_metas
 
 
 def build_gcn_dataloaders(

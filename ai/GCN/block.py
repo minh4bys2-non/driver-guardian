@@ -1,4 +1,5 @@
 # File: block.py
+from typing import List, Tuple, Optional, Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -13,7 +14,11 @@ class FacialGraphBuilder:
     """
 
     @staticmethod
-    def get_edge_index(num_nodes: int = 68) -> torch.Tensor:
+    def get_edge_index(
+        num_nodes: int = 68,
+        vertical_pairs: Optional[List[Tuple[int, int]] | List[List[int]]] = None,
+        cross_region_pairs: Optional[List[Tuple[int, int]] | List[List[int]]] = None,
+    ) -> torch.Tensor:
         edges = []
 
         def add_chain(indices, closed=False):
@@ -34,19 +39,21 @@ class FacialGraphBuilder:
         add_chain(range(60, 68), closed=True)  # Môi trong
 
         # 2. Cạnh dọc đo độ mở Mắt (EAR) & Miệng (MAR)
-        vertical_pairs = [
-            [37, 41], [38, 40], [43, 47], [44, 46],  # Mí mắt trên - dưới
-            [50, 58], [51, 57], [52, 56], [61, 67], [62, 66], [63, 65]  # Môi trên - dưới
-        ]
+        if vertical_pairs is None:
+            vertical_pairs = [
+                [37, 41], [38, 40], [43, 47], [44, 46],  # Mí mắt trên - dưới
+                [50, 58], [51, 57], [52, 56], [61, 67], [62, 66], [63, 65]  # Môi trên - dưới
+            ]
 
         # 3. Cạnh tiên nghiệm liên vùng (Mắt <-> Miệng, Mũi <-> Cằm)
-        cross_region_pairs = [
-            [37, 48], [41, 48], [38, 62], [40, 66],  # Mắt trái <-> Miệng
-            [44, 54], [46, 54], [43, 62], [47, 66],  # Mắt phải <-> Miệng
-            [30, 8], [30, 36], [30, 45], [27, 8]  # Chóp mũi <-> Cằm & Đuôi mắt
-        ]
+        if cross_region_pairs is None:
+            cross_region_pairs = [
+                [37, 48], [41, 48], [38, 62], [40, 66],  # Mắt trái <-> Miệng
+                [44, 54], [46, 54], [43, 62], [47, 66],  # Mắt phải <-> Miệng
+                [30, 8], [30, 36], [30, 45], [27, 8]  # Chóp mũi <-> Cằm & Đuôi mắt
+            ]
 
-        all_edges = edges + vertical_pairs + cross_region_pairs
+        all_edges = edges + [list(p) for p in vertical_pairs] + [list(p) for p in cross_region_pairs]
         edge_index = torch.tensor(all_edges, dtype=torch.long).t().contiguous()
 
         # Sử dụng hàm có sẵn của PyTorch Geometric để tạo đồ thị vô hướng và thêm self-loops
@@ -55,9 +62,18 @@ class FacialGraphBuilder:
         return edge_index
 
     @classmethod
-    def get_dense_adj(cls, num_nodes: int = 68) -> torch.Tensor:
+    def get_dense_adj(
+        cls,
+        num_nodes: int = 68,
+        vertical_pairs: Optional[List[Tuple[int, int]] | List[List[int]]] = None,
+        cross_region_pairs: Optional[List[Tuple[int, int]] | List[List[int]]] = None,
+    ) -> torch.Tensor:
         """Trả về ma trận kề Dense kích thước (V, V) từ edge_index."""
-        edge_index = cls.get_edge_index(num_nodes=num_nodes)
+        edge_index = cls.get_edge_index(
+            num_nodes=num_nodes,
+            vertical_pairs=vertical_pairs,
+            cross_region_pairs=cross_region_pairs,
+        )
         return to_dense_adj(edge_index, max_num_nodes=num_nodes).squeeze(0)
 
 
@@ -68,8 +84,21 @@ class KinematicFeatureExtractor(nn.Module):
     2. Tính Vận tốc (dx, dy) và Gia tốc (d2x, d2y) đã chuẩn hóa theo kích thước khuôn mặt
        (giữ nguyên được quỹ đạo rơi của đầu khi tài xế ngủ gật).
     """
-    def __init__(self, nose_idx: int = 30, left_eye_idx: int = 36, right_eye_idx: int = 45, eps: float = 1e-6):
+    def __init__(
+        self,
+        nose_idx: int = 30,
+        left_eye_idx: int = 36,
+        right_eye_idx: int = 45,
+        eps: float = 1e-6,
+        config: Optional[Any] = None,
+    ):
         super().__init__()
+        if config is not None:
+            nose_idx = getattr(config, "nose_idx", nose_idx)
+            left_eye_idx = getattr(config, "left_eye_idx", left_eye_idx)
+            right_eye_idx = getattr(config, "right_eye_idx", right_eye_idx)
+            eps = getattr(config, "eps", eps)
+
         self.nose_idx = nose_idx
         self.left_eye_idx = left_eye_idx
         self.right_eye_idx = right_eye_idx
@@ -114,19 +143,20 @@ class PyGSpatialGraphConv(nn.Module):
     """
 
     def __init__(
-            self,
-            in_channels: int,
-            out_channels: int,
-            adj_prior: torch.Tensor,
-            gat_heads: int = 4,
-            dropout: float = 0.1
+        self,
+        in_channels: int,
+        out_channels: int,
+        adj_prior: torch.Tensor,
+        gat_heads: int = 4,
+        dropout: float = 0.1,
+        adaptive_init_scale: float = 1e-5,
     ):
         super().__init__()
         num_nodes = adj_prior.size(0)
         self.register_buffer('adj_prior', adj_prior)
 
         # Ma trận kề tự học toàn cục A_adaptive
-        self.adj_adaptive = nn.Parameter(torch.randn(num_nodes, num_nodes) * 1e-5)
+        self.adj_adaptive = nn.Parameter(torch.randn(num_nodes, num_nodes) * adaptive_init_scale)
 
         # 1. Nhánh GCN tĩnh + thích ứng (PyG DenseGCNConv tự động chuẩn hóa D^-1/2 A D^-1/2)
         self.gcn = DenseGCNConv(in_channels, out_channels, improved=False, bias=True)
@@ -175,25 +205,33 @@ class MultiScaleTemporalConv(nn.Module):
     - Nhánh 2 (Dilation = 2): Bắt chuyển động kéo dài (ngáp, ngủ gật).
     """
 
-    def __init__(self, channels: int, kernel_size: int = 5, stride: int = 1, dropout: float = 0.2):
+    def __init__(
+        self,
+        channels: int,
+        kernel_size: int = 5,
+        stride: int = 1,
+        dropout: float = 0.2,
+        dilations: Tuple[int, int] = (1, 2),
+    ):
         super().__init__()
         mid_channels = channels // 2
-        pad_d1 = (kernel_size - 1) // 2
-        pad_d2 = (kernel_size - 1)  # Với dilation = 2
+        d1, d2 = dilations
+        pad_d1 = (kernel_size - 1) * d1 // 2
+        pad_d2 = (kernel_size - 1) * d2 // 2
 
         self.branch1 = nn.Conv2d(
             channels, mid_channels,
             kernel_size=(kernel_size, 1),
             stride=(stride, 1),
             padding=(pad_d1, 0),
-            dilation=(1, 1)
+            dilation=(d1, 1)
         )
         self.branch2 = nn.Conv2d(
             channels, channels - mid_channels,
             kernel_size=(kernel_size, 1),
             stride=(stride, 1),
             padding=(pad_d2, 0),
-            dilation=(2, 1)
+            dilation=(d2, 1)
         )
 
         self.bn = nn.BatchNorm2d(channels)
@@ -210,17 +248,33 @@ class STGCNBlock(nn.Module):
     """
 
     def __init__(
-            self,
-            in_channels: int,
-            out_channels: int,
-            adj_prior: torch.Tensor,
-            temporal_kernel: int = 5,
-            stride: int = 1,
-            dropout: float = 0.2
+        self,
+        in_channels: int,
+        out_channels: int,
+        adj_prior: torch.Tensor,
+        temporal_kernel: int = 5,
+        stride: int = 1,
+        dropout: float = 0.2,
+        gat_heads: int = 4,
+        adaptive_init_scale: float = 1e-5,
+        dilations: Tuple[int, int] = (1, 2),
     ):
         super().__init__()
-        self.sgcn = PyGSpatialGraphConv(in_channels, out_channels, adj_prior, dropout=dropout)
-        self.tgcn = MultiScaleTemporalConv(out_channels, kernel_size=temporal_kernel, stride=stride, dropout=dropout)
+        self.sgcn = PyGSpatialGraphConv(
+            in_channels,
+            out_channels,
+            adj_prior,
+            gat_heads=gat_heads,
+            dropout=dropout,
+            adaptive_init_scale=adaptive_init_scale,
+        )
+        self.tgcn = MultiScaleTemporalConv(
+            out_channels,
+            kernel_size=temporal_kernel,
+            stride=stride,
+            dropout=dropout,
+            dilations=dilations,
+        )
 
         if in_channels == out_channels and stride == 1:
             self.residual = nn.Identity()

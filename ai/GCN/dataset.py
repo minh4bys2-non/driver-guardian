@@ -201,15 +201,37 @@ class GCNDataset(Dataset):
 
     def __init__(
         self,
-        dataset_dir: str = r"E:\LSTM\data_processed",
+        dataset_dir: Optional[str | Path] = None,
         split: str = "train",
-        time_interval: float = 0.2,
+        time_interval: Optional[float] = None,
         window_sec: Optional[float] = 10.0,
         landmark_model_path: Optional[str | Path] = None,
         return_frames: bool = False,
+        config: Optional[Any] = None,
     ):
         if split not in ("train", "val", "test"):
             raise ValueError(f"Split không hợp lệ: {split}. Chỉ chấp nhận 'train', 'val', 'test'.")
+
+        # Nạp giá trị từ config nếu được truyền
+        if config is not None:
+            ds_cfg = getattr(config, "dataset", config)
+            if dataset_dir is None:
+                dataset_dir = getattr(ds_cfg, "dataset_dir", r"E:\LSTM\data_processed")
+            if time_interval is None:
+                time_interval = getattr(ds_cfg, "time_interval", 0.2)
+            if window_sec is None and hasattr(ds_cfg, "window_sec"):
+                window_sec = getattr(ds_cfg, "window_sec", 10.0)
+            if landmark_model_path is None:
+                landmark_model_path = getattr(ds_cfg, "landmark_model_path", None)
+            self.manifest_filename = getattr(ds_cfg, "manifest_filename", "dataset_merged_split.csv")
+        else:
+            self.manifest_filename = "dataset_merged_split.csv"
+
+        if dataset_dir is None:
+            dataset_dir = r"E:\LSTM\data_processed"
+        if time_interval is None:
+            time_interval = 0.2
+
         if time_interval < 0:
             raise ValueError(f"time_interval phải là số không âm (>= 0): {time_interval}")
         if window_sec is not None and window_sec <= 0:
@@ -228,7 +250,7 @@ class GCNDataset(Dataset):
 
     def _load_samples(self) -> List[Dict[str, Any]]:
         """Nạp danh sách video từ manifest CSV hoặc quét thư mục dự phòng."""
-        manifest = self.root / "dataset_merged_split.csv"
+        manifest = self.root / self.manifest_filename
         samples = []
 
         if manifest.is_file():
@@ -506,21 +528,39 @@ def collate_gcn(batch: List[Tuple[torch.Tensor, torch.Tensor, Dict[str, Any]]]):
 
 
 def build_gcn_dataloaders(
-    dataset_dir: str = r"E:\LSTM\data_processed",
-    batch_size: int = 16,
-    num_workers: int = 0,
-    time_interval: float = 0.2,
-    window_sec: Optional[float] = 10.0,
-    pin_memory: bool = True,
+    dataset_dir: Optional[str | Path] = None,
+    batch_size: Optional[int] = None,
+    num_workers: Optional[int] = None,
+    time_interval: Optional[float] = None,
+    window_sec: Optional[float] = None,
+    pin_memory: Optional[bool] = None,
+    config: Optional[Any] = None,
 ):
     """
     Xây dựng nhanh bộ DataLoader cho cả 3 tập train, val, test.
     - time_interval = 0: đọc toàn bộ frame tuần tự thông thường từ video.
     - time_interval > 0: lấy mẫu cách nhau time_interval giây (vd 0.2s tương đương 5 FPS).
+    - Hỗ trợ truyền cấu hình thông qua config (MasterConfig hoặc DatasetConfig/DataLoaderConfig).
     """
-    train_ds = GCNDataset(dataset_dir, split="train", time_interval=time_interval, window_sec=window_sec)
-    val_ds = GCNDataset(dataset_dir, split="val", time_interval=time_interval, window_sec=window_sec)
-    test_ds = GCNDataset(dataset_dir, split="test", time_interval=time_interval, window_sec=window_sec)
+    ds_cfg = getattr(config, "dataset", config) if config is not None else None
+    dl_cfg = getattr(config, "dataloader", config) if config is not None else None
+
+    if dataset_dir is None:
+        dataset_dir = getattr(ds_cfg, "dataset_dir", r"E:\LSTM\data_processed")
+    if time_interval is None:
+        time_interval = getattr(ds_cfg, "time_interval", 0.2)
+    if window_sec is None:
+        window_sec = getattr(ds_cfg, "window_sec", 10.0) if ds_cfg is not None else 10.0
+    if batch_size is None:
+        batch_size = getattr(dl_cfg, "batch_size", 16)
+    if num_workers is None:
+        num_workers = getattr(dl_cfg, "num_workers", 0)
+    if pin_memory is None:
+        pin_memory = getattr(dl_cfg, "pin_memory", True)
+
+    train_ds = GCNDataset(dataset_dir, split="train", time_interval=time_interval, window_sec=window_sec, config=ds_cfg)
+    val_ds = GCNDataset(dataset_dir, split="val", time_interval=time_interval, window_sec=window_sec, config=ds_cfg)
+    test_ds = GCNDataset(dataset_dir, split="test", time_interval=time_interval, window_sec=window_sec, config=ds_cfg)
 
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers,

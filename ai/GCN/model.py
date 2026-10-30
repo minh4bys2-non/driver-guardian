@@ -1,5 +1,5 @@
 # File: model.py
-from typing import List, Optional, Any
+from typing import List, Optional
 import torch
 import torch.nn as nn
 from block import (
@@ -13,7 +13,7 @@ class DriverSTGCN(nn.Module):
     """
     Model 1: ST-GCN Tiêu chuẩn siêu nhẹ (Tối ưu cho Edge AI / Suy luận thời gian thực).
     Ghép nối chuỗi STGCNBlock + Global Adaptive Pooling + MLP Classifier.
-    Hỗ trợ khởi tạo qua tham số rời rạc hoặc truyền trực tiếp đối tượng config (hoặc **dict).
+    Khởi tạo thuần túy qua các tham số thông thường, hoàn toàn độc lập với đối tượng config.
     """
     def __init__(
         self,
@@ -26,21 +26,12 @@ class DriverSTGCN(nn.Module):
         temporal_kernel: int = 5,
         gat_heads: int = 4,
         classifier_hidden_dim: Optional[int] = None,
-        config: Optional[Any] = None,
+        nose_idx: int = 30,
+        left_eye_idx: int = 36,
+        right_eye_idx: int = 45,
+        eps: float = 1e-6,
     ):
         super().__init__()
-        # Nếu truyền đối tượng config, tự động trích xuất các giá trị
-        if config is not None:
-            in_channels = getattr(config, "in_channels", in_channels)
-            num_classes = getattr(config, "num_classes", num_classes)
-            num_nodes = getattr(config, "num_nodes", num_nodes)
-            hidden_dims = getattr(config, "hidden_dims", hidden_dims)
-            strides = getattr(config, "strides", strides)
-            dropout = getattr(config, "dropout", dropout)
-            temporal_kernel = getattr(config, "temporal_kernel", temporal_kernel)
-            gat_heads = getattr(config, "gat_heads", gat_heads)
-            classifier_hidden_dim = getattr(config, "classifier_hidden_dim", classifier_hidden_dim)
-
         if hidden_dims is None:
             hidden_dims = [64, 128, 256]
         if strides is None:
@@ -52,7 +43,12 @@ class DriverSTGCN(nn.Module):
         adj_prior = FacialGraphBuilder.get_dense_adj(num_nodes=num_nodes)
 
         # 2. Khối trích xuất động học & Chuẩn hóa BatchNorm đầu vào trên từng điểm mốc
-        self.kinematics = KinematicFeatureExtractor(config=config)
+        self.kinematics = KinematicFeatureExtractor(
+            nose_idx=nose_idx,
+            left_eye_idx=left_eye_idx,
+            right_eye_idx=right_eye_idx,
+            eps=eps,
+        )
         self.input_bn = nn.BatchNorm1d(in_channels * num_nodes)
 
         # 3. Chuỗi các khối ST-GCN (dùng nn.ModuleList)
@@ -114,7 +110,7 @@ class DriverSTGCNTransformer(nn.Module):
     Model 2: Kiến trúc Lai ST-GCN + PyTorch TransformerEncoder.
     Dùng ST-GCN để học tương quan đồ thị cơ mặt cục bộ, sau đó đưa qua
     nn.TransformerEncoder để học phụ thuộc chuỗi thời gian dài hạn.
-    Hỗ trợ khởi tạo qua tham số rời rạc hoặc truyền trực tiếp đối tượng config (hoặc **dict).
+    Khởi tạo thuần túy qua các tham số thông thường, hoàn toàn độc lập với đối tượng config.
     """
     def __init__(
         self,
@@ -130,24 +126,12 @@ class DriverSTGCNTransformer(nn.Module):
         stem_strides: Optional[List[int]] = None,
         dim_feedforward: Optional[int] = None,
         init_std: float = 0.02,
-        config: Optional[Any] = None,
+        nose_idx: int = 30,
+        left_eye_idx: int = 36,
+        right_eye_idx: int = 45,
+        eps: float = 1e-6,
     ):
         super().__init__()
-        # Nếu truyền đối tượng config, tự động trích xuất các giá trị
-        if config is not None:
-            in_channels = getattr(config, "in_channels", in_channels)
-            num_classes = getattr(config, "num_classes", num_classes)
-            num_nodes = getattr(config, "num_nodes", num_nodes)
-            d_model = getattr(config, "d_model", d_model)
-            nhead = getattr(config, "nhead", nhead)
-            num_transformer_layers = getattr(config, "num_transformer_layers", num_transformer_layers)
-            max_len = getattr(config, "max_len", max_len)
-            dropout = getattr(config, "dropout", dropout)
-            stem_channels = getattr(config, "stem_channels", stem_channels)
-            stem_strides = getattr(config, "stem_strides", stem_strides)
-            dim_feedforward = getattr(config, "dim_feedforward", dim_feedforward)
-            init_std = getattr(config, "init_std", init_std)
-
         if stem_channels is None:
             stem_channels = [64, d_model]
         if stem_strides is None:
@@ -157,7 +141,12 @@ class DriverSTGCNTransformer(nn.Module):
 
         adj_prior = FacialGraphBuilder.get_dense_adj(num_nodes=num_nodes)
 
-        self.kinematics = KinematicFeatureExtractor(config=config)
+        self.kinematics = KinematicFeatureExtractor(
+            nose_idx=nose_idx,
+            left_eye_idx=left_eye_idx,
+            right_eye_idx=right_eye_idx,
+            eps=eps,
+        )
         self.input_bn = nn.BatchNorm1d(in_channels * num_nodes)
 
         # 1. Tầng ST-GCN Stem rút trích đặc trưng đồ thị khuôn mặt
@@ -230,7 +219,7 @@ class DriverSTGCNTransformer(nn.Module):
 # KIỂM THỬ CẢ 2 MODEL KHI CHẠY TRỰC TIẾP FILE model.py
 # =====================================================================
 if __name__ == "__main__":
-    from config import get_default_config
+    from config import TrainConfig
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
@@ -238,23 +227,23 @@ if __name__ == "__main__":
     # Thử nghiệm với đầu vào chỉ có 2 kênh tọa độ (x, y): Shape = (Batch=4, C=2, T=60, V=68)
     raw_landmarks = torch.randn(4, 2, 60, 68).to(device)
 
-    # 1. Khởi tạo bằng đối tượng config (num_classes=2)
-    cfg = get_default_config(num_classes=2)
+    # 1. Khởi tạo qua kwargs được trích xuất từ TrainConfig
+    cfg = TrainConfig(num_classes=2)
 
-    model_light = DriverSTGCN(config=cfg.stgcn).to(device)
+    model_light = DriverSTGCN(**cfg.get_stgcn_kwargs()).to(device)
     out_light = model_light(raw_landmarks)
     params_light = sum(p.numel() for p in model_light.parameters() if p.requires_grad)
 
-    model_trans = DriverSTGCNTransformer(config=cfg.transformer).to(device)
+    model_trans = DriverSTGCNTransformer(**cfg.get_transformer_kwargs()).to(device)
     out_trans = model_trans(raw_landmarks)
     params_trans = sum(p.numel() for p in model_trans.parameters() if p.requires_grad)
 
-    print("\n--- Test khoi tao qua config=cfg.xxx ---")
+    print("\n--- Test khoi tao qua TrainConfig.get_*_kwargs() ---")
     print(f"[DriverSTGCN]            Output shape: {out_light.shape} | Params: {params_light:,}")
     print(f"[DriverSTGCNTransformer] Output shape: {out_trans.shape} | Params: {params_trans:,}")
 
-    # 2. Khởi tạo truyền thống (tương thích ngược hoàn toàn)
-    legacy_model = DriverSTGCN(in_channels=6, num_classes=3).to(device)
-    legacy_out = legacy_model(raw_landmarks)
-    print("\n--- Test khoi tao truyen thong (kwargs truyen tay) ---")
-    print(f"[DriverSTGCN Legacy]     Output shape: {legacy_out.shape}")
+    # 2. Khởi tạo truyền thống hoàn toàn độc lập (không cần bất kỳ đối tượng config nào)
+    pure_model = DriverSTGCN(in_channels=6, num_classes=3).to(device)
+    pure_out = pure_model(raw_landmarks)
+    print("\n--- Test khoi tao thuan tuy (tham so doc lap, khong config) ---")
+    print(f"[DriverSTGCN Pure]       Output shape: {pure_out.shape}")

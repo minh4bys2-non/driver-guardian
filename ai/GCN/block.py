@@ -1,5 +1,5 @@
 # File: block.py
-from typing import List, Tuple, Optional, Any
+from typing import List, Tuple, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -90,15 +90,8 @@ class KinematicFeatureExtractor(nn.Module):
         left_eye_idx: int = 36,
         right_eye_idx: int = 45,
         eps: float = 1e-6,
-        config: Optional[Any] = None,
     ):
         super().__init__()
-        if config is not None:
-            nose_idx = getattr(config, "nose_idx", nose_idx)
-            left_eye_idx = getattr(config, "left_eye_idx", left_eye_idx)
-            right_eye_idx = getattr(config, "right_eye_idx", right_eye_idx)
-            eps = getattr(config, "eps", eps)
-
         self.nose_idx = nose_idx
         self.left_eye_idx = left_eye_idx
         self.right_eye_idx = right_eye_idx

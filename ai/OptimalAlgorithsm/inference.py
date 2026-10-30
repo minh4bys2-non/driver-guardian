@@ -41,6 +41,7 @@ class CameraConfig:
     no_display: bool = False
     primary_fusion: str = "cooccurrence"  # Nhãn chính; vẫn xuất cả ba chế độ.
 
+
 CAMERA_CONFIG = CameraConfig()
 # Thứ tự: blink_frequency, blink_duration, perclos, yawn_frequency,
 # nod_duration, nod_frequency, dominant_head_motion_frequency, neuralnetwork_score, threshold.
@@ -48,10 +49,19 @@ CAMERA_CONFIG = CameraConfig()
 FUSION_CANDIDATES = {
     "weighted_mean": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.5],
     "noisy_or": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.5],
-    "cooccurrence": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.5],
+    "cooccurrence": [0.5003395080566406,
+                     0.8887009024620056,
+                     0.7320020794868469,
+                     0.2563990652561188,
+                     0.0,
+                     0.6491293907165527,
+                     0.4759885370731354,
+                     0.0,
+                     0.07674604654312134],
 }
 # Gán đường dẫn evaluation.json physical_v1 để thay trọng số thủ công của từng chế độ.
 FUSION_REPORTS = {"weighted_mean": None, "noisy_or": None, "cooccurrence": None}
+
 
 def load_fusion(path, normalizer):
     report = json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
@@ -109,11 +119,13 @@ def draw_dashboard(frame, metrics, result, fusions, status, timestamp, fps, args
         ("EAR / MAR", f"{number(metrics['ear'])} / {number(metrics['mar'])}"),
         ("PERCLOS (%)", number(metrics['perclos_pct'])),
         ("Blink / yawn / nod (per min)", " / ".join(number(metrics[k], 1) for k in
-            ('blink_rate_per_min', 'yawning_frequency_per_min', 'nodding_frequency_per_min'))),
+                                                    ('blink_rate_per_min', 'yawning_frequency_per_min',
+                                                     'nodding_frequency_per_min'))),
         ("Pitch / yaw / roll (deg)", " / ".join(number(metrics[k], 1) for k in ('pitch_deg', 'yaw_deg', 'roll_deg'))),
         ("Head motion (Hz)", number(metrics['head_motion_frequency_hz'])),
         ("Coverage eye / mouth / head (s)", " / ".join(number(metrics[k], 1) for k in
-            ('eye_observed_sec', 'mouth_observed_sec', 'head_observed_sec'))),
+                                                       ('eye_observed_sec', 'mouth_observed_sec',
+                                                        'head_observed_sec'))),
     )
     for label, value in live:
         y += 26
@@ -121,7 +133,8 @@ def draw_dashboard(frame, metrics, result, fusions, status, timestamp, fps, args
     y += 26
     ready = "/".join("READY" if metrics[k] else "WAIT" for k in ('eye_ready', 'mouth_ready', 'head_calibrated'))
     line(f"Eye / mouth / head: {ready}", 12, y, yellow)
-    line("Face detected" if metrics['face_detected'] else "NO FACE", 12, y + 26, green if metrics['face_detected'] else yellow)
+    line("Face detected" if metrics['face_detected'] else "NO FACE", 12, y + 26,
+         green if metrics['face_detected'] else yellow)
     line("Q / ESC: quit", 12, height - 14)
 
     x = width + 18
@@ -136,7 +149,7 @@ def draw_dashboard(frame, metrics, result, fusions, status, timestamp, fps, args
     line("NEURAL: CNN + ConvGRU", x, 332, yellow)
     if result:
         score = result['neuralnetwork_score']
-        line(f"P(alert)={1-score:.4f}   P(drowsy)={score:.4f}   age={age:.1f}s", x, 358)
+        line(f"P(alert)={1 - score:.4f}   P(drowsy)={score:.4f}   age={age:.1f}s", x, 358)
     else:
         line("Waiting for a valid physical window and neural clip...", x, 358)
     line("FUSION: score / threshold -> prediction", x, 398, yellow)
@@ -247,8 +260,8 @@ def run(args=CAMERA_CONFIG):
             metrics = camera.process(frame, timestamp)
             buffer.update(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), timestamp)
             for history, detected, duration in (
-                (blink, "blink_detected", "blink_duration_ms"),
-                (nod, "nod_detected", "nod_event_duration_ms"),
+                    (blink, "blink_detected", "blink_duration_ms"),
+                    (nod, "nod_detected", "nod_event_duration_ms"),
             ):
                 if metrics[detected] and metrics[duration] is not None:
                     history.append((timestamp, metrics[duration]))

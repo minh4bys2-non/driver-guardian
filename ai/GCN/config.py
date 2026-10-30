@@ -213,6 +213,7 @@ class TrainConfig:
             "window_sec": self.window_sec,
             "manifest_filename": self.manifest_filename,
             "landmark_model_path": self.landmark_model_path,
+            "letterbox_size": self.letterbox_size,
         }
 
     def get_dataloader_kwargs(self) -> Dict[str, Any]:
@@ -227,6 +228,7 @@ class TrainConfig:
             "pin_memory": self.pin_memory,
             "shuffle_train": self.shuffle_train,
             "landmark_model_path": self.landmark_model_path,
+            "letterbox_size": self.letterbox_size,
         }
 
 

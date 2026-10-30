@@ -207,6 +207,7 @@ class GCNDataset(Dataset):
         window_sec: Optional[float] = 10.0,
         manifest_filename: str = "dataset_merged_split.csv",
         landmark_model_path: Optional[str | Path] = None,
+        letterbox_size: int = 480,
         return_frames: bool = False,
     ):
         if split not in ("train", "val", "test"):
@@ -223,6 +224,7 @@ class GCNDataset(Dataset):
         self.split = split
         self.time_interval = float(time_interval)
         self.window_sec = float(window_sec) if window_sec is not None else None
+        self.letterbox_size = letterbox_size
         self.return_frames = return_frames
         self.extractor = FaceLandmarkExtractor(landmark_model_path, time_interval=self.time_interval)
         self.samples = self._load_samples()
@@ -355,6 +357,9 @@ class GCNDataset(Dataset):
 
         indices = self._get_frame_indices(total_frames, fps)
         frames = self._read_frames(sample["path"], indices)
+
+        if self.letterbox_size:
+            frames = [letterbox(f, new_size=self.letterbox_size) for f in frames]
 
         # Trích xuất 68 điểm mốc: shape (T, 68, 2)
         lm68 = self.extractor.extract(frames)
@@ -540,6 +545,7 @@ def build_gcn_dataloaders(
     pin_memory: bool = True,
     shuffle_train: bool = True,
     landmark_model_path: Optional[str | Path] = None,
+    letterbox_size: int = 480,
 ):
     """
     Xây dựng nhanh bộ DataLoader cho cả 3 tập train, val, test.
@@ -553,6 +559,7 @@ def build_gcn_dataloaders(
         window_sec=window_sec,
         manifest_filename=manifest_filename,
         landmark_model_path=landmark_model_path,
+        letterbox_size=letterbox_size,
     )
     val_ds = GCNDataset(
         dataset_dir=dataset_dir,
@@ -561,6 +568,7 @@ def build_gcn_dataloaders(
         window_sec=window_sec,
         manifest_filename=manifest_filename,
         landmark_model_path=landmark_model_path,
+        letterbox_size=letterbox_size,
     )
     test_ds = GCNDataset(
         dataset_dir=dataset_dir,
@@ -569,6 +577,7 @@ def build_gcn_dataloaders(
         window_sec=window_sec,
         manifest_filename=manifest_filename,
         landmark_model_path=landmark_model_path,
+        letterbox_size=letterbox_size,
     )
 
     train_loader = DataLoader(

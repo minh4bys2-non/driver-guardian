@@ -123,10 +123,10 @@ def build_model(cfg: TrainConfig) -> nn.Module:
 
 
 def get_cosine_warmup_scheduler(
-    optimizer: torch.optim.Optimizer,
-    total_epochs: int,
-    warmup_epochs: int = 5,
-    min_lr_ratio: float = 0.05,
+        optimizer: torch.optim.Optimizer,
+        total_epochs: int,
+        warmup_epochs: int = 5,
+        min_lr_ratio: float = 0.05,
 ) -> LambdaLR:
     """Tạo bộ điều tốc Cosine Annealing kèm giai đoạn Linear Warmup."""
     warmup_epochs = max(0, min(warmup_epochs, total_epochs - 1))
@@ -145,10 +145,10 @@ def get_cosine_warmup_scheduler(
 # 3. TÍNH TOÁN CHỈ SỐ: LOSS, ACCURACY, RECALL, F1, F2
 # =====================================================================
 def compute_metrics(
-    y_true: np.ndarray,
-    y_pred: np.ndarray,
-    avg_loss: float,
-    num_classes: int = 2,
+        y_true: np.ndarray,
+        y_pred: np.ndarray,
+        avg_loss: float,
+        num_classes: int = 2,
 ) -> Dict[str, float]:
     """
     Tính toán chi tiết các chỉ số phân loại: Loss, Accuracy, Recall, F1-score, F2-score, Precision.
@@ -218,16 +218,16 @@ def compute_metrics(
 # 4. THỰC THI 1 EPOCH (TRAIN HOẶC EVALUATION)
 # =====================================================================
 def run_epoch(
-    model: nn.Module,
-    loader: DataLoader,
-    criterion: nn.Module,
-    device: torch.device,
-    optimizer: Optional[torch.optim.Optimizer] = None,
-    scaler: Optional[torch.amp.GradScaler] = None,
-    amp: bool = True,
-    max_grad_norm: float = 1.0,
-    desc: str = "Train",
-    num_classes: int = 2,
+        model: nn.Module,
+        loader: DataLoader,
+        criterion: nn.Module,
+        device: torch.device,
+        optimizer: Optional[torch.optim.Optimizer] = None,
+        scaler: Optional[torch.amp.GradScaler] = None,
+        amp: bool = True,
+        max_grad_norm: float = 1.0,
+        desc: str = "Train",
+        num_classes: int = 2,
 ) -> Dict[str, float]:
     """Chạy 1 epoch đầy đủ qua DataLoader và trả về bộ chỉ số tổng hợp."""
     training = optimizer is not None
@@ -303,11 +303,11 @@ def run_epoch(
 # 5. GHI LOG TENSORBOARD ĐỒNG BỘ
 # =====================================================================
 def log_epoch_to_tensorboard(
-    writer: SummaryWriter,
-    train_metrics: Dict[str, float],
-    val_metrics: Dict[str, float],
-    current_lr: float,
-    epoch: int,
+        writer: SummaryWriter,
+        train_metrics: Dict[str, float],
+        val_metrics: Dict[str, float],
+        current_lr: float,
+        epoch: int,
 ) -> None:
     """Ghi nhận chi tiết các scalar Loss, Accuracy, Recall, F1, F2 cho cả Train & Val."""
     # 1. Các nhánh độc lập
@@ -365,7 +365,8 @@ def train(cfg: Optional[TrainConfig] = None) -> nn.Module:
 
     # 1. Khởi tạo DataLoaders
     train_loader, val_loader, test_loader = build_gcn_dataloaders(**cfg.get_dataloader_kwargs())
-    logger.info(f"Số lượng mẫu Dataset      : Train={len(train_loader.dataset)} | Val={len(val_loader.dataset)} | Test={len(test_loader.dataset)}")
+    logger.info(
+        f"Số lượng mẫu Dataset      : Train={len(train_loader.dataset)} | Val={len(val_loader.dataset)} | Test={len(test_loader.dataset)}")
 
     # 2. Khởi tạo Mô hình & Hàm Mất mát CrossEntropyLoss
     model = build_model(cfg).to(device)
@@ -553,22 +554,7 @@ def train(cfg: Optional[TrainConfig] = None) -> nn.Module:
 # =====================================================================
 if __name__ == "__main__":
     # Cấu hình trực tiếp các tham số huấn luyện qua lớp TrainConfig tại đây:
-    config = TrainConfig(
-        model_name="stgcn",                  # "stgcn" hoặc "transformer"
-        dataset_dir=r"E:\LSTM\data_processed",
-        batch_size=4,
-        num_workers=0,                       # Đặt > 0 nếu muốn DataLoader đa tiến trình
-        epochs=50,
-        warmup_epochs=1,
-        lr=1e-3,
-        weight_decay=1e-4,
-        time_interval=0.2,                   # 0.2s tương đương 5 FPS
-        window_sec=10.0,                     # Cửa sổ 10 giây (None = toàn bộ video)
-        num_classes=2,                       # 2 lớp: Alert (0) vs Drowsy (1)
-        save_dir="ai/GCN/checkpoints",       # Thư mục lưu checkpoint & logs
-        amp=True,                            # Kích hoạt Mixed Precision trên CUDA
-        seed=42,
-    )
+    config = TrainConfig()
 
     # Bắt đầu quá trình huấn luyện
     train(config)

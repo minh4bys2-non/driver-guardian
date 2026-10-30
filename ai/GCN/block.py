@@ -63,31 +63,47 @@ class FacialGraphBuilder:
 
 class KinematicFeatureExtractor(nn.Module):
     """
-    Khối tiền xử lý tự động tính Vận tốc (dx, dy) và Gia tốc (d2x, d2y)
-    từ tọa độ (x, y) bằng hàm torch.diff có sẵn của PyTorch.
+    Khối tiền xử lý chuẩn hóa tọa độ 68 điểm mốc:
+    1. Đưa tọa độ tĩnh (x, y) về Hệ tọa độ Cục bộ Tâm mũi (điểm 30) & chia cho khoảng cách 2 mắt (36 <-> 45).
+    2. Tính Vận tốc (dx, dy) và Gia tốc (d2x, d2y) đã chuẩn hóa theo kích thước khuôn mặt
+       (giữ nguyên được quỹ đạo rơi của đầu khi tài xế ngủ gật).
     """
-
-    def __init__(self):
+    def __init__(self, nose_idx: int = 30, left_eye_idx: int = 36, right_eye_idx: int = 45, eps: float = 1e-6):
         super().__init__()
+        self.nose_idx = nose_idx
+        self.left_eye_idx = left_eye_idx
+        self.right_eye_idx = right_eye_idx
+        self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Input : (B, C, T, V) - Nếu C == 2 (chỉ có x, y), tự động mở rộng lên C == 6.
-                               Nếu C == 6, giữ nguyên.
-        Output: (B, 6, T, V) gồm [x, y, dx, dy, d2x, d2y]
+        Input : (B, 2, T, V=68) - Tọa độ pixel hoặc [0, 1] trong Hệ tọa độ Khung ảnh.
+        Output: (B, 6, T, V=68) - [x_norm, y_norm, dx_norm, dy_norm, d2x_norm, d2y_norm]
         """
         if x.size(1) == 6:
             return x
 
-        # Tính vận tốc dọc trục thời gian T (dim=2)
-        vel = torch.diff(x, n=1, dim=2)
-        vel = F.pad(vel, (0, 0, 1, 0), mode='replicate')  # Pad frame đầu tiên
+        # 1. Tính khoảng cách giải phẫu chuẩn d_t (Inter-Ocular Distance giữa điểm 36 và 45)
+        # eye_dist shape: (B, 1, T, 1)
+        p_left_eye = x[:, :, :, self.left_eye_idx : self.left_eye_idx + 1]   # (B, 2, T, 1)
+        p_right_eye = x[:, :, :, self.right_eye_idx : self.right_eye_idx + 1] # (B, 2, T, 1)
+        iod_scale = torch.norm(p_right_eye - p_left_eye, p=2, dim=1, keepdim=True) + self.eps
 
-        # Tính gia tốc dọc trục thời gian T (dim=2)
-        acc = torch.diff(vel, n=1, dim=2)
-        acc = F.pad(acc, (0, 0, 1, 0), mode='replicate')
+        # 2. Chuẩn hóa tọa độ hình thái tĩnh theo Tâm mũi (điểm 30) và tỷ lệ IOD
+        nose_pos = x[:, :, :, self.nose_idx : self.nose_idx + 1]              # (B, 2, T, 1)
+        pos_norm = (x - nose_pos) / iod_scale                                 # (B, 2, T, V)
 
-        return torch.cat([x, vel, acc], dim=1)
+        # 3. Tính Vận tốc (dx, dy) và Gia tốc (d2x, d2y) chuẩn hóa theo IOD
+        # (Tính diff trên x trước khi trừ mũi để giữ được vận tốc gật đầu của cả khuôn mặt)
+        vel_raw = torch.diff(x, n=1, dim=2)
+        vel_raw = F.pad(vel_raw, (0, 0, 1, 0), mode='replicate')
+        vel_norm = vel_raw / iod_scale                                        # (B, 2, T, V)
+
+        acc_norm = torch.diff(vel_norm, n=1, dim=2)
+        acc_norm = F.pad(acc_norm, (0, 0, 1, 0), mode='replicate')            # (B, 2, T, V)
+
+        # Ghép thành 6 kênh đặc trưng chuẩn hóa hoàn chỉnh
+        return torch.cat([pos_norm, vel_norm, acc_norm], dim=1)               # (B, 6, T, V)
 
 
 class PyGSpatialGraphConv(nn.Module):

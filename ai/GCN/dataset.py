@@ -109,10 +109,10 @@ class FaceLandmarkExtractor:
         return np.array(landmarks_seq, dtype=np.float32)
 
     def extract_from_video(
-        self,
-        video_path: str | Path,
-        time_interval: Optional[float] = None,
-        window_sec: Optional[float] = None,
+            self,
+            video_path: str | Path,
+            time_interval: Optional[float] = None,
+            window_sec: Optional[float] = None,
     ) -> Tuple[np.ndarray, List[np.ndarray], Dict[str, Any]]:
         """
         Đọc frame trực tiếp từ video file và trích xuất chuỗi 68 landmark.
@@ -200,15 +200,15 @@ class GCNDataset(Dataset):
     """
 
     def __init__(
-        self,
-        dataset_dir: str | Path = r"E:\LSTM\data_processed",
-        split: str = "train",
-        time_interval: float = 0.2,
-        window_sec: Optional[float] = 10.0,
-        manifest_filename: str = "dataset_merged_split.csv",
-        landmark_model_path: Optional[str | Path] = None,
-        letterbox_size: int = 480,
-        return_frames: bool = False,
+            self,
+            dataset_dir: str | Path = r"E:\LSTM\data_processed",
+            split: str = "train",
+            time_interval: float = 0.2,
+            window_sec: Optional[float] = 10.0,
+            manifest_filename: str = "dataset_merged_split.csv",
+            landmark_model_path: Optional[str | Path] = None,
+            letterbox_size: int = 480,
+            return_frames: bool = False,
     ):
         if split not in ("train", "val", "test"):
             raise ValueError(f"Split không hợp lệ: {split}. Chỉ chấp nhận 'train', 'val', 'test'.")
@@ -285,7 +285,8 @@ class GCNDataset(Dataset):
                 num_frames = int(round(win_sec * fps))
                 num_frames = max(1, min(num_frames, total_frames))
                 max_start = max(0, total_frames - num_frames)
-                start_idx = random.randint(0, max_start) if (self.split == "train" and max_start > 0) else max_start // 2
+                start_idx = random.randint(0, max_start) if (
+                            self.split == "train" and max_start > 0) else max_start // 2
                 return np.arange(start_idx, start_idx + num_frames, dtype=int)
 
         # TRƯỜNG HỢP 2: time_interval > 0 -> Lấy mẫu cách đều theo thời gian thực (time-domain sampling)
@@ -390,61 +391,232 @@ FaceLandmarkExtractorDataset = GCNDataset
 # =====================================================================
 # 4. HÀM VẼ LANDMARK VÀ HIỂN THỊ VIDEO
 # =====================================================================
-def draw_landmarks_on_frame(frame: np.ndarray, landmarks_xy: np.ndarray) -> np.ndarray:
+def get_landmark_region_color(idx: int) -> Tuple[int, int, int]:
     """
-    Vẽ 68 điểm mốc khuôn mặt và các đường viền giải phẫu lên frame ảnh.
-    landmarks_xy: numpy array shape (68, 2) với tọa độ chuẩn hóa trong [0, 1].
+    Trả về màu sắc đại diện (BGR) theo từng vùng giải phẫu của hệ 68 điểm mốc:
+      - 00 - 16: Viền hàm (Jawline) -> Xám bạc (200, 200, 200)
+      - 17 - 21: Lông mày trái (Left Eyebrow) -> Vàng cam (255, 190, 0)
+      - 22 - 26: Lông mày phải (Right Eyebrow) -> Vàng cam (255, 190, 0)
+      - 27 - 30: Sống mũi (Nose Bridge) -> Vàng chanh (0, 255, 255)
+      - 31 - 35: Chân mũi / Cánh mũi (Lower Nose) -> Vàng chanh (0, 255, 255)
+      - 36 - 41: Mắt trái (Left Eye) -> Xanh lá (0, 255, 0)
+      - 42 - 47: Mắt phải (Right Eye) -> Xanh lá (0, 255, 0)
+      - 48 - 59: Môi ngoài (Outer Lip) -> Đỏ (0, 0, 255)
+      - 60 - 67: Môi trong (Inner Lip) -> Cam đậm (0, 140, 255)
+    """
+    if 0 <= idx <= 16:
+        return (200, 200, 200)  # Viền hàm
+    elif 17 <= idx <= 26:
+        return (255, 190, 0)  # Lông mày trái & phải
+    elif 27 <= idx <= 35:
+        return (0, 255, 255)  # Sống mũi & cánh mũi
+    elif 36 <= idx <= 47:
+        return (0, 255, 0)  # Mắt trái & phải
+    elif 48 <= idx <= 59:
+        return (0, 0, 255)  # Môi ngoài
+    elif 60 <= idx <= 67:
+        return (0, 140, 255)  # Môi trong
+    return (0, 255, 0)
+
+
+def draw_landmarks_on_frame(
+        frame: np.ndarray,
+        landmarks_xy: np.ndarray,
+        show_ids: bool | List[int] | str = False,
+        font_scale: float = 0.28,
+        id_color: Optional[Tuple[int, int, int] | str] = (0, 255, 255),
+        point_radius: int = 2,
+        point_color: Optional[Tuple[int, int, int]] = (0, 255, 0),
+        draw_contours: bool = True,
+) -> np.ndarray:
+    """
+    Vẽ 68 điểm mốc khuôn mặt và các đường viền giải phẫu lên frame ảnh,
+    đồng thời hỗ trợ hiển thị ID của các điểm theo hệ 68 điểm mốc của dự án (0-67).
+
+    Tham số:
+        frame: Ảnh gốc định dạng numpy array (H, W, 3) BGR.
+        landmarks_xy: Tọa độ điểm mốc shape (68, 2) đã chuẩn hóa trong đoạn [0, 1].
+        show_ids:
+            - True: Hiển thị ID của toàn bộ 68 điểm (0 đến 67).
+            - False / None: Tắt hiển thị ID.
+            - List[int]: Danh sách các ID cụ thể cần hiển thị (vd: list(range(36, 48)) cho vùng mắt).
+            - str: Từ khóa vùng giải phẫu: "eyes", "mouth", "nose", "eyebrows", "jaw", "all".
+        font_scale: Kích thước chữ số hiển thị ID (mặc định 0.28, nhỏ gọn, rõ nét).
+        id_color: Màu sắc chữ số (BGR). Mặc định vàng (0, 255, 255).
+                  Nếu đặt id_color="region" hoặc id_color=None: Chữ số sẽ mang màu đồng bộ
+                  theo từng vùng giải phẫu tương ứng.
+        point_radius: Bán kính chấm tròn của mốc (mặc định 2).
+        point_color: Màu sắc chấm tròn mốc (mặc định xanh lá). Nếu None: lấy theo màu vùng.
+        draw_contours: Vẽ các đường liên kết giải phẫu (viền hàm, mắt, mày, môi, mũi).
+
+    Hệ 68 điểm mốc của dự án:
+        - 00 - 16: Viền hàm (17 điểm)
+        - 17 - 21: Lông mày trái (5 điểm)
+        - 22 - 26: Lông mày phải (5 điểm)
+        - 27 - 30: Sống mũi (4 điểm)
+        - 31 - 35: Chân / Cánh mũi (5 điểm)
+        - 36 - 41: Mắt trái (6 điểm)
+        - 42 - 47: Mắt phải (6 điểm)
+        - 48 - 59: Môi ngoài (12 điểm)
+        - 60 - 67: Môi trong (8 điểm)
     """
     vis = frame.copy()
     h, w = vis.shape[:2]
 
+    num_pts = min(68, len(landmarks_xy))
     pts = []
-    for i in range(68):
+    for i in range(num_pts):
         x = int(landmarks_xy[i, 0] * w)
         y = int(landmarks_xy[i, 1] * h)
         pts.append((x, y))
 
     # 1. Vẽ các đường nối giải phẫu (Contours)
-    def draw_chain(indices, closed=False, color=(0, 255, 255), thickness=1):
-        for i in range(len(indices) - 1):
-            cv2.line(vis, pts[indices[i]], pts[indices[i + 1]], color, thickness)
-        if closed:
-            cv2.line(vis, pts[indices[-1]], pts[indices[0]], color, thickness)
+    if draw_contours and len(pts) >= 68:
+        def draw_chain(indices, closed=False, color=(0, 255, 255), thickness=1):
+            for i in range(len(indices) - 1):
+                cv2.line(vis, pts[indices[i]], pts[indices[i + 1]], color, thickness)
+            if closed:
+                cv2.line(vis, pts[indices[-1]], pts[indices[0]], color, thickness)
 
-    draw_chain(list(range(0, 17)), closed=False, color=(200, 200, 200), thickness=1)  # Viền hàm
-    draw_chain(list(range(17, 22)), closed=False, color=(255, 190, 0), thickness=1)   # Lông mày trái
-    draw_chain(list(range(22, 27)), closed=False, color=(255, 190, 0), thickness=1)   # Lông mày phải
-    draw_chain(list(range(27, 31)), closed=False, color=(0, 255, 255), thickness=1)   # Sống mũi
-    draw_chain(list(range(31, 36)), closed=False, color=(0, 255, 255), thickness=1)   # Cánh mũi
-    draw_chain(list(range(36, 42)), closed=True, color=(0, 255, 0), thickness=1)      # Mắt trái
-    draw_chain(list(range(42, 48)), closed=True, color=(0, 255, 0), thickness=1)      # Mắt phải
-    draw_chain(list(range(48, 60)), closed=True, color=(0, 0, 255), thickness=1)      # Môi ngoài
-    draw_chain(list(range(60, 68)), closed=True, color=(0, 140, 255), thickness=1)    # Môi trong
+        draw_chain(list(range(0, 17)), closed=False, color=(200, 200, 200), thickness=1)  # Viền hàm
+        draw_chain(list(range(17, 22)), closed=False, color=(255, 190, 0), thickness=1)  # Lông mày trái
+        draw_chain(list(range(22, 27)), closed=False, color=(255, 190, 0), thickness=1)  # Lông mày phải
+        draw_chain(list(range(27, 31)), closed=False, color=(0, 255, 255), thickness=1)  # Sống mũi
+        draw_chain(list(range(31, 36)), closed=False, color=(0, 255, 255), thickness=1)  # Cánh mũi
+        draw_chain(list(range(36, 42)), closed=True, color=(0, 255, 0), thickness=1)  # Mắt trái
+        draw_chain(list(range(42, 48)), closed=True, color=(0, 255, 0), thickness=1)  # Mắt phải
+        draw_chain(list(range(48, 60)), closed=True, color=(0, 0, 255), thickness=1)  # Môi ngoài
+        draw_chain(list(range(60, 68)), closed=True, color=(0, 140, 255), thickness=1)  # Môi trong
 
     # 2. Vẽ 68 điểm mốc dạng chấm tròn
-    for x, y in pts:
-        cv2.circle(vis, (x, y), 2, (0, 255, 0), -1)
+    for i, (x, y) in enumerate(pts):
+        c = point_color if point_color is not None else get_landmark_region_color(i)
+        cv2.circle(vis, (x, y), point_radius, c, -1)
+
+    # 3. Vẽ ID của các điểm theo hệ 68 điểm của dự án (0 đến 67)
+    if show_ids:
+        # Xác định tập hợp ID cần vẽ
+        if isinstance(show_ids, bool):
+            target_ids = list(range(len(pts)))
+        elif isinstance(show_ids, str):
+            kw = show_ids.lower().strip()
+            regions = {
+                "jaw": list(range(0, 17)),
+                "eyebrows": list(range(17, 27)),
+                "left_eyebrow": list(range(17, 22)),
+                "right_eyebrow": list(range(22, 27)),
+                "nose": list(range(27, 36)),
+                "nose_bridge": list(range(27, 31)),
+                "lower_nose": list(range(31, 36)),
+                "eyes": list(range(36, 48)),
+                "left_eye": list(range(36, 42)),
+                "right_eye": list(range(42, 48)),
+                "mouth": list(range(48, 68)),
+                "outer_lip": list(range(48, 60)),
+                "inner_lip": list(range(60, 68)),
+                "all": list(range(len(pts))),
+            }
+            target_ids = regions.get(kw, list(range(len(pts))))
+        elif hasattr(show_ids, "__iter__"):
+            target_ids = list(show_ids)
+        else:
+            target_ids = []
+
+        for i in target_ids:
+            if 0 <= i < len(pts):
+                x, y = pts[i]
+                # Canh chỉnh tọa độ đặt text ID để không bị che khuất điểm và không tràn mép ảnh
+                tx = max(0, min(w - 18, x + 2))
+                ty = max(10, min(h - 2, y - 2))
+                text = str(i)
+
+                # Xác định màu sắc text
+                if id_color is None or id_color == "region":
+                    text_color = get_landmark_region_color(i)
+                elif isinstance(id_color, (tuple, list)):
+                    text_color = tuple(id_color)
+                else:
+                    text_color = (0, 255, 255)
+
+                # Viền chữ đen dày 2px tạo độ tương phản tuyệt đối trên mọi nền ảnh
+                cv2.putText(vis, text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), 2, cv2.LINE_AA)
+                # Chữ số chính dày 1px
+                cv2.putText(vis, text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, font_scale, text_color, 1, cv2.LINE_AA)
 
     return vis
 
 
+def visualize_frame_landmarks(
+        frame: np.ndarray,
+        landmarks_xy: np.ndarray,
+        window_name: str = "Driver Guardian - 68 Facial Landmarks",
+        show_ids: bool | List[int] | str = True,
+        font_scale: float = 0.28,
+        id_color: Optional[Tuple[int, int, int] | str] = (0, 255, 255),
+        wait_key: bool = True,
+) -> np.ndarray:
+    """
+    Hiển thị 1 frame ảnh kèm 68 điểm mốc và ID của chúng theo hệ 68 điểm của dự án.
+    Rất thuận tiện cho việc kiểm tra nhanh và debug từng frame đơn lẻ.
+    """
+    vis = draw_landmarks_on_frame(
+        frame=frame,
+        landmarks_xy=landmarks_xy,
+        show_ids=show_ids,
+        font_scale=font_scale,
+        id_color=id_color,
+    )
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    h, w = vis.shape[:2]
+    cv2.resizeWindow(window_name, min(w, 800), min(h, 600))
+    cv2.imshow(window_name, vis)
+    if wait_key:
+        print(f"\n[Hiển thị Frame Landmark] Đang mở cửa sổ '{window_name}' (show_ids={show_ids}).")
+        print(">>> Nhấn phím bất kỳ hoặc 'q' trên cửa sổ ảnh để đóng <<<")
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+    return vis
+
+
 def visualize_video_landmarks(
-    landmarks_tensor: torch.Tensor,
-    frames: List[np.ndarray],
-    meta: Dict[str, Any],
-    label: torch.Tensor,
-    time_interval: float = 0.2,
-    window_name: str = "Driver Guardian - 68 Facial Landmarks",
+        landmarks_tensor: torch.Tensor | np.ndarray,
+        frames: List[np.ndarray],
+        meta: Dict[str, Any],
+        label: torch.Tensor | int = 0,
+        time_interval: float = 0.2,
+        window_name: str = "Driver Guardian - 68 Facial Landmarks",
+        show_ids: bool | List[int] | str = False,
+        font_scale: float = 0.28,
+        id_color: Optional[Tuple[int, int, int] | str] = (0, 255, 255),
 ):
     """
     Hiển thị video tuần tự từng frame kèm các điểm mốc landmark đã trích xuất.
-    Hỗ trợ cả time_interval > 0 (lấy mẫu giãn cách) và time_interval == 0 (video thông thường).
-    Nhấn phím 'q' hoặc ESC trên cửa sổ để dừng hiển thị sớm.
-    """
-    T = landmarks_tensor.shape[1]
-    # Chuyển về shape (T, 68, 2)
-    lm_np = landmarks_tensor.permute(1, 2, 0).cpu().numpy()
+    Hỗ trợ hiển thị và bật/tắt ID của 68 điểm mốc theo hệ chuẩn của dự án (0-67).
 
+    Phím điều khiển tương tác trên cửa sổ video:
+        - [i] hoặc [I]: Bật / Tắt hiển thị ID của 68 điểm mốc trong thời gian thực.
+        - [Space]: Tạm dừng / Tiếp tục phát video (dùng khi muốn dừng lại soi kỹ từng ID).
+        - [d] / [Mũi tên phải]: Tiến 1 frame (khi đang tạm dừng).
+        - [a] / [Mũi tên trái]: Lùi 1 frame (khi đang tạm dừng).
+        - [q] hoặc [ESC]: Thoát video sớm.
+    """
+    # Xử lý linh hoạt landmarks_tensor: nhận cả (2, T, 68), (T, 68, 2), (B, 2, T, 68) hoặc np.ndarray
+    if isinstance(landmarks_tensor, torch.Tensor):
+        if landmarks_tensor.ndim == 4:
+            landmarks_tensor = landmarks_tensor[0]
+        if landmarks_tensor.shape[0] == 2:
+            lm_np = landmarks_tensor.permute(1, 2, 0).cpu().numpy()
+        else:
+            lm_np = landmarks_tensor.cpu().numpy()
+    elif isinstance(landmarks_tensor, np.ndarray):
+        if landmarks_tensor.ndim == 3 and landmarks_tensor.shape[0] == 2:
+            lm_np = np.transpose(landmarks_tensor, (1, 2, 0))
+        else:
+            lm_np = landmarks_tensor
+    else:
+        raise TypeError(f"landmarks_tensor không đúng kiểu: {type(landmarks_tensor)}")
+
+    T = min(lm_np.shape[0], len(frames))
     fps = meta.get("fps", 30.0) or 30.0
     if time_interval == 0:
         delay_ms = max(1, int(1000 / fps))
@@ -453,37 +625,86 @@ def visualize_video_landmarks(
         delay_ms = max(1, int(time_interval * 1000))
         total_time_str = f"~{T * time_interval:.1f}s"
 
-    label_text = "ALERT (0)" if label.item() == 0 else "DROWSY (1)"
-    label_color = (0, 255, 0) if label.item() == 0 else (0, 0, 255)
+    lbl_val = label.item() if isinstance(label, torch.Tensor) else int(label)
+    label_text = "ALERT (0)" if lbl_val == 0 else "DROWSY (1)"
+    label_color = (0, 255, 0) if lbl_val == 0 else (0, 0, 255)
 
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     h, w = frames[0].shape[:2]
     cv2.resizeWindow(window_name, min(w, 800), min(h, 600))
 
-    print(f"\n[Playing Video] {meta['video_id']} ({T} frames, {total_time_str})")
-    print(">>> Nhấn phím 'q' hoặc ESC trên cửa sổ video để dừng hiển thị sớm <<<")
+    video_id = meta.get("video_id", "Sample")
+    print(f"\n[Playing Video] {video_id} ({T} frames, {total_time_str})")
+    print(
+        ">>> Phím nóng: [i] Bật/tắt ID (0-67) | [Space] Tạm dừng/Soi chi tiết | [a/d] Frame lùi/tiến | [q/ESC] Thoát <<<")
 
-    for t in range(T):
-        vis = draw_landmarks_on_frame(frames[t], lm_np[t])
+    t = 0
+    paused = False
+    show_ids_state = show_ids
 
-        # Vẽ thông tin trạng thái lên ảnh
-        cv2.putText(vis, f"Video: {meta['video_id']} | Status: {label_text}", (15, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 3, cv2.LINE_AA)
-        cv2.putText(vis, f"Video: {meta['video_id']} | Status: {label_text}", (15, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, label_color, 2, cv2.LINE_AA)
+    while t < T:
+        vis = draw_landmarks_on_frame(
+            frame=frames[t],
+            landmarks_xy=lm_np[t],
+            show_ids=show_ids_state,
+            font_scale=font_scale,
+            id_color=id_color,
+        )
 
+        # Dòng 1: Video ID & Trạng thái Alert / Drowsy
+        cv2.putText(vis, f"Video: {video_id} | Status: {label_text}", (15, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(vis, f"Video: {video_id} | Status: {label_text}", (15, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, label_color, 2, cv2.LINE_AA)
+
+        # Dòng 2: Chỉ số frame, mốc thời gian thực, FPS và trạng thái tạm dừng
         curr_time_sec = (t / fps) if time_interval == 0 else (t * time_interval)
-        info = f"Frame: {t + 1}/{T} | Time: {curr_time_sec:.1f}s | FPS: {fps:.1f}"
-        cv2.putText(vis, info, (15, 60),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3, cv2.LINE_AA)
-        cv2.putText(vis, info, (15, 60),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+        time_info = f"Frame: {t + 1}/{T} | Time: {curr_time_sec:.1f}s | FPS: {fps:.1f}"
+        if paused:
+            time_info += "  [PAUSED - Soi ID]"
+        cv2.putText(vis, time_info, (15, 55),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(vis, time_info, (15, 55),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+
+        # Dòng 3: Hướng dẫn phím nóng tương tác
+        id_str = "ON" if show_ids_state else "OFF"
+        guide = f"[i]: IDs ({id_str}) | [Space]: {'Resume' if paused else 'Pause'} | [q/ESC]: Exit"
+        cv2.putText(vis, guide, (15, 80),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(vis, guide, (15, 80),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
 
         cv2.imshow(window_name, vis)
-        key = cv2.waitKey(delay_ms) & 0xFF
-        if key == ord('q') or key == 27:
+
+        # Kiểm tra nếu cửa sổ bị tắt bởi nút X
+        if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
+            print("Cửa sổ đã được đóng.")
+            break
+
+        wait_ms = 0 if paused else delay_ms
+        key = cv2.waitKey(wait_ms) & 0xFF
+
+        if key in (ord('q'), ord('Q'), 27):
             print("Đã nhận lệnh dừng từ người dùng.")
             break
+        elif key in (ord('i'), ord('I')):
+            show_ids_state = not show_ids_state
+            print(f">>> Landmark IDs (0-67): {'BẬT' if show_ids_state else 'TẮT'}")
+            continue
+        elif key == 32:  # Phím Space
+            paused = not paused
+            print(f">>> {'TẠM DỪNG' if paused else 'TIẾP TỤC'}")
+            continue
+        elif paused and key in (ord('d'), ord('D'), 83):  # Frame kế tiếp
+            t = min(T - 1, t + 1)
+            continue
+        elif paused and key in (ord('a'), ord('A'), 81):  # Frame trước đó
+            t = max(0, t - 1)
+            continue
+
+        if not paused:
+            t += 1
 
     cv2.destroyAllWindows()
 
@@ -536,16 +757,16 @@ def collate_gcn(batch: List[Tuple[Any, ...]]):
 
 
 def build_gcn_dataloaders(
-    dataset_dir: str | Path = r"E:\LSTM\data_processed",
-    batch_size: int = 16,
-    num_workers: int = 0,
-    time_interval: float = 0.2,
-    window_sec: Optional[float] = 10.0,
-    manifest_filename: str = "dataset_merged_split.csv",
-    pin_memory: bool = True,
-    shuffle_train: bool = True,
-    landmark_model_path: Optional[str | Path] = None,
-    letterbox_size: int = 480,
+        dataset_dir: str | Path = r"E:\LSTM\data_processed",
+        batch_size: int = 16,
+        num_workers: int = 0,
+        time_interval: float = 0.2,
+        window_sec: Optional[float] = 10.0,
+        manifest_filename: str = "dataset_merged_split.csv",
+        pin_memory: bool = True,
+        shuffle_train: bool = True,
+        landmark_model_path: Optional[str | Path] = None,
+        letterbox_size: int = 480,
 ):
     """
     Xây dựng nhanh bộ DataLoader cho cả 3 tập train, val, test.
@@ -600,6 +821,7 @@ def build_gcn_dataloaders(
 # =====================================================================
 if __name__ == "__main__":
     import sys
+
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
 
@@ -615,14 +837,15 @@ if __name__ == "__main__":
     ds = GCNDataset(
         dataset_dir=DATASET_DIR,
         split="train",
-        time_interval=0,         # Đọc frame tuần tự thông thường từ video
-        window_sec=None,          # Lấy cửa sổ 5 giây (vd: 30 FPS -> 150 frames liên tiếp)
+        time_interval=0,  # Đọc frame tuần tự thông thường từ video
+        letterbox_size=640,
+        window_sec=None,  # Lấy cửa sổ 5 giây (vd: 30 FPS -> 150 frames liên tiếp)
         return_frames=True,
     )
     print(f"Tổng số mẫu trong tập train: {len(ds)}")
 
     # 2. Lấy mẫu video đầu tiên
-    landmarks, label, meta, frames = ds[0]
+    landmarks, label, meta, frames = ds[1000]
     print(f"Video ID      : {meta['video_id']}")
     print(f"Đường dẫn file: {meta['path']}")
     print(f"FPS nguồn     : {meta['fps']}")
@@ -631,5 +854,6 @@ if __name__ == "__main__":
     print(f"Landmarks     : shape {landmarks.shape} (C=2, T={landmarks.shape[1]}, V=68)")
     print(f"Nhãn (Label)  : {label.item()} ({'Alert' if label.item() == 0 else 'Drowsy'})")
 
-    # 3. Điền các landmark và hiển thị video
-    visualize_video_landmarks(landmarks, frames, meta, label, time_interval=ds.time_interval)
+    # 3. Điền các landmark và hiển thị video (bật show_ids=True để hiển thị toàn bộ ID 0-67)
+    # Ghi chú: Trong lúc video phát, có thể nhấn 'i' để bật/tắt ID hoặc 'Space' để tạm dừng soi từng điểm mốc.
+    visualize_video_landmarks(landmarks, frames, meta, label, time_interval=ds.time_interval, show_ids=True)

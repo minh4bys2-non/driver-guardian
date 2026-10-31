@@ -1,7 +1,9 @@
 # File: dataset.py
 import csv
 import logging
+import os
 import random
+import sys
 from pathlib import Path
 from typing import List, Tuple, Dict, Any, Optional
 
@@ -9,6 +11,16 @@ import cv2
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
+
+# Cấu hình nạp DLL PyTorch CUDA và môi trường cho ONNX Runtime trên Windows
+torch_lib_path = os.path.join(os.path.dirname(torch.__file__), "lib")
+if os.path.exists(torch_lib_path):
+    try:
+        os.add_dll_directory(torch_lib_path)
+    except Exception:
+        pass
+    os.environ["PATH"] = torch_lib_path + os.pathsep + os.environ.get("PATH", "")
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 # =====================================================================
 # 1. BẢNG CHỈ SỐ ÁNH XẠ 68 ĐIỂM MỐC (MediaPipe 478 -> Dlib 68)
@@ -42,55 +54,94 @@ def letterbox(image: np.ndarray, new_size: int = 480, color: tuple = (114, 114, 
 
 
 # =====================================================================
-# 2. BỘ TRÍCH XUẤT 68 ĐIỂM MỐC KHUÔN MẶT BẰNG MEDIAPIPE TASKS
+# 2. BỘ TRÍCH XUẤT 68 ĐIỂM MỐC KHUÔN MẶT BẰNG INSIGHTFACE (CUDA)
 # =====================================================================
 class FaceLandmarkExtractor:
-    """Trích xuất 68 điểm mốc chuẩn Dlib từ các khung hình ảnh bằng MediaPipe Tasks."""
+    """Trích xuất 68 điểm mốc chuẩn iBUG/Dlib từ các khung hình ảnh bằng InsightFace (mặc định CUDA)."""
 
-    def __init__(self, model_path: Optional[str | Path] = None, time_interval: float = 0.0):
-        if model_path is None:
-            model_path = Path(__file__).resolve().parents[1] / "PhysicalBranch" / "models" / "face_landmarker.task"
-        self.model_path = Path(model_path)
+    def __init__(
+            self,
+            model_path: Optional[str | Path] = None,
+            time_interval: float = 0.0,
+            device: str = "cuda",
+            det_size: Tuple[int, int] = (640, 640),
+            model_name: str = "buffalo_l",
+    ):
+        self.model_path = Path(model_path) if model_path is not None else None
         self.time_interval = float(time_interval)
-        self.landmarker = None
+        self.device = device.lower().strip()
+        self.det_size = det_size
+        self.model_name = model_name
+        self.app = None
 
     def _init_landmarker(self):
         """Khởi tạo trễ (lazy init) để tương thích đa tiến trình của DataLoader."""
-        if not self.model_path.is_file():
-            raise FileNotFoundError(f"Không tìm thấy file mô hình MediaPipe tại: {self.model_path}")
+        import onnxruntime as ort
+        from insightface.app import FaceAnalysis
 
-        import mediapipe as mp
-        from mediapipe.tasks.python import BaseOptions
-        from mediapipe.tasks.python.vision import FaceLandmarker, FaceLandmarkerOptions, RunningMode
+        available_providers = ort.get_available_providers()
+        use_cuda = self.device.startswith("cuda") and ("CUDAExecutionProvider" in available_providers)
 
-        options = FaceLandmarkerOptions(
-            base_options=BaseOptions(model_asset_path=str(self.model_path)),
-            running_mode=RunningMode.IMAGE,
-            num_faces=1,
-        )
-        self.landmarker = FaceLandmarker.create_from_options(options)
+        if self.device.startswith("cuda") and not use_cuda:
+            logging.warning(
+                f"[WARNING] Không tìm thấy CUDAExecutionProvider (khả dụng: {available_providers})! "
+                "Mô hình InsightFace sẽ chạy trên CPU."
+            )
+
+        if use_cuda:
+            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            ctx_id = 0
+        else:
+            providers = ["CPUExecutionProvider"]
+            ctx_id = -1
+
+        init_kwargs = {
+            "name": self.model_name,
+            "allowed_modules": ["detection", "landmark_3d_68"],
+            "providers": providers,
+        }
+        if self.model_path is not None and self.model_path.is_dir():
+            init_kwargs["root"] = str(self.model_path)
+
+        self.app = FaceAnalysis(**init_kwargs)
+        self.app.prepare(ctx_id=ctx_id, det_size=self.det_size)
 
     def extract(self, frames: List[np.ndarray]) -> np.ndarray:
         """
         Nhận danh sách frames BGR và trích xuất chuỗi 68 điểm mốc chuẩn hóa trong [0, 1].
         Trả về numpy array kích thước: (T, 68, 2)
         """
-        if self.landmarker is None:
+        if self.app is None:
             self._init_landmarker()
-
-        import mediapipe as mp
 
         landmarks_seq = []
         last_valid = None
 
         for frame in frames:
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            result = self.landmarker.detect(mp_image)
+            h, w = frame.shape[:2]
+            faces = self.app.get(frame)
 
-            if result.face_landmarks:
-                pts = result.face_landmarks[0]
-                lm68 = np.array([[pts[i].x, pts[i].y] for i in LANDMARK_68_INDICES], dtype=np.float32)
+            # Lọc các khuôn mặt có landmark_3d_68 hợp lệ
+            valid_faces = [f for f in faces if getattr(f, "landmark_3d_68", None) is not None]
+
+            if valid_faces:
+                # Nếu có nhiều khuôn mặt, chọn khuôn mặt có diện tích bounding box lớn nhất
+                if len(valid_faces) > 1:
+                    face = max(
+                        valid_faces,
+                        key=lambda f: (
+                            (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1])
+                            if getattr(f, "bbox", None) is not None else 0.0
+                            if getattr(f, "bbox", None) is not None else 0.0
+                        ),
+                    )
+                else:
+                    face = valid_faces[0]
+
+                lmk_3d = face.landmark_3d_68  # Shape: (68, 3) gồm (x, y, z)
+                lm68 = np.empty((68, 2), dtype=np.float32)
+                lm68[:, 0] = lmk_3d[:, 0] / max(1, w)
+                lm68[:, 1] = lmk_3d[:, 1] / max(1, h)
                 last_valid = lm68
             else:
                 # Forward-fill: dùng lại landmark của frame hợp lệ gần nhất nếu bị mất mặt
@@ -209,6 +260,9 @@ class GCNDataset(Dataset):
             landmark_model_path: Optional[str | Path] = None,
             letterbox_size: int = 480,
             return_frames: bool = False,
+            device: str = "cuda",
+            det_size: Tuple[int, int] = (640, 640),
+            model_name: str = "buffalo_l",
     ):
         if split not in ("train", "val", "test"):
             raise ValueError(f"Split không hợp lệ: {split}. Chỉ chấp nhận 'train', 'val', 'test'.")
@@ -226,7 +280,16 @@ class GCNDataset(Dataset):
         self.window_sec = float(window_sec) if window_sec is not None else None
         self.letterbox_size = letterbox_size
         self.return_frames = return_frames
-        self.extractor = FaceLandmarkExtractor(landmark_model_path, time_interval=self.time_interval)
+        self.device = device
+        self.det_size = det_size
+        self.model_name = model_name
+        self.extractor = FaceLandmarkExtractor(
+            landmark_model_path,
+            time_interval=self.time_interval,
+            device=self.device,
+            det_size=self.det_size,
+            model_name=self.model_name,
+        )
         self.samples = self._load_samples()
 
         if len(self.samples) == 0:
@@ -767,6 +830,9 @@ def build_gcn_dataloaders(
         shuffle_train: bool = True,
         landmark_model_path: Optional[str | Path] = None,
         letterbox_size: int = 480,
+        device: str = "cuda",
+        det_size: Tuple[int, int] = (640, 640),
+        model_name: str = "buffalo_l",
 ):
     """
     Xây dựng nhanh bộ DataLoader cho cả 3 tập train, val, test.
@@ -781,6 +847,9 @@ def build_gcn_dataloaders(
         manifest_filename=manifest_filename,
         landmark_model_path=landmark_model_path,
         letterbox_size=letterbox_size,
+        device=device,
+        det_size=det_size,
+        model_name=model_name,
     )
     val_ds = GCNDataset(
         dataset_dir=dataset_dir,
@@ -790,6 +859,9 @@ def build_gcn_dataloaders(
         manifest_filename=manifest_filename,
         landmark_model_path=landmark_model_path,
         letterbox_size=letterbox_size,
+        device=device,
+        det_size=det_size,
+        model_name=model_name,
     )
     test_ds = GCNDataset(
         dataset_dir=dataset_dir,
@@ -799,6 +871,9 @@ def build_gcn_dataloaders(
         manifest_filename=manifest_filename,
         landmark_model_path=landmark_model_path,
         letterbox_size=letterbox_size,
+        device=device,
+        det_size=det_size,
+        model_name=model_name,
     )
 
     train_loader = DataLoader(

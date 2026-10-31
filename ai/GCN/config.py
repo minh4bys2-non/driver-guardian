@@ -74,8 +74,8 @@ class TrainConfig:
     # =====================================================================
     dataset_dir: str = r"E:\LSTM\data_processed"
     manifest_filename: str = "dataset_merged_split.csv"
-    time_interval: float = 0.2                # 0.2s = 5 FPS lấy mẫu thời gian thực
-    window_sec: Optional[float] = 10.0        # Cửa sổ thời gian (giây), None: toàn bộ video
+    time_interval: float = 0               # 0.2s = 5 FPS lấy mẫu thời gian thực
+    window_sec: Optional[float] = None     # Cửa sổ thời gian (giây), None: toàn bộ video
     landmark_model_path: Optional[str] = None # None: tự tìm face_landmarker.task trong project
     class_names: Dict[int, str] = field(default_factory=lambda: {
         0: "Alert",

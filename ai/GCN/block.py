@@ -1,10 +1,12 @@
 # File: block.py
 from typing import List, Tuple, Optional
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import DenseGCNConv, DenseGATConv
 from torch_geometric.utils import to_undirected, add_self_loops, to_dense_adj
+from torch.autograd import Function
 
 
 class FacialGraphBuilder:
@@ -15,9 +17,9 @@ class FacialGraphBuilder:
 
     @staticmethod
     def get_edge_index(
-        num_nodes: int = 68,
-        vertical_pairs: Optional[List[Tuple[int, int]] | List[List[int]]] = None,
-        cross_region_pairs: Optional[List[Tuple[int, int]] | List[List[int]]] = None,
+            num_nodes: int = 68,
+            vertical_pairs: Optional[List[Tuple[int, int]] | List[List[int]]] = None,
+            cross_region_pairs: Optional[List[Tuple[int, int]] | List[List[int]]] = None,
     ) -> torch.Tensor:
         edges = []
 
@@ -63,10 +65,10 @@ class FacialGraphBuilder:
 
     @classmethod
     def get_dense_adj(
-        cls,
-        num_nodes: int = 68,
-        vertical_pairs: Optional[List[Tuple[int, int]] | List[List[int]]] = None,
-        cross_region_pairs: Optional[List[Tuple[int, int]] | List[List[int]]] = None,
+            cls,
+            num_nodes: int = 68,
+            vertical_pairs: Optional[List[Tuple[int, int]] | List[List[int]]] = None,
+            cross_region_pairs: Optional[List[Tuple[int, int]] | List[List[int]]] = None,
     ) -> torch.Tensor:
         """Trả về ma trận kề Dense kích thước (V, V) từ edge_index."""
         edge_index = cls.get_edge_index(
@@ -85,12 +87,13 @@ class KinematicFeatureExtractor(nn.Module):
        (giữ nguyên được quỹ đạo rơi của đầu khi tài xế ngủ gật).
     Hỗ trợ temporal mask để triệt tiêu cú sốc số học tại biên zero-padding khi batch có độ dài thay đổi.
     """
+
     def __init__(
-        self,
-        nose_idx: int = 30,
-        left_eye_idx: int = 36,
-        right_eye_idx: int = 45,
-        eps: float = 1e-6,
+            self,
+            nose_idx: int = 30,
+            left_eye_idx: int = 36,
+            right_eye_idx: int = 45,
+            eps: float = 1e-6,
     ):
         super().__init__()
         self.nose_idx = nose_idx
@@ -100,9 +103,9 @@ class KinematicFeatureExtractor(nn.Module):
 
     @staticmethod
     def build_temporal_mask(
-        x: torch.Tensor,
-        lengths: Optional[torch.Tensor] = None,
-        eps: float = 1e-6,
+            x: torch.Tensor,
+            lengths: Optional[torch.Tensor] = None,
+            eps: float = 1e-6,
     ) -> torch.Tensor:
         """
         Tạo binary float mask kích thước (B, 1, T, 1) biểu diễn các frame hợp lệ (1.0) và frame đệm (0.0).
@@ -131,15 +134,15 @@ class KinematicFeatureExtractor(nn.Module):
 
         # 1. Tính khoảng cách giải phẫu chuẩn d_t (Inter-Ocular Distance giữa điểm 36 và 45)
         # eye_dist shape: (B, 1, T, 1)
-        p_left_eye = x[:, :, :, self.left_eye_idx : self.left_eye_idx + 1]   # (B, 2, T, 1)
-        p_right_eye = x[:, :, :, self.right_eye_idx : self.right_eye_idx + 1] # (B, 2, T, 1)
+        p_left_eye = x[:, :, :, self.left_eye_idx: self.left_eye_idx + 1]  # (B, 2, T, 1)
+        p_right_eye = x[:, :, :, self.right_eye_idx: self.right_eye_idx + 1]  # (B, 2, T, 1)
         raw_iod = torch.norm(p_right_eye - p_left_eye, p=2, dim=1, keepdim=True)
         # Tránh chia cho eps=1e-6 tại các frame pad gây spike số học khổng lồ
         iod_scale = raw_iod.clamp(min=self.eps)
 
         # 2. Chuẩn hóa tọa độ hình thái tĩnh theo Tâm mũi (điểm 30) và tỷ lệ IOD
-        nose_pos = x[:, :, :, self.nose_idx : self.nose_idx + 1]              # (B, 2, T, 1)
-        pos_norm = (x - nose_pos) / iod_scale                                 # (B, 2, T, V)
+        nose_pos = x[:, :, :, self.nose_idx: self.nose_idx + 1]  # (B, 2, T, 1)
+        pos_norm = (x - nose_pos) / iod_scale  # (B, 2, T, V)
 
         # 3. Tính Vận tốc (dx, dy) và Gia tốc (d2x, d2y) chuẩn hóa theo IOD
         # (Tính diff trên x trước khi trừ mũi để giữ được vận tốc gật đầu của cả khuôn mặt)
@@ -152,7 +155,7 @@ class KinematicFeatureExtractor(nn.Module):
             pair_valid_vel = F.pad(pair_valid_vel, (0, 0, 1, 0), mode='constant', value=1.0)
             vel_raw = vel_raw * pair_valid_vel
 
-        vel_norm = vel_raw / iod_scale                                        # (B, 2, T, V)
+        vel_norm = vel_raw / iod_scale  # (B, 2, T, V)
 
         acc_raw = torch.diff(vel_norm, n=1, dim=2)
         acc_raw = F.pad(acc_raw, (0, 0, 1, 0), mode='replicate')
@@ -162,10 +165,10 @@ class KinematicFeatureExtractor(nn.Module):
             pair_valid_acc = F.pad(pair_valid_acc, (0, 0, 1, 0), mode='constant', value=1.0)
             acc_raw = acc_raw * pair_valid_acc
 
-        acc_norm = acc_raw                                                    # (B, 2, T, V)
+        acc_norm = acc_raw  # (B, 2, T, V)
 
         # Ghép thành 6 kênh đặc trưng chuẩn hóa hoàn chỉnh
-        out = torch.cat([pos_norm, vel_norm, acc_norm], dim=1)               # (B, 6, T, V)
+        out = torch.cat([pos_norm, vel_norm, acc_norm], dim=1)  # (B, 6, T, V)
 
         if mask is not None:
             out = out * mask
@@ -181,13 +184,13 @@ class PyGSpatialGraphConv(nn.Module):
     """
 
     def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        adj_prior: torch.Tensor,
-        gat_heads: int = 4,
-        dropout: float = 0.1,
-        adaptive_init_scale: float = 1e-5,
+            self,
+            in_channels: int,
+            out_channels: int,
+            adj_prior: torch.Tensor,
+            gat_heads: int = 4,
+            dropout: float = 0.1,
+            adaptive_init_scale: float = 1e-5,
     ):
         super().__init__()
         num_nodes = adj_prior.size(0)
@@ -244,12 +247,12 @@ class MultiScaleTemporalConv(nn.Module):
     """
 
     def __init__(
-        self,
-        channels: int,
-        kernel_size: int = 5,
-        stride: int = 1,
-        dropout: float = 0.2,
-        dilations: Tuple[int, int] = (1, 2),
+            self,
+            channels: int,
+            kernel_size: int = 5,
+            stride: int = 1,
+            dropout: float = 0.2,
+            dilations: Tuple[int, int] = (1, 2),
     ):
         super().__init__()
         mid_channels = channels // 2
@@ -287,16 +290,16 @@ class STGCNBlock(nn.Module):
     """
 
     def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        adj_prior: torch.Tensor,
-        temporal_kernel: int = 5,
-        stride: int = 1,
-        dropout: float = 0.2,
-        gat_heads: int = 4,
-        adaptive_init_scale: float = 1e-5,
-        dilations: Tuple[int, int] = (1, 2),
+            self,
+            in_channels: int,
+            out_channels: int,
+            adj_prior: torch.Tensor,
+            temporal_kernel: int = 5,
+            stride: int = 1,
+            dropout: float = 0.2,
+            gat_heads: int = 4,
+            adaptive_init_scale: float = 1e-5,
+            dilations: Tuple[int, int] = (1, 2),
     ):
         super().__init__()
         self.stride = stride
@@ -342,3 +345,162 @@ class STGCNBlock(nn.Module):
             mask_out = mask[:, :, ::self.stride, :][:, :, :out.size(2), :]
             out = out * mask_out
         return out
+
+
+class _GradientReversalFunction(Function):
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, lambda_grl: float):
+        ctx.lambda_grl = lambda_grl
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        return -ctx.lambda_grl * grad_output, None
+
+
+class GradientReversalLayer(nn.Module):
+    """Lớp Đảo ngược Gradient (GRL) dùng cho Domain Generalization theo bài báo MSTGCN."""
+
+    def __init__(self, lambda_grl: float = 1.0):
+        super().__init__()
+        self.lambda_grl = lambda_grl
+
+    def set_lambda(self, progress: float, gamma: float = 10.0):
+        """
+        Tự động tăng dần lambda_grl từ 0.0 -> 1.0 theo tiến độ huấn luyện progress thuộc [0, 1]
+        giúp mạng học ổn định ở những epoch đầu tiên.
+        """
+        self.lambda_grl = float(2.0 / (1.0 + math.exp(-gamma * progress)) - 1.0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return _GradientReversalFunction.apply(x, self.lambda_grl)
+
+
+class AttentiveDrowsinessOutputHead(nn.Module):
+    """
+    Khối Dự đoán Đầu ra Tối ưu cho ST-GCN Phát hiện Buồn ngủ:
+    1. Spatial Node Attention: Tự động tập trung vào các điểm mốc Mắt/Miệng, loại bỏ nhiễu viền hàm.
+    2. Temporal Gated-Conv + Max & Attention Pooling: Kế thừa tầng Output Temporal Conv của Yu et al.
+       kết hợp Max-Pooling để bắt khoảnh khắc chợp mắt/ngáp ngắn (Micro-sleep) trong chuỗi dài.
+    3. Dual Heads (G_y & G_d): Hỗ trợ đồng thời Phân loại buồn ngủ (G_y), Phân loại miền đối kháng (G_d - Jia et al.)
+       và Hồi quy mức độ mệt mỏi liên tục (KSS Score Regression).
+    """
+
+    def __init__(
+            self,
+            in_channels: int = 256,
+            num_classes: int = 3,
+            num_nodes: int = 68,
+            num_domains: int = 0,  # Đặt > 0 nếu muốn bật nhánh Domain Classifier (G_d) của MSTGCN
+            enable_regression: bool = False,  # Đặt True nếu muốn dự đoán thêm điểm buồn ngủ liên tục (KSS)
+            dropout: float = 0.25
+    ):
+        super().__init__()
+        self.num_domains = num_domains
+        self.enable_regression = enable_regression
+
+        # --- BƯỚC 1: GOM ĐẶC TRƯNG KHÔNG GIAN CÓ CHÚ Ý (Spatial Node Attention) ---
+        # Học trọng số quan trọng cho từng điểm trong 68 điểm mốc khuôn mặt
+        self.spatial_attn = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels // 4, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(in_channels // 4, 1, kernel_size=1),
+            nn.Softmax(dim=-1)  # Chuẩn hóa trọng số dọc theo 68 đỉnh (dim V)
+        )
+
+        # --- BƯỚC 2: TINH CHỈNH & GOM ĐẶC TRƯNG THỜI GIAN (Theo Yu et al. + Attention) ---
+        # Lớp Temporal Conv cuối cùng kèm cổng GLU lọc nhiễu chuỗi thời gian
+        self.final_temporal_conv = nn.Sequential(
+            nn.Conv1d(in_channels, in_channels * 2, kernel_size=3, padding=1),
+            nn.GLU(dim=1),
+            nn.BatchNorm1d(in_channels)
+        )
+        # Trọng số chú ý thời gian (Temporal Attention) bắt khung hình buồn ngủ
+        self.temporal_attn = nn.Sequential(
+            nn.Conv1d(in_channels, 1, kernel_size=1),
+            nn.Softmax(dim=-1)  # Chuẩn hóa dọc theo trục thời gian T
+        )
+
+        # Kết hợp cả Temporal Attention Pooling và Temporal Max Pooling -> Nhân đôi chiều đặc trưng
+        fused_dim = in_channels * 2
+
+        # --- BƯỚC 3: CÁC NHÁNH DỰ ĐOÁN ĐẦU RA (Prediction Heads) ---
+        # 3.1. Nhánh chính G_y: Phân loại trạng thái buồn ngủ (Công thức 11 - MSTGCN)
+        self.label_predictor = nn.Sequential(
+            nn.LayerNorm(fused_dim),
+            nn.Dropout(dropout),
+            nn.Linear(fused_dim, in_channels // 2),
+            nn.GELU(),
+            nn.Dropout(dropout * 0.5),
+            nn.Linear(in_channels // 2, num_classes)
+        )
+
+        # 3.2. Nhánh phụ G_d (Tùy chọn): Phân loại miền/tài xế qua GRL (Công thức 12 - MSTGCN)
+        if num_domains > 0:
+            self.grl = GradientReversalLayer(lambda_grl=1.0)
+            self.domain_classifier = nn.Sequential(
+                nn.LayerNorm(fused_dim),
+                nn.Dropout(dropout),
+                nn.Linear(fused_dim, in_channels // 2),
+                nn.GELU(),
+                nn.Linear(in_channels // 2, num_domains)
+            )
+
+        # 3.3. Nhánh Hồi quy (Tùy chọn): Dự đoán chỉ số buồn ngủ liên tục (như KSS / PERCLOS)
+        if enable_regression:
+            self.regression_head = nn.Sequential(
+                nn.LayerNorm(fused_dim),
+                nn.Linear(fused_dim, 1),
+                nn.Sigmoid()  # Quy về khoảng [0.0 -> 1.0] (Tỉnh táo -> Ngủ gật hoàn toàn)
+            )
+
+    def pool_spatio_temporal(self, feat: torch.Tensor) -> torch.Tensor:
+        """
+        Nén Tensor (B, C, T, V=68) -> Vector đặc trưng toàn cục (B, 2*C)
+        mà không làm mất tín hiệu cục bộ ở Mắt/Miệng hay các cơn chợp mắt ngắn.
+        """
+        # 1. Gộp chiều Không gian (V=68 -> 1) bằng Spatial Attention
+        s_weights = self.spatial_attn(feat)  # (B, 1, T, V)
+        x_spatial = torch.sum(feat * s_weights, dim=-1)  # (B, C, T)
+
+        # 2. Lọc qua lớp Temporal Conv cuối cùng (Yu et al.)
+        x_temp = self.final_temporal_conv(x_spatial) + x_spatial  # (B, C, T)
+
+        # 3. Gộp chiều Thời gian (T -> 1): Kết hợp Attention Pool (xu hướng chung) + Max Pool (đỉnh cơn ngáp/nhắm mắt)
+        t_weights = self.temporal_attn(x_temp)  # (B, 1, T)
+        t_attn_pool = torch.sum(x_temp * t_weights, dim=-1)  # (B, C)
+        t_max_pool = torch.amax(x_temp, dim=-1)  # (B, C)
+
+        return torch.cat([t_attn_pool, t_max_pool], dim=-1)  # (B, 2*C)
+
+    def forward(
+            self,
+            feat: torch.Tensor,
+            return_domain: bool = False,
+            return_probs: bool = False
+    ):
+        """
+        Input : feat shape (B, C, T, V) từ khối STGCNBlock cuối cùng.
+        Output:
+          - Mặc định (Inference): y_logits (hoặc xác suất Softmax nếu return_probs=True).
+          - Khi huấn luyện đa tác vụ / Domain Generalization: dict chứa 'logits', 'domain_logits', 'fatigue_score'.
+        """
+        global_feat = self.pool_spatio_temporal(feat)  # (B, 2*C)
+
+        # Dự đoán nhãn trạng thái buồn ngủ (G_y)
+        y_logits = self.label_predictor(global_feat)  # (B, num_classes)
+        y_out = F.softmax(y_logits, dim=-1) if return_probs else y_logits
+
+        if not return_domain and not self.enable_regression:
+            return y_out
+
+        outputs = {"logits": y_out}
+
+        if return_domain and self.num_domains > 0:
+            rev_feat = self.grl(global_feat)
+            outputs["domain_logits"] = self.domain_classifier(rev_feat)
+
+        if self.enable_regression:
+            outputs["fatigue_score"] = self.regression_head(global_feat).squeeze(-1)
+
+        return outputs

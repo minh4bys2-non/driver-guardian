@@ -957,7 +957,8 @@ class BenchmarkRunner:
 
                 t0 = time.perf_counter()
                 with torch.autocast(device_type=device.type, enabled=self.cfg.amp and device.type == "cuda"):
-                    logits = model(landmarks, lengths=lengths)
+                    outputs = model(landmarks, lengths=lengths)
+                    logits = outputs["logits"] if isinstance(outputs, dict) else outputs
                     loss = criterion(logits, labels)
 
                 if device.type == "cuda":

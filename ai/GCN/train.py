@@ -1,11 +1,12 @@
 # File: train.py
 """
-Kịch bản huấn luyện mô hình ST-GCN Giám sát Tài xế (Driver Guardian).
+Kịch bản huấn luyện hướng đối tượng (OOP) mô hình ST-GCN Giám sát Tài xế (Driver Guardian).
 Tích hợp trực tiếp config.py, dataset.py và model.py:
-- Hàm mất mát: CrossEntropyLoss
-- Theo dõi chỉ số qua TensorBoard: Loss, Accuracy, Recall, F1, F2 cho cả Train & Validation
-- Quản lý và lưu checkpoint (best.pt, last.pt) dựa trên chỉ số Validation F1-score
-- Cấu hình thuần túy qua đối tượng TrainConfig (không dùng CLI/argparse).
+- Lớp điều phối chính: GCNTrainer (cùng các hàm wrapper tương thích ngược: train, run_epoch, build_model, ...)
+- Hàm mất mát: CrossEntropyLoss (hỗ trợ Label Smoothing trên tập Train, CrossEntropy thuần trên Val/Test)
+- Theo dõi chỉ số qua TensorBoard: Loss, Accuracy, Recall, F1, F2, Precision cho cả Train & Validation
+- Quản lý và lưu checkpoint nguyên tử (epoch_XX.pt, best.pt, last.pt) dựa trên chỉ số Validation F1-score
+- Cấu hình thuần túy qua đối tượng TrainConfig.
 """
 
 from __future__ import annotations
@@ -49,7 +50,7 @@ logger = logging.getLogger("DriverGuardian.GCN")
 
 
 # =====================================================================
-# 1. TIỆN ÍCH HỆ THỐNG: SEED, LOGGING & CHECKPOINT
+# 1. TIỆN ÍCH HỆ THỐNG & HÀM ĐỘC LẬP (BACKWARD-COMPATIBLE HELPERS)
 # =====================================================================
 def seed_everything(seed: int = 42) -> None:
     """Cố định seed để đảm bảo khả năng tái lập kết quả thực nghiệm."""
@@ -105,21 +106,17 @@ def atomic_save(state: Any, path: str | Path) -> None:
         Path(tmp_file).unlink(missing_ok=True)
 
 
-# =====================================================================
-# 2. KHỞI TẠO MÔ HÌNH VÀ BỘ ĐIỀU TỐC LEARNING RATE
-# =====================================================================
 def build_model(cfg: TrainConfig) -> nn.Module:
     """Khởi tạo mô hình dựa trên TrainConfig."""
     model_name = cfg.model_name.lower().strip()
     if model_name in ("stgcn", "driverstgcn", "light"):
-        logger.info("Khoi tao kien truc DriverSTGCN (Spatio-Temporal Graph CNN)...")
-        model = DriverSTGCN(**cfg.get_stgcn_kwargs())
+        logger.info("Khởi tạo kiến trúc DriverSTGCN (ST-GCN + AttentiveDrowsinessOutputHead)...")
+        return DriverSTGCN(**cfg.get_stgcn_kwargs())
     elif model_name in ("transformer", "driverstgcntransformer", "trans"):
-        logger.info("Khoi tao kien truc DriverSTGCNTransformer (STGCN + TransformerEncoder)...")
-        model = DriverSTGCNTransformer(**cfg.get_transformer_kwargs())
+        logger.info("Khởi tạo kiến trúc DriverSTGCNTransformer (STGCN + TransformerEncoder)...")
+        return DriverSTGCNTransformer(**cfg.get_transformer_kwargs())
     else:
-        raise ValueError(f"Khong ho tro model_name='{cfg.model_name}'. Chon 'stgcn' hoac 'transformer'.")
-    return model
+        raise ValueError(f"Không hỗ trợ model_name='{cfg.model_name}'. Chọn 'stgcn' hoặc 'transformer'.")
 
 
 def get_cosine_warmup_scheduler(
@@ -141,9 +138,6 @@ def get_cosine_warmup_scheduler(
     return LambdaLR(optimizer, lr_lambda=lr_lambda)
 
 
-# =====================================================================
-# 3. TÍNH TOÁN CHỈ SỐ: LOSS, ACCURACY, RECALL, F1, F2
-# =====================================================================
 def compute_metrics(
         y_true: np.ndarray,
         y_pred: np.ndarray,
@@ -173,15 +167,12 @@ def compute_metrics(
         tp = int(((y_pred == 1) & (y_true == 1)).sum())
         fp = int(((y_pred == 1) & (y_true == 0)).sum())
         fn = int(((y_pred == 0) & (y_true == 1)).sum())
-        tn = int(((y_pred == 0) & (y_true == 0)).sum())
 
         precision = float(tp / max(1, tp + fp))
         recall = float(tp / max(1, tp + fn))
         f1 = float((2 * tp) / max(1, 2 * tp + fp + fn))
-        # F2-score: beta=2 -> uu tien Recall cao hon Precision (giam bo sot tai xe ngu gat)
         f2 = float((5 * tp) / max(1, 5 * tp + 4 * fn + fp))
     else:
-        # Macro average cho đa lớp
         precisions, recalls, f1s, f2s = [], [], [], []
         for c in range(num_classes):
             tp_c = int(((y_pred == c) & (y_true == c)).sum())
@@ -214,9 +205,6 @@ def compute_metrics(
     }
 
 
-# =====================================================================
-# 4. THỰC THI 1 EPOCH (TRAIN HOẶC EVALUATION)
-# =====================================================================
 def run_epoch(
         model: nn.Module,
         loader: DataLoader,
@@ -241,7 +229,6 @@ def run_epoch(
     progress = tqdm(loader, desc=desc, unit="batch", dynamic_ncols=True, leave=False)
 
     for batch in progress:
-        # Nhận tuple 4 phần tử từ collate_gcn: (padded_landmarks, labels, lengths, metas)
         landmarks, labels, lengths = batch[0], batch[1], batch[2]
         landmarks = landmarks.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
@@ -250,7 +237,8 @@ def run_epoch(
 
         with torch.set_grad_enabled(training):
             with torch.autocast(device_type=device.type, enabled=amp and device.type == "cuda"):
-                logits = model(landmarks, lengths=lengths)
+                outputs = model(landmarks, lengths=lengths)
+                logits = outputs["logits"] if isinstance(outputs, dict) else outputs
                 loss = criterion(logits, labels)
 
             if not torch.isfinite(loss):
@@ -299,9 +287,6 @@ def run_epoch(
     return compute_metrics(y_true, y_pred, avg_loss, num_classes=num_classes)
 
 
-# =====================================================================
-# 5. GHI LOG TENSORBOARD ĐỒNG BỘ
-# =====================================================================
 def log_epoch_to_tensorboard(
         writer: SummaryWriter,
         train_metrics: Dict[str, float],
@@ -310,7 +295,6 @@ def log_epoch_to_tensorboard(
         epoch: int,
 ) -> None:
     """Ghi nhận chi tiết các scalar Loss, Accuracy, Recall, F1, F2 cho cả Train & Val."""
-    # 1. Các nhánh độc lập
     for metric_name in ("loss", "accuracy", "recall", "f1", "f2", "precision"):
         if metric_name in train_metrics:
             writer.add_scalar(f"train/{metric_name}", train_metrics[metric_name], epoch)
@@ -319,7 +303,6 @@ def log_epoch_to_tensorboard(
 
     writer.add_scalar("train/learning_rate", current_lr, epoch)
 
-    # 2. Đồ thị so sánh đối chiếu trực tiếp giữa Train và Validation
     for metric_name in ("loss", "accuracy", "recall", "f1", "f2"):
         writer.add_scalars(
             f"compare/{metric_name}",
@@ -330,231 +313,327 @@ def log_epoch_to_tensorboard(
 
 
 # =====================================================================
-# 6. HÀM CHÍNH: QUẢN LÝ HUẤN LUYỆN & LƯU CHECKPOINT THEO F1
+# 2. LỚP QUẢN LÝ HUẤN LUYỆN HƯỚNG ĐỐI TƯỢNG (OOP GCN TRAINER)
 # =====================================================================
-def train(cfg: Optional[TrainConfig] = None) -> nn.Module:
+class GCNTrainer:
     """
-    Hàm thực thi huấn luyện toàn bộ pipeline.
-    Nhận đối tượng TrainConfig trực tiếp từ mã nguồn hoặc khởi tạo mặc định.
+    Lớp Trainer hướng đối tượng (OOP) quản lý toàn bộ vòng đời huấn luyện mô hình Driver Guardian GCN:
+    1. Khởi tạo và đồng bộ siêu tham số cấu hình (TrainConfig).
+    2. Xây dựng DataLoaders (Train, Val, Test) tích hợp Cache .pt & InsightFace 68 3D Landmarks.
+    3. Khởi tạo kiến trúc mô hình (DriverSTGCN / DriverSTGCNTransformer), Hàm mất mát, Optimizer, Scheduler và Scaler (AMP).
+    4. Điều phối vòng lặp huấn luyện từng epoch, tính toán chỉ số chi tiết (Loss, Accuracy, Recall, F1, F2).
+    5. Quản lý lưu trữ checkpoint nguyên tử (Atomic Save) cho từng epoch (epoch_XX.pt), best.pt và last.pt.
+    6. Ghi nhận log trực quan theo thời gian thực ra Console, train.log và TensorBoard.
+    7. Tự động đánh giá kiểm thử nghiệm thu trên tập Test bằng checkpoint tốt nhất sau khi kết thúc.
     """
-    if cfg is None:
-        cfg = TrainConfig()
-    cfg.__post_init__()
 
-    save_dir = Path(cfg.save_dir)
-    save_dir.mkdir(parents=True, exist_ok=True)
-    configure_logging(save_dir / "train.log")
+    seed_everything = staticmethod(seed_everything)
+    configure_logging = staticmethod(configure_logging)
+    atomic_save = staticmethod(atomic_save)
+    compute_metrics = staticmethod(compute_metrics)
 
-    log_dir = Path(cfg.log_dir) if cfg.log_dir else (save_dir / "tensorboard")
-    log_dir.mkdir(parents=True, exist_ok=True)
+    def __init__(self, cfg: Optional[TrainConfig] = None):
+        self.cfg = cfg if cfg is not None else TrainConfig()
+        self.cfg.__post_init__()
 
-    seed_everything(cfg.seed)
-    device = torch.device(cfg.device if torch.cuda.is_available() or cfg.device == "cpu" else "cpu")
+        self.save_dir = Path(self.cfg.save_dir)
+        self.save_dir.mkdir(parents=True, exist_ok=True)
 
-    logger.info("=" * 70)
-    logger.info("BẮT ĐẦU HUẤN LUYỆN MÔ HÌNH DRIVER GUARDIAN GCN")
-    logger.info("=" * 70)
-    logger.info(f"Thiết bị sử dụng (Device) : {device}")
-    logger.info(f"Kiến trúc mô hình (Model) : {cfg.model_name}")
-    logger.info(f"Số lớp phân loại (Classes): {cfg.num_classes} ({cfg.class_names})")
-    logger.info(f"Thư mục lưu Checkpoint     : {save_dir}")
-    logger.info(f"Thư mục log TensorBoard   : {log_dir}")
+        self.log_dir = Path(self.cfg.log_dir) if self.cfg.log_dir else (self.save_dir / "tensorboard")
+        self.log_dir.mkdir(parents=True, exist_ok=True)
 
-    # Lưu lại file cấu hình json tại thư mục checkpoint
-    cfg.save(save_dir / "config.json")
+        self.configure_logging(self.save_dir / "train.log")
+        self.seed_everything(self.cfg.seed)
 
-    # 1. Khởi tạo DataLoaders
-    train_loader, val_loader, test_loader = build_gcn_dataloaders(**cfg.get_dataloader_kwargs())
-    logger.info(
-        f"Số lượng mẫu Dataset      : Train={len(train_loader.dataset)} | Val={len(val_loader.dataset)} | Test={len(test_loader.dataset)}")
+        self.device = torch.device(self.cfg.device if torch.cuda.is_available() or self.cfg.device == "cpu" else "cpu")
+        self.writer: Optional[SummaryWriter] = None
 
-    # 2. Khởi tạo Mô hình & Hàm Mất mát CrossEntropyLoss
-    model = build_model(cfg).to(device)
-    num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    logger.info(f"Tổng số tham số học được  : {num_params:,} parameters")
+        self.cfg.save(self.save_dir / "config.json")
+        self._setup_components()
 
-    criterion = nn.CrossEntropyLoss()
-    optimizer = AdamW(
-        (p for p in model.parameters() if p.requires_grad),
-        lr=cfg.lr,
-        weight_decay=cfg.weight_decay,
-    )
-    scheduler = get_cosine_warmup_scheduler(
-        optimizer,
-        total_epochs=cfg.epochs,
-        warmup_epochs=cfg.warmup_epochs,
-        min_lr_ratio=cfg.min_lr_ratio,
-    )
-    scaler = torch.amp.GradScaler("cuda", enabled=cfg.amp and device.type == "cuda")
+    def _setup_components(self) -> None:
+        """Khởi tạo DataLoaders, Mô hình, Hàm mất mát, Optimizer, Scheduler và Scaler."""
+        logger.info("=" * 70)
+        logger.info("KHỞI TẠO PIPELINE HUẤN LUYỆN GCNTRAINER (OOP) - DRIVER GUARDIAN GCN")
+        logger.info("=" * 70)
+        logger.info(f"Thiết bị sử dụng (Device)      : {self.device}")
+        logger.info(f"Kiến trúc mô hình (Model)      : {self.cfg.model_name}")
+        logger.info(f"Số lớp phân loại (Classes)     : {self.cfg.num_classes} ({self.cfg.class_names})")
+        logger.info(f"Mô hình Landmark (InsightFace) : {self.cfg.landmark_model_name} (Det: {self.cfg.det_size})")
+        logger.info(f"Sử dụng Cache Landmark (.pt)   : {self.cfg.use_cache} (Dir: {self.cfg.cache_dir})")
+        logger.info(f"Hệ số Label Smoothing          : {self.cfg.label_smoothing}")
+        logger.info(f"Thư mục lưu Checkpoint         : {self.save_dir}")
+        logger.info(f"Thư mục log TensorBoard        : {self.log_dir}")
 
-    # 3. Quản lý khôi phục (Resume) nếu có
-    start_epoch = 1
-    best_epoch = 0
-    best_metrics: Optional[Dict[str, float]] = None
+        self.train_loader, self.val_loader, self.test_loader = self._build_dataloaders()
+        logger.info(
+            f"Số lượng mẫu Dataset           : Train={len(self.train_loader.dataset)} | "
+            f"Val={len(self.val_loader.dataset)} | Test={len(self.test_loader.dataset)}"
+        )
 
-    if cfg.resume:
-        resume_path = Path(cfg.resume)
-        if resume_path.is_file():
-            logger.info(f"Nạp lại checkpoint từ: {resume_path}")
-            checkpoint = torch.load(resume_path, map_location=device)
-            model.load_state_dict(checkpoint["model_state_dict"])
-            if "optimizer_state_dict" in checkpoint:
-                optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-            if "scheduler_state_dict" in checkpoint:
-                scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-            if "scaler_state_dict" in checkpoint and scaler is not None and checkpoint["scaler_state_dict"] is not None:
-                scaler.load_state_dict(checkpoint["scaler_state_dict"])
-            start_epoch = checkpoint.get("epoch", 0) + 1
-            best_epoch = checkpoint.get("best_epoch", 0)
-            best_metrics = checkpoint.get("best_metrics", None)
-            logger.info(f"Đã khôi phục thành công! Tiếp tục từ Epoch {start_epoch} (Best Epoch trước đó: {best_epoch})")
+        self.model = self._build_model().to(self.device)
+        num_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        logger.info(f"Tổng số tham số học được       : {num_params:,} parameters")
 
-    # 4. Vòng lặp huấn luyện từng Epoch & Đánh giá Checkpoint theo F1
-    writer = SummaryWriter(str(log_dir))
-    writer.add_text("Config", f"```json\n{json.dumps(cfg.to_dict(), indent=2, ensure_ascii=False)}\n```", 0)
+        self.criterion = nn.CrossEntropyLoss(label_smoothing=self.cfg.label_smoothing)
+        self.val_criterion = nn.CrossEntropyLoss()
+        self.optimizer = AdamW(
+            (p for p in self.model.parameters() if p.requires_grad),
+            lr=self.cfg.lr,
+            weight_decay=self.cfg.weight_decay,
+        )
 
-    start_train_time = time.time()
+        self.scheduler = self._build_scheduler()
+        self.scaler = torch.amp.GradScaler("cuda", enabled=self.cfg.amp and self.device.type == "cuda")
 
-    try:
-        for epoch in range(start_epoch, cfg.epochs + 1):
-            epoch_start = time.time()
-            current_lr = float(optimizer.param_groups[0]["lr"])
+        self.start_epoch = 1
+        self.best_epoch = 0
+        self.best_metrics: Optional[Dict[str, float]] = None
 
-            # Huấn luyện trên tập Train
-            train_metrics = run_epoch(
-                model=model,
-                loader=train_loader,
-                criterion=criterion,
-                device=device,
-                optimizer=optimizer,
-                scaler=scaler,
-                amp=cfg.amp,
-                max_grad_norm=cfg.max_grad_norm,
-                desc=f"Epoch {epoch:02d}/{cfg.epochs:02d} [Train]",
-                num_classes=cfg.num_classes,
-            )
+        if self.cfg.resume:
+            self.load_checkpoint(self.cfg.resume)
 
-            # Đánh giá trên tập Validation
-            val_metrics = run_epoch(
-                model=model,
-                loader=val_loader,
-                criterion=criterion,
-                device=device,
-                optimizer=None,
-                scaler=None,
-                amp=cfg.amp,
-                max_grad_norm=cfg.max_grad_norm,
-                desc=f"Epoch {epoch:02d}/{cfg.epochs:02d} [Val]",
-                num_classes=cfg.num_classes,
-            )
+    def _build_dataloaders(self):
+        return build_gcn_dataloaders(**self.cfg.get_dataloader_kwargs())
 
-            scheduler.step()
-            epoch_duration = time.time() - epoch_start
+    def _build_model(self) -> nn.Module:
+        return build_model(self.cfg)
 
-            # Ghi TensorBoard
-            log_epoch_to_tensorboard(writer, train_metrics, val_metrics, current_lr, epoch)
+    def _build_scheduler(self) -> LambdaLR:
+        return get_cosine_warmup_scheduler(
+            self.optimizer,
+            total_epochs=self.cfg.epochs,
+            warmup_epochs=self.cfg.warmup_epochs,
+            min_lr_ratio=self.cfg.min_lr_ratio,
+        )
 
-            # Đánh giá tiêu chí lưu Checkpoint tốt nhất: DỰA TRÊN CHỈ SỐ F1 CỦA TẬP VALIDATION
-            is_best = False
-            if best_metrics is None:
-                is_best = True
-            else:
-                # Ưu tiên F1 cao hơn; nếu F1 bằng nhau xét tiếp F2 và sau đó là Loss thấp hơn
-                val_score = (val_metrics["f1"], val_metrics["f2"], -val_metrics["loss"])
-                best_score = (best_metrics["f1"], best_metrics["f2"], -best_metrics["loss"])
-                if val_score > best_score:
-                    is_best = True
+    def load_checkpoint(self, resume_path: str | Path) -> None:
+        """Khôi phục trạng thái mô hình và optimizer từ checkpoint đã lưu."""
+        resume_path = Path(resume_path)
+        if not resume_path.is_file():
+            logger.warning(f"Không tìm thấy file checkpoint resume tại: {resume_path}. Bỏ qua nạp lại.")
+            return
 
-            if is_best:
-                best_epoch = epoch
-                best_metrics = val_metrics
-                best_state = {
-                    "format_version": 1,
-                    "epoch": best_epoch,
-                    "model_name": cfg.model_name,
-                    "model_state_dict": {k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
-                    "val_metrics": best_metrics,
-                    "config": cfg.to_dict(),
-                }
-                atomic_save(best_state, save_dir / "best.pt")
-                with open(save_dir / "best_metrics.json", "w", encoding="utf-8") as f:
-                    json.dump(best_metrics, f, indent=4, ensure_ascii=False)
+        logger.info(f"Nạp lại checkpoint từ: {resume_path}")
+        try:
+            checkpoint = torch.load(resume_path, map_location=self.device, weights_only=False)
+        except TypeError:
+            checkpoint = torch.load(resume_path, map_location=self.device)
 
-            # Lưu checkpoint cuối cùng sau mỗi epoch để hỗ trợ resume
-            last_state = {
+        self.model.load_state_dict(checkpoint["model_state_dict"])
+        if "optimizer_state_dict" in checkpoint:
+            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        if "scheduler_state_dict" in checkpoint:
+            self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        if "scaler_state_dict" in checkpoint and self.scaler is not None and checkpoint["scaler_state_dict"] is not None:
+            self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
+        self.start_epoch = checkpoint.get("epoch", 0) + 1
+        self.best_epoch = checkpoint.get("best_epoch", 0)
+        self.best_metrics = checkpoint.get("best_metrics", None)
+        logger.info(f"Đã khôi phục thành công! Tiếp tục từ Epoch {self.start_epoch} (Best Epoch trước đó: {self.best_epoch})")
+
+    def save_checkpoints(
+            self,
+            epoch: int,
+            train_metrics: Dict[str, float],
+            val_metrics: Dict[str, float],
+            is_best: bool,
+    ) -> None:
+        """Lưu trữ an toàn mọi checkpoint của từng epoch (epoch_XX.pt), best.pt và last.pt."""
+        checkpoint_state = {
+            "format_version": 1,
+            "epoch": epoch,
+            "model_name": self.cfg.model_name,
+            "model_state_dict": self.model.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "scheduler_state_dict": self.scheduler.state_dict(),
+            "scaler_state_dict": self.scaler.state_dict() if self.scaler else None,
+            "train_metrics": train_metrics,
+            "val_metrics": val_metrics,
+            "best_epoch": self.best_epoch if not is_best else epoch,
+            "best_metrics": self.best_metrics if not is_best else val_metrics,
+            "config": self.cfg.to_dict(),
+        }
+
+        epoch_ckpt_path = self.save_dir / f"epoch_{epoch:02d}.pt"
+        self.atomic_save(checkpoint_state, epoch_ckpt_path)
+        self.atomic_save(checkpoint_state, self.save_dir / "last.pt")
+
+        if is_best:
+            self.best_epoch = epoch
+            self.best_metrics = val_metrics
+            best_state = {
                 "format_version": 1,
-                "epoch": epoch,
-                "model_name": cfg.model_name,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "scheduler_state_dict": scheduler.state_dict(),
-                "scaler_state_dict": scaler.state_dict() if scaler else None,
-                "best_epoch": best_epoch,
-                "best_metrics": best_metrics,
-                "config": cfg.to_dict(),
+                "epoch": self.best_epoch,
+                "model_name": self.cfg.model_name,
+                "model_state_dict": {k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()},
+                "train_metrics": train_metrics,
+                "val_metrics": self.best_metrics,
+                "config": self.cfg.to_dict(),
             }
-            atomic_save(last_state, save_dir / "last.pt")
+            self.atomic_save(best_state, self.save_dir / "best.pt")
+            with open(self.save_dir / "best_metrics.json", "w", encoding="utf-8") as f:
+                json.dump(self.best_metrics, f, indent=4, ensure_ascii=False)
 
-            # In thông tin tổng kết Epoch
-            best_tag = " >>> [BEST CHECKPOINT SAVED] <<<" if is_best else ""
-            logger.info(
-                f"Epoch {epoch:02d}/{cfg.epochs:02d} ({epoch_duration:.1f}s) | LR: {current_lr:.6g}\n"
-                f"  - Train: Loss={train_metrics['loss']:.4f} | Acc={train_metrics['accuracy']:.4f} | Recall={train_metrics['recall']:.4f} | F1={train_metrics['f1']:.4f} | F2={train_metrics['f2']:.4f}\n"
-                f"  - Val  : Loss={val_metrics['loss']:.4f} | Acc={val_metrics['accuracy']:.4f} | Recall={val_metrics['recall']:.4f} | F1={val_metrics['f1']:.4f} | F2={val_metrics['f2']:.4f}{best_tag}"
-            )
+    def log_epoch_to_tensorboard(
+            self,
+            train_metrics: Dict[str, float],
+            val_metrics: Dict[str, float],
+            current_lr: float,
+            epoch: int,
+    ) -> None:
+        if self.writer is None:
+            return
+        log_epoch_to_tensorboard(self.writer, train_metrics, val_metrics, current_lr, epoch)
 
-    except KeyboardInterrupt:
-        logger.warning("\nQuá trình huấn luyện bị ngắt bởi người dùng. Checkpoint 'last.pt' đã được bảo lưu an toàn.")
-    finally:
-        total_time = time.time() - start_train_time
-        logger.info(f"\nHoàn tất huấn luyện sau {total_time / 60:.2f} phút.")
-        if best_metrics:
-            logger.info(f"Checkpoint tốt nhất tại Epoch {best_epoch}:")
-            logger.info(f"  - Val F1      : {best_metrics['f1']:.4f}")
-            logger.info(f"  - Val F2      : {best_metrics['f2']:.4f}")
-            logger.info(f"  - Val Recall  : {best_metrics['recall']:.4f}")
-            logger.info(f"  - Val Accuracy: {best_metrics['accuracy']:.4f}")
-            logger.info(f"  - Val Loss    : {best_metrics['loss']:.4f}")
+    def run_epoch(
+            self,
+            loader: DataLoader,
+            training: bool = True,
+            desc: str = "Train",
+    ) -> Dict[str, float]:
+        """Chạy 1 epoch đầy đủ qua DataLoader (dùng cho cả Train, Val, Test)."""
+        return run_epoch(
+            model=self.model,
+            loader=loader,
+            criterion=self.criterion if training else self.val_criterion,
+            device=self.device,
+            optimizer=self.optimizer if training else None,
+            scaler=self.scaler if training else None,
+            amp=self.cfg.amp,
+            max_grad_norm=self.cfg.max_grad_norm,
+            desc=desc,
+            num_classes=self.cfg.num_classes,
+        )
 
-        # 5. Đánh giá kiểm thử cuối cùng trên tập Test bằng model tốt nhất
-        best_pt_path = save_dir / "best.pt"
-        if best_pt_path.is_file() and len(test_loader.dataset) > 0:
-            logger.info("\nĐang tải best.pt để đánh giá nghiệm thu trên tập Test...")
-            checkpoint = torch.load(best_pt_path, map_location=device)
-            model.load_state_dict(checkpoint["model_state_dict"])
-            test_metrics = run_epoch(
-                model=model,
-                loader=test_loader,
-                criterion=criterion,
-                device=device,
-                optimizer=None,
-                scaler=None,
-                amp=cfg.amp,
-                desc="Final Test",
-                num_classes=cfg.num_classes,
-            )
+    def train_one_epoch(self, epoch: int) -> Dict[str, float]:
+        if hasattr(self.model, "output_head") and hasattr(self.model.output_head, "grl"):
+            progress = float(epoch - 1) / float(max(1, self.cfg.epochs - 1))
+            self.model.output_head.grl.set_lambda(progress)
+
+        return self.run_epoch(
+            loader=self.train_loader,
+            training=True,
+            desc=f"Epoch {epoch:02d}/{self.cfg.epochs:02d} [Train]",
+        )
+
+    def validate(self, epoch: int) -> Dict[str, float]:
+        return self.run_epoch(
+            loader=self.val_loader,
+            training=False,
+            desc=f"Epoch {epoch:02d}/{self.cfg.epochs:02d} [Val]",
+        )
+
+    def evaluate_test(self) -> Optional[Dict[str, float]]:
+        """Đánh giá kiểm thử nghiệm thu trên tập Test bằng checkpoint tốt nhất (best.pt)."""
+        best_pt_path = self.save_dir / "best.pt"
+        if not best_pt_path.is_file() or len(self.test_loader.dataset) == 0:
+            return None
+
+        logger.info("\nĐang tải best.pt để đánh giá nghiệm thu trên tập Test...")
+        try:
+            checkpoint = torch.load(best_pt_path, map_location=self.device, weights_only=False)
+        except TypeError:
+            checkpoint = torch.load(best_pt_path, map_location=self.device)
+        self.model.load_state_dict(checkpoint["model_state_dict"])
+
+        test_metrics = self.run_epoch(
+            loader=self.test_loader,
+            training=False,
+            desc="Final Test",
+        )
+
+        if self.writer is not None:
             for m_name, m_val in test_metrics.items():
-                writer.add_scalar(f"test/{m_name}", m_val, best_epoch)
-            writer.flush()
-            with open(save_dir / "test_metrics.json", "w", encoding="utf-8") as f:
-                json.dump(test_metrics, f, indent=4, ensure_ascii=False)
-            logger.info(
-                f"Kết quả Test (Best Epoch {best_epoch}): "
-                f"Loss={test_metrics['loss']:.4f} | Acc={test_metrics['accuracy']:.4f} | "
-                f"Recall={test_metrics['recall']:.4f} | F1={test_metrics['f1']:.4f} | F2={test_metrics['f2']:.4f}"
-            )
+                self.writer.add_scalar(f"test/{m_name}", m_val, self.best_epoch)
+            self.writer.flush()
 
-        writer.close()
+        with open(self.save_dir / "test_metrics.json", "w", encoding="utf-8") as f:
+            json.dump(test_metrics, f, indent=4, ensure_ascii=False)
 
-    return model
+        logger.info(
+            f"Kết quả Test (Best Epoch {self.best_epoch}): "
+            f"Loss={test_metrics['loss']:.4f} | Acc={test_metrics['accuracy']:.4f} | "
+            f"Recall={test_metrics['recall']:.4f} | F1={test_metrics['f1']:.4f} | F2={test_metrics['f2']:.4f}"
+        )
+        return test_metrics
+
+    def fit(self) -> nn.Module:
+        """Thực thi toàn bộ quy trình huấn luyện và đánh giá mô hình."""
+        self.writer = SummaryWriter(str(self.log_dir))
+        self.writer.add_text(
+            "Config",
+            f"```json\n{json.dumps(self.cfg.to_dict(), indent=2, ensure_ascii=False)}\n```",
+            0
+        )
+
+        logger.info("=" * 70)
+        logger.info("BẮT ĐẦU VÒNG LẶP HUẤN LUYỆN (FIT LOOP)")
+        logger.info("=" * 70)
+
+        start_train_time = time.time()
+
+        try:
+            for epoch in range(self.start_epoch, self.cfg.epochs + 1):
+                epoch_start = time.time()
+                current_lr = float(self.optimizer.param_groups[0]["lr"])
+
+                train_metrics = self.train_one_epoch(epoch)
+                val_metrics = self.validate(epoch)
+
+                self.scheduler.step()
+                epoch_duration = time.time() - epoch_start
+
+                self.log_epoch_to_tensorboard(train_metrics, val_metrics, current_lr, epoch)
+
+                is_best = False
+                if self.best_metrics is None:
+                    is_best = True
+                else:
+                    val_score = (val_metrics["f1"], val_metrics["f2"], -val_metrics["loss"])
+                    best_score = (self.best_metrics["f1"], self.best_metrics["f2"], -self.best_metrics["loss"])
+                    if val_score > best_score:
+                        is_best = True
+
+                self.save_checkpoints(epoch, train_metrics, val_metrics, is_best)
+
+                best_tag = " >>> [BEST RECORD UPDATED] <<<" if is_best else ""
+                logger.info(
+                    f"Epoch {epoch:02d}/{self.cfg.epochs:02d} ({epoch_duration:.1f}s) | LR: {current_lr:.6g} [Checkpoint: epoch_{epoch:02d}.pt]\n"
+                    f"  - Train: Loss={train_metrics['loss']:.4f} | Acc={train_metrics['accuracy']:.4f} | Recall={train_metrics['recall']:.4f} | F1={train_metrics['f1']:.4f} | F2={train_metrics['f2']:.4f}\n"
+                    f"  - Val  : Loss={val_metrics['loss']:.4f} | Acc={val_metrics['accuracy']:.4f} | Recall={val_metrics['recall']:.4f} | F1={val_metrics['f1']:.4f} | F2={val_metrics['f2']:.4f}{best_tag}"
+                )
+
+        except KeyboardInterrupt:
+            logger.warning("\nQuá trình huấn luyện bị ngắt bởi người dùng. Toàn bộ checkpoint đã được bảo lưu an toàn.")
+        finally:
+            total_time = time.time() - start_train_time
+            logger.info(f"\nHoàn tất huấn luyện sau {total_time / 60:.2f} phút.")
+            if self.best_metrics:
+                logger.info(f"Checkpoint tốt nhất tại Epoch {self.best_epoch}:")
+                logger.info(f"  - Val F1      : {self.best_metrics['f1']:.4f}")
+                logger.info(f"  - Val F2      : {self.best_metrics['f2']:.4f}")
+                logger.info(f"  - Val Recall  : {self.best_metrics['recall']:.4f}")
+                logger.info(f"  - Val Accuracy: {self.best_metrics['accuracy']:.4f}")
+                logger.info(f"  - Val Loss    : {self.best_metrics['loss']:.4f}")
+
+            self.evaluate_test()
+
+            if self.writer is not None:
+                self.writer.close()
+
+        return self.model
+
+
+def train(cfg: Optional[TrainConfig] = None) -> nn.Module:
+    """Hàm thực thi huấn luyện toàn bộ pipeline thông qua GCNTrainer."""
+    trainer = GCNTrainer(cfg)
+    return trainer.fit()
 
 
 # =====================================================================
-# 7. KHỞI CHẠY TRỰC TIẾP (THUẦN PYTHON, KHÔNG DÙNG CLI)
+# 3. KHỞI CHẠY TRỰC TIẾP (THUẦN PYTHON, KHÔNG DÙNG CLI)
 # =====================================================================
 if __name__ == "__main__":
-    # Cấu hình trực tiếp các tham số huấn luyện qua lớp TrainConfig tại đây:
     config = TrainConfig()
-
-    # Bắt đầu quá trình huấn luyện
     train(config)

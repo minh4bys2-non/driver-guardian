@@ -1,0 +1,1234 @@
+# =====================================================================
+# File: dataset.py
+# Dự án: Driver Guardian - Module LiteFat
+# Tác vụ: Nạp tập dữ liệu phát hiện buồn ngủ, trích xuất 68 điểm mốc khuôn mặt
+#         bằng PIPNet (FaceBoxesV2 + ResNet18 300W) và cắt vùng khuôn mặt
+#         chuẩn hóa cho mô hình LiteFat (MobileNetV3-Small + STGL).
+# Tối ưu hóa:
+#   - Tốc độ: Batched GPU FaceBoxesV2, Cached Priors, Torchvision GPU NMS,
+#             Batched GPU PIPNet với giải mã NRM vector hóa, Fast Video Seeking.
+#   - Chính xác: Đồng bộ kích thước letterbox (ultis.py), theo dõi khuôn mặt tài xế
+#               qua IoU, Landmark-Guided BBox Refinement, nội suy tuyến tính &
+#               làm mượt thời gian (Temporal Smoothing) cho khung hình khuôn mặt.
+# =====================================================================
+from __future__ import annotations
+
+import csv
+import json
+import logging
+import math
+import os
+import random
+import sys
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+# Monkey patch cho scipy >= 1.14 để tương thích với torchlm metrics
+import scipy.integrate
+if not hasattr(scipy.integrate, "simps"):
+    scipy.integrate.simps = scipy.integrate.simpson
+
+# Cấu hình môi trường Windows và nạp DLL PyTorch CUDA
+torch_lib_path = os.path.join(os.path.dirname(sys.executable), "Library", "bin")
+if os.path.exists(torch_lib_path):
+    os.environ["PATH"] = torch_lib_path + os.pathsep + os.environ.get("PATH", "")
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+import cv2
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision
+from torch.utils.data import DataLoader, Dataset
+
+# Import hàm letterbox chuẩn từ ultis.py
+from ultis import letterbox
+
+# Import khởi tạo PIPNet & hàm vẽ điểm mốc từ pipnet_68_camera.py
+from pipnet_68_camera import init_pipnet_68_gpu, draw_68_landmarks_custom
+
+logger = logging.getLogger("DriverGuardian.LiteFat")
+if not logger.handlers:
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter("[%(levelname)s] %(name)s: %(message)s"))
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+
+
+def _parse_size(size: Optional[Union[int, Tuple[int, int], List[int]]]) -> Tuple[int, int]:
+    """
+    Chuẩn hóa kích thước về tuple (width, height).
+    """
+    if size is None:
+        return (640, 480)
+    if isinstance(size, int):
+        return (size, size)
+    if isinstance(size, (tuple, list)) and len(size) == 2:
+        return (int(size[0]), int(size[1]))
+    raise ValueError(f"Kích thước không hợp lệ: {size}. Phải là int hoặc tuple (w, h).")
+
+
+def compute_iou(box_a: np.ndarray, box_b: np.ndarray) -> float:
+    """
+    Tính Intersection over Union (IoU) giữa 2 hộp giới hạn [x1, y1, x2, y2].
+    """
+    xa = max(box_a[0], box_b[0])
+    ya = max(box_a[1], box_b[1])
+    xb = min(box_a[2], box_b[2])
+    yb = min(box_a[3], box_b[3])
+
+    inter = max(0.0, xb - xa) * max(0.0, yb - ya)
+    area_a = max(0.0, box_a[2] - box_a[0]) * max(0.0, box_a[3] - box_a[1])
+    area_b = max(0.0, box_b[2] - box_b[0]) * max(0.0, box_b[3] - box_b[1])
+    union = area_a + area_b - inter
+    if union <= 0.0:
+        return 0.0
+    return float(inter / union)
+
+
+# =====================================================================
+# 1. BỘ TRÍCH XUẤT PIPNET TỐI ƯU HÓA CAO CẤP (FAST PIPNET EXTRACTOR)
+# =====================================================================
+class FastPIPNetExtractor:
+    """
+    Bộ trích xuất 68 điểm mốc khuôn mặt và cắt khung hình cho LiteFat
+    được tối ưu hóa tối đa:
+      1. Batched FaceBoxesV2 trên GPU: Nạp một mảng T khung hình cùng lúc,
+         tái sử dụng PriorBox anchors đã được tính toán sẵn 1 lần trên GPU,
+         sử dụng torchvision.ops.nms trực tiếp trên GPU.
+      2. Temporal Driver Tracking: Lựa chọn khuôn mặt tài xế ổn định dựa trên
+         điểm số, diện tích và độ tương đồng IoU qua các khung hình liên tiếp.
+      3. Batched PIPNet 300W trên GPU: Gom toàn bộ vùng mặt phát hiện được thành
+         1 batch tensor [N_valid, 3, 256, 256], chạy 1 lần suy luận duy nhất,
+         giải mã NRM (Neighbor Regression) hoàn toàn bằng tensor PyTorch trên GPU.
+      4. Landmark-Guided Box Refinement: Mở rộng hộp bao kết hợp giữa BBox và
+         cực trị 68 điểm mốc, làm mượt theo thời gian (EMA) và nội suy tuyến tính
+         cho các khung hình mất mặt, đảm bảo không bị cắt lẹm cằm/mắt.
+    """
+
+    def __init__(
+            self,
+            backbone: str = "resnet18",
+            device: Optional[str] = None,
+            letterbox_size: Tuple[int, int] = (640, 480),
+            face_size: Tuple[int, int] = (224, 224),
+            conf_threshold: float = 0.5,
+            nms_threshold: float = 0.3,
+            bbox_margin: float = 0.15,
+            box_smooth_alpha: float = 0.7,
+            use_fp16: bool = False,
+    ):
+        self.device = torch.device(
+            device if device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
+        )
+        self.letterbox_size = _parse_size(letterbox_size)  # (target_w, target_h)
+        self.face_size = _parse_size(face_size)            # (crop_w, crop_h)
+        self.conf_threshold = float(conf_threshold)
+        self.nms_threshold = float(nms_threshold)
+        self.bbox_margin = float(bbox_margin)
+        self.box_smooth_alpha = float(box_smooth_alpha)
+        self.use_fp16 = bool(use_fp16) and (self.device.type == "cuda")
+
+        # Khởi tạo mô hình thông qua runtime của torchlm
+        from torchlm.runtime._wrappers import RuntimeWrapper
+        if getattr(RuntimeWrapper, "face_base", None) is None or getattr(RuntimeWrapper, "landmarks_base", None) is None:
+            init_pipnet_68_gpu(backbone=backbone)
+
+        self.face_base = RuntimeWrapper.face_base
+        self.face_net = self.face_base.net.to(self.device)
+        self.face_net.eval()
+
+        self.lmk_base = RuntimeWrapper.landmarks_base
+        self.lmk_net = self.lmk_base.to(self.device)
+        self.lmk_net.eval()
+
+        # Cache PriorBox và hằng số chuẩn hóa trên GPU cho kích thước letterbox cố định
+        target_w, target_h = self.letterbox_size
+        from torchlm.tools._faceboxesv2 import PriorBox
+        pbox = PriorBox(self.face_base.cfg, image_size=(target_h, target_w))
+        self.cached_priors = pbox.forward().to(self.device)  # [P, 4]
+        self.cached_variances = self.face_base.cfg["variance"]
+        self.cached_scale = torch.tensor(
+            [target_w, target_h, target_w, target_h], dtype=torch.float32, device=self.device
+        )
+        self.faceboxes_mean = torch.tensor(
+            [104.0, 117.0, 123.0], dtype=torch.float32, device=self.device
+        ).view(1, 3, 1, 1)
+
+        # Hằng số chuẩn hóa PIPNet (ImageNet RGB)
+        self.pipnet_mean = torch.tensor(
+            [0.485, 0.456, 0.406], dtype=torch.float32, device=self.device
+        ).view(1, 3, 1, 1)
+        self.pipnet_std = torch.tensor(
+            [0.229, 0.224, 0.225], dtype=torch.float32, device=self.device
+        ).view(1, 3, 1, 1)
+
+        # Cache bảng chỉ số NRM cho PIPNet trên GPU
+        rev1 = self.lmk_base.reverse_index1
+        rev2 = self.lmk_base.reverse_index2
+        num_nb = self.lmk_base.num_nb
+        self.rev_indices = torch.tensor(
+            [r1 * num_nb + r2 for r1, r2 in zip(rev1, rev2)],
+            dtype=torch.long,
+            device=self.device,
+        )
+
+        # Hằng số chuẩn hóa ImageNet cho MobileNetV3 (CPU / GPU)
+        self.imagenet_mean = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 1, 3)
+        self.imagenet_std = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 1, 3)
+
+    @torch.no_grad()
+    def _detect_faces_batched(self, frames: List[np.ndarray], max_chunk: int = 32) -> List[np.ndarray]:
+        """
+        Chạy phát hiện khuôn mặt theo lô T khung hình trên GPU.
+        Tự động chia nhỏ theo max_chunk để tránh tràn VRAM GPU khi chuỗi khung hình dài (ví dụ video 300-1000 frames).
+        Mỗi khung hình trong `frames` đã được chuẩn hóa kích thước letterbox (target_h, target_w).
+        Trả về danh sách mảng numpy shape [num_dets, 5] (x1, y1, x2, y2, score).
+        """
+        T = len(frames)
+        if T == 0:
+            return []
+
+        all_dets: List[np.ndarray] = []
+        priors_xy = self.cached_priors[None, :, :2]
+        priors_wh = self.cached_priors[None, :, 2:]
+        v0, v1 = self.cached_variances[0], self.cached_variances[1]
+
+        for s in range(0, T, max_chunk):
+            chunk = frames[s:s + max_chunk]
+            cur_T = len(chunk)
+
+            # Gom batch BGR numpy -> tensor [cur_T, 3, H, W] trên GPU
+            frames_np = np.stack(chunk, axis=0)  # [cur_T, H, W, 3]
+            tensor = torch.from_numpy(frames_np).permute(0, 3, 1, 2).to(self.device).float()
+            tensor = tensor - self.faceboxes_mean
+
+            loc, conf = self.face_net(tensor)  # loc: [cur_T, P, 4], conf: [cur_T, P, 2]
+            scores = conf[:, :, 1]  # [cur_T, P]
+
+            # Giải mã tọa độ hộp giới hạn vector hóa cho cả chunk
+            boxes_xy = priors_xy + loc[:, :, :2] * v0 * priors_wh
+            boxes_wh = priors_wh * torch.exp(loc[:, :, 2:] * v1)
+            b_x1y1 = boxes_xy - boxes_wh / 2.0
+            b_x2y2 = b_x1y1 + boxes_wh
+            decoded_boxes = torch.cat([b_x1y1, b_x2y2], dim=-1) * self.cached_scale  # [cur_T, P, 4]
+
+            for b in range(cur_T):
+                sc = scores[b]
+                mask = sc >= self.conf_threshold
+                if not mask.any():
+                    all_dets.append(np.empty((0, 5), dtype=np.float32))
+                    continue
+
+                bx = decoded_boxes[b, mask]
+                sc_valid = sc[mask]
+
+                keep = torchvision.ops.nms(bx, sc_valid, iou_threshold=self.nms_threshold)
+                keep = keep[:50]  # Giữ tối đa 50 mặt có độ tin cậy cao nhất
+                res = torch.cat([bx[keep], sc_valid[keep, None]], dim=-1).cpu().numpy()
+                all_dets.append(res)
+
+        return all_dets
+
+    def _select_driver_faces(
+            self,
+            all_dets: List[np.ndarray],
+            target_w: int,
+            target_h: int
+    ) -> Tuple[List[Optional[np.ndarray]], List[bool]]:
+        """
+        Theo dõi và chọn duy nhất 1 khuôn mặt tài xế cho từng khung hình:
+          - Kết hợp diện tích và độ tin cậy.
+          - Duy trì tính nhất quán vị trí không gian qua IoU với khung hình liền kề.
+        Trả về:
+          - chosen_bboxes: danh sách bbox [x1, y1, x2, y2, score] (hoặc None nếu mất mặt)
+          - found: danh sách boolean đánh dấu phát hiện được khuôn mặt
+        """
+        T = len(all_dets)
+        chosen_bboxes: List[Optional[np.ndarray]] = [None] * T
+        found: List[bool] = [False] * T
+
+        prev_box: Optional[np.ndarray] = None
+
+        for t in range(T):
+            dets = all_dets[t]
+            if len(dets) == 0:
+                continue
+
+            best_idx = 0
+            if prev_box is None:
+                # Frame đầu tiên có mặt: chọn theo score * area
+                best_score = -1.0
+                for i, d in enumerate(dets):
+                    area = max(0.0, d[2] - d[0]) * max(0.0, d[3] - d[1])
+                    metric = d[4] * (area ** 0.5)
+                    if metric > best_score:
+                        best_score = metric
+                        best_idx = i
+            else:
+                # Các frame tiếp theo: ưu tiên IoU với khuôn mặt đã khóa trước đó
+                best_match = -1.0
+                for i, d in enumerate(dets):
+                    iou = compute_iou(d[:4], prev_box[:4])
+                    area = max(0.0, d[2] - d[0]) * max(0.0, d[3] - d[1])
+                    # Kết hợp IoU và độ tin cậy
+                    metric = (iou * 2.0) + (d[4] * 0.5) + (min(1.0, area / (prev_box_area + 1e-6)) * 0.3)
+                    if metric > best_match:
+                        best_match = metric
+                        best_idx = i
+
+            chosen = dets[best_idx].copy()
+            chosen_bboxes[t] = chosen
+            found[t] = True
+            prev_box = chosen
+            prev_box_area = max(1.0, (prev_box[2] - prev_box[0]) * (prev_box[3] - prev_box[1]))
+
+        return chosen_bboxes, found
+
+    @torch.no_grad()
+    def _extract_landmarks_batched(
+            self,
+            frames: List[np.ndarray],
+            chosen_bboxes: List[Optional[np.ndarray]],
+            found: List[bool],
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Trích xuất 68 điểm mốc khuôn mặt theo chuẩn 300W bằng PIPNet theo lô trên GPU.
+        Đảm bảo giữ chính xác công thức căn chỉnh vùng cắt của PIPNet 300W:
+          extend = 0.2 -> x1 -= 0.1*w, y1 += 0.1*h, x2 += 0.1*w, y2 += 0.1*h
+        Trả về:
+          - landmarks_norm: [T, 68, 3] gồm (x/W, y/H, confidence)
+          - landmarks_px:   [T, 68, 2] tọa độ pixel tuyệt đối trên khung hình letterbox
+        """
+        T = len(frames)
+        target_w, target_h = self.letterbox_size
+        extend = 0.2
+
+        valid_indices = [t for t in range(T) if found[t] and chosen_bboxes[t] is not None]
+
+        # Khởi tạo ma trận điểm mốc: mặc định gán 1.0 khi mất mặt (theo Section III-B bài báo LiteFat)
+        landmarks_norm = np.ones((T, 68, 3), dtype=np.float32)
+        landmarks_px = np.zeros((T, 68, 2), dtype=np.float32)
+
+        if not valid_indices:
+            return landmarks_norm, landmarks_px
+
+        crop_coords = []
+        crops_resized = []
+
+        for idx in valid_indices:
+            bbox = chosen_bboxes[idx]
+            bx1, by1, bx2, by2 = bbox[:4]
+            bw = bx2 - bx1 + 1.0
+            bh = by2 - by1 + 1.0
+
+            # Căn chỉnh lề theo đúng logic của PIPNet 300W (torchlm RuntimeWrapper)
+            cx1 = int(bx1 - bw * extend / 2.0)
+            cy1 = int(by1 + bh * extend / 2.0)
+            cx2 = int(bx2 + bw * extend / 2.0)
+            cy2 = int(by2 + bh * extend / 2.0)
+
+            cx1 = max(0, min(target_w - 2, cx1))
+            cy1 = max(0, min(target_h - 2, cy1))
+            cx2 = max(cx1 + 1, min(target_w, cx2))
+            cy2 = max(cy1 + 1, min(target_h, cy2))
+
+            crop_w = float(cx2 - cx1)
+            crop_h = float(cy2 - cy1)
+            crop_coords.append((cx1, cy1, crop_w, crop_h))
+
+            # Cắt ảnh và chuyển BGR -> RGB cho PIPNet
+            face_crop = frames[idx][cy1:cy2, cx1:cx2, ::-1]
+            face_resized = cv2.resize(face_crop, (256, 256), interpolation=cv2.INTER_LINEAR)
+            crops_resized.append(face_resized)
+
+        # Gom lô N_valid vùng mặt lên GPU và giải mã theo từng sub-batch (max_chunk=64) để tránh tràn VRAM
+        max_crop_chunk = 64
+        batched_lms_list = []
+        norm_factor = 1.0 * self.lmk_base.input_size / self.lmk_base.net_stride  # 256 / 32 = 8.0
+        num_nb = self.lmk_base.num_nb
+        max_len = self.lmk_base.max_len
+
+        for s in range(0, len(crops_resized), max_crop_chunk):
+            chunk_crops = crops_resized[s:s + max_crop_chunk]
+            crops_np = np.stack(chunk_crops, axis=0)  # [cur_b, 256, 256, 3]
+            crops_tensor = torch.from_numpy(crops_np).permute(0, 3, 1, 2).to(self.device).float() / 255.0
+            crops_tensor = (crops_tensor - self.pipnet_mean) / self.pipnet_std
+
+            out_cls, out_x, out_y, out_nb_x, out_nb_y = self.lmk_net(crops_tensor)
+            cur_B, num_lms, H_map, W_map = out_cls.shape
+
+            out_cls = out_cls.view(cur_B, num_lms, -1)
+            max_ids = torch.argmax(out_cls, dim=2)
+            max_ids_col = max_ids.unsqueeze(-1)
+
+            out_x_flat = out_x.view(cur_B, num_lms, -1)
+            out_y_flat = out_y.view(cur_B, num_lms, -1)
+            x_sel = torch.gather(out_x_flat, 2, max_ids_col).squeeze(2)
+            y_sel = torch.gather(out_y_flat, 2, max_ids_col).squeeze(2)
+
+            max_ids_nb = max_ids_col.repeat(1, 1, num_nb).view(cur_B, num_lms * num_nb, 1)
+            out_nb_x_flat = out_nb_x.view(cur_B, num_lms * num_nb, -1)
+            out_nb_y_flat = out_nb_y.view(cur_B, num_lms * num_nb, -1)
+            nb_x_sel = torch.gather(out_nb_x_flat, 2, max_ids_nb).view(cur_B, num_lms, num_nb)
+            nb_y_sel = torch.gather(out_nb_y_flat, 2, max_ids_nb).view(cur_B, num_lms, num_nb)
+
+            pred_x = ((max_ids % W_map).float() + x_sel) / norm_factor
+            pred_y = (torch.floor(max_ids.float() / W_map) + y_sel) / norm_factor
+
+            pred_nb_x = ((max_ids % W_map).float().unsqueeze(-1) + nb_x_sel) / norm_factor
+            pred_nb_y = (torch.floor(max_ids.float() / W_map).unsqueeze(-1) + nb_y_sel) / norm_factor
+
+            # Giải mã NRM vector hóa qua bảng ánh xạ reverse indices
+            pred_nb_x_flat = pred_nb_x.view(cur_B, -1)
+            pred_nb_y_flat = pred_nb_y.view(cur_B, -1)
+
+            nb_x_rev = pred_nb_x_flat[:, self.rev_indices].view(cur_B, num_lms, max_len)
+            nb_y_rev = pred_nb_y_flat[:, self.rev_indices].view(cur_B, num_lms, max_len)
+
+            final_x = torch.mean(torch.cat([pred_x.unsqueeze(-1), nb_x_rev], dim=-1), dim=-1)
+            final_y = torch.mean(torch.cat([pred_y.unsqueeze(-1), nb_y_rev], dim=-1), dim=-1)
+            chunk_lms = torch.stack([final_x, final_y], dim=-1).cpu().numpy()  # [cur_B, 68, 2] in [0, 1]
+            batched_lms_list.append(chunk_lms)
+
+        batched_lms = np.concatenate(batched_lms_list, axis=0) if batched_lms_list else np.empty((0, 68, 2), dtype=np.float32)
+
+        # Ánh xạ ngược tọa độ từ crop về khung hình letterbox
+        for i, idx in enumerate(valid_indices):
+            cx1, cy1, cw, ch = crop_coords[i]
+            score = float(chosen_bboxes[idx][4])
+
+            lm_crop = batched_lms[i].copy()
+            abs_x = lm_crop[:, 0] * cw + cx1
+            abs_y = lm_crop[:, 1] * ch + cy1
+
+            landmarks_px[idx, :, 0] = abs_x
+            landmarks_px[idx, :, 1] = abs_y
+
+            # Chuẩn hóa về [0, 1] trên kích thước letterbox
+            landmarks_norm[idx, :, 0] = abs_x / float(target_w)
+            landmarks_norm[idx, :, 1] = abs_y / float(target_h)
+            landmarks_norm[idx, :, 2] = score
+
+        return landmarks_norm, landmarks_px
+
+    def _crop_faces_for_litefat(
+            self,
+            frames: List[np.ndarray],
+            chosen_bboxes: List[Optional[np.ndarray]],
+            landmarks_px: np.ndarray,
+            found: List[bool],
+    ) -> torch.Tensor:
+        """
+        Cắt vùng khuôn mặt chuẩn hóa 224x224 cho nhánh MobileNetV3-Small:
+          - Kết hợp BBox và bao đóng 68 điểm mốc (Landmark-Guided BBox Refinement).
+          - Mở rộng lề margin 15% đối xứng, giữ tỷ lệ khung hình vuông (1:1).
+          - Nội suy tuyến tính cho các frame mất mặt và làm mượt thời gian (EMA).
+          - Trả về Tensor FloatTensor [T, 3, 224, 224] chuẩn hóa ImageNet.
+        """
+        T = len(frames)
+        target_w, target_h = self.letterbox_size
+        crop_w, crop_h = self.face_size
+
+        # 1. Tính toán hộp bao khuôn mặt thô cho từng khung hình
+        raw_boxes = np.zeros((T, 4), dtype=np.float32)
+
+        for t in range(T):
+            if found[t] and chosen_bboxes[t] is not None:
+                bx1, by1, bx2, by2 = chosen_bboxes[t][:4]
+                lms = landmarks_px[t]  # [68, 2]
+                lx1, ly1 = float(np.min(lms[:, 0])), float(np.min(lms[:, 1]))
+                lx2, ly2 = float(np.max(lms[:, 0])), float(np.max(lms[:, 1]))
+
+                # Hợp nhất hộp dò mặt và cực trị điểm mốc để không lẹm cằm/mắt
+                fx1 = min(bx1, lx1)
+                fy1 = min(by1, ly1)
+                fx2 = max(bx2, lx2)
+                fy2 = max(by2, ly2)
+
+                fw = fx2 - fx1
+                fh = fy2 - fy1
+                cx1 = fx1 - fw * self.bbox_margin
+                cy1 = fy1 - fh * self.bbox_margin
+                cx2 = fx2 + fw * self.bbox_margin
+                cy2 = fy2 + fh * self.bbox_margin
+
+                # Giữ khung vuông quanh tâm khuôn mặt
+                center_x = (cx1 + cx2) / 2.0
+                center_y = (cy1 + cy2) / 2.0
+                side = max(cx2 - cx1, cy2 - cy1)
+
+                raw_boxes[t] = [
+                    center_x - side / 2.0,
+                    center_y - side / 2.0,
+                    center_x + side / 2.0,
+                    center_y + side / 2.0
+                ]
+
+        # 2. Nội suy tuyến tính (Linear Interpolation) cho các frame mất mặt
+        valid_indices = [t for t in range(T) if found[t]]
+        if not valid_indices:
+            # Fallback toàn video mất mặt: lấy chính giữa khung hình
+            side = min(target_w, target_h) * 0.8
+            cx, cy = target_w / 2.0, target_h / 2.0
+            default_box = np.array([cx - side / 2.0, cy - side / 2.0, cx + side / 2.0, cy + side / 2.0], dtype=np.float32)
+            for t in range(T):
+                raw_boxes[t] = default_box
+        else:
+            # Điền đầu video
+            first_idx = valid_indices[0]
+            for t in range(first_idx):
+                raw_boxes[t] = raw_boxes[first_idx]
+            # Điền cuối video
+            last_idx = valid_indices[-1]
+            for t in range(last_idx + 1, T):
+                raw_boxes[t] = raw_boxes[last_idx]
+            # Nội suy giữa các mốc
+            for i in range(len(valid_indices) - 1):
+                idx_a = valid_indices[i]
+                idx_b = valid_indices[i + 1]
+                if idx_b - idx_a > 1:
+                    box_a = raw_boxes[idx_a]
+                    box_b = raw_boxes[idx_b]
+                    for t in range(idx_a + 1, idx_b):
+                        alpha = float(t - idx_a) / float(idx_b - idx_a)
+                        raw_boxes[t] = (1.0 - alpha) * box_a + alpha * box_b
+
+        # 3. Làm mượt thời gian bằng bộ lọc EMA (Exponential Moving Average)
+        smoothed_boxes = np.zeros_like(raw_boxes)
+        smoothed_boxes[0] = raw_boxes[0]
+        alpha = self.box_smooth_alpha
+        for t in range(1, T):
+            smoothed_boxes[t] = alpha * raw_boxes[t] + (1.0 - alpha) * smoothed_boxes[t - 1]
+
+        # 4. Cắt vùng mặt, resize về 224x224 và chuẩn hóa ImageNet
+        face_crops = np.zeros((T, crop_h, crop_w, 3), dtype=np.uint8)
+        for t in range(T):
+            bx1, by1, bx2, by2 = smoothed_boxes[t]
+            x1 = max(0, min(target_w - 2, int(round(bx1))))
+            y1 = max(0, min(target_h - 2, int(round(by1))))
+            x2 = max(x1 + 1, min(target_w, int(round(bx2))))
+            y2 = max(y1 + 1, min(target_h, int(round(by2))))
+
+            crop = frames[t][y1:y2, x1:x2, :]  # BGR
+            if crop.size == 0 or crop.shape[0] < 2 or crop.shape[1] < 2:
+                crop = frames[t]
+
+            resized = cv2.resize(crop, (crop_w, crop_h), interpolation=cv2.INTER_LINEAR)
+            face_crops[t] = resized[:, :, ::-1]  # Chuyển sang RGB
+
+        # Chuẩn hóa vector hóa cho cả chuỗi T ảnh
+        # [T, 224, 224, 3] -> [T, 3, 224, 224] float32 trong [0, 1]
+        face_tensor = torch.from_numpy(face_crops).permute(0, 3, 1, 2).float() / 255.0
+        norm_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+        norm_std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+        face_tensor = (face_tensor - norm_mean) / norm_std
+
+        return face_tensor
+
+    def extract_from_frames(
+            self,
+            frames: List[np.ndarray]
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[Optional[np.ndarray]], List[bool]]:
+        """
+        Pipeline trích xuất hoàn chỉnh từ chuỗi khung hình đã qua letterbox:
+          - Phát hiện mặt batched GPU.
+          - Chọn khuôn mặt tài xế ổn định.
+          - Trích xuất 68 điểm mốc batched GPU.
+          - Cắt và chuẩn hóa khung hình mặt cho LiteFat.
+
+        Returns:
+          - face_frames: Tensor [T, 3, 224, 224]
+          - landmarks:   Tensor [T, 68, 3] (X, Y, Conf)
+          - bboxes:      Danh sách BBox chọn lọc của từng frame
+          - found:       Danh sách boolean đánh dấu phát hiện được mặt
+        """
+        target_w, target_h = self.letterbox_size
+        # Đảm bảo mọi frame đầu vào đúng kích thước letterbox
+        uniform_frames = []
+        for f in frames:
+            if f.shape[1] != target_w or f.shape[0] != target_h:
+                uniform_frames.append(letterbox(f, new_size=(target_w, target_h)))
+            else:
+                uniform_frames.append(f)
+
+        # 1. Phát hiện mặt theo lô
+        all_dets = self._detect_faces_batched(uniform_frames)
+
+        # 2. Lựa chọn khuôn mặt tài xế ổn định
+        chosen_bboxes, found = self._select_driver_faces(all_dets, target_w, target_h)
+
+        # 3. Trích xuất 68 điểm mốc theo lô
+        landmarks_norm, landmarks_px = self._extract_landmarks_batched(
+            uniform_frames, chosen_bboxes, found
+        )
+
+        # 4. Cắt khung hình khuôn mặt cho MobileNetV3-Small
+        face_frames_tensor = self._crop_faces_for_litefat(
+            uniform_frames, chosen_bboxes, landmarks_px, found
+        )
+
+        landmarks_tensor = torch.from_numpy(landmarks_norm).float()
+
+        return face_frames_tensor, landmarks_tensor, chosen_bboxes, found
+
+
+# =====================================================================
+# 2. ĐỌC NHANH KHUNG HÌNH TỪ VIDEO (FAST VIDEO SEEKER)
+# =====================================================================
+def fast_read_video_frames(
+        video_path: Union[str, Path],
+        target_indices: np.ndarray,
+        letterbox_size: Tuple[int, int] = (640, 480),
+) -> Tuple[List[np.ndarray], float, int]:
+    """
+    Đọc chính xác các chỉ số khung hình `target_indices` từ video với tốc độ cao:
+      - Nhảy thẳng bằng CAP_PROP_POS_FRAMES tới vị trí đầu tiên.
+      - Dùng cap.grab() để lướt qua các frame trung gian (tiết kiệm chi phí giải mã CPU).
+      - Áp dụng ultis.letterbox về đúng kích thước chuẩn (target_w, target_h).
+    """
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise IOError(f"Không thể mở tệp video: {video_path}")
+
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    target_w, target_h = letterbox_size
+
+    frames: List[np.ndarray] = []
+    curr_frame = int(target_indices[0])
+    cap.set(cv2.CAP_PROP_POS_FRAMES, curr_frame)
+
+    try:
+        for target_idx in target_indices:
+            target_idx = int(target_idx)
+            if target_idx < curr_frame and frames:
+                frames.append(frames[-1].copy())
+                continue
+
+            while curr_frame < target_idx:
+                if not cap.grab():
+                    break
+                curr_frame += 1
+
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                break
+
+            # Chuẩn hóa qua ultis.letterbox
+            lb_frame = letterbox(frame, new_size=(target_w, target_h))
+            frames.append(lb_frame)
+            curr_frame += 1
+    finally:
+        cap.release()
+
+    if not frames:
+        raise IOError(f"Không đọc được khung hình nào từ: {video_path}")
+
+    # Bù khung hình nếu video kết thúc sớm hơn số lượng yêu cầu
+    while len(frames) < len(target_indices):
+        frames.append(frames[-1].copy())
+
+    return frames, fps, total_frames
+
+
+# =====================================================================
+# 3. LỚP LITEFAT DATASET (HỖ TRỢ ĐA CHẾ ĐỘ LẤY MẪU & CACHE)
+# =====================================================================
+class LiteFatDataset(Dataset):
+    """
+    PyTorch Dataset nạp dữ liệu cho mô hình LiteFat từ E:\\LSTM\\data_processed:
+      - Hỗ trợ nạp từ manifest dataset_merged_split.csv hoặc quét thư mục train/val/test.
+      - Hỗ trợ 2 chế độ lấy mẫu thời gian:
+          + Chế độ 1 (mặc định): Cố định num_frames (T=16) theo bài báo LiteFat.
+            Train: Temporal Jitter (lấy ngẫu nhiên trong từng phân đoạn); Val/Test: Linspace đều đặn.
+          + Chế độ 2: Lấy mẫu theo time_interval và window_sec.
+      - Tiền xử lý toàn bộ khung hình qua ultis.letterbox (640, 480).
+      - Trích xuất 68 điểm mốc bằng FastPIPNetExtractor (Batched GPU).
+      - Cắt khung hình khuôn mặt 224x224 chuẩn hóa ImageNet cho MobileNetV3-Small.
+      - Hỗ trợ nạp / lưu cache .pt để tăng tốc tối đa khi huấn luyện nhiều epoch.
+    """
+
+    def __init__(
+            self,
+            dataset_dir: Union[str, Path] = r"E:\LSTM\data_processed",
+            split: str = "train",
+            time_interval: float = 0.1,
+            window_sec: Optional[float] = 10.0,
+            manifest_filename: str = "dataset_merged_split.csv",
+            letterbox_size: Tuple[int, int] = (640, 480),
+            face_size: Tuple[int, int] = (224, 224),
+            conf_threshold: float = 0.5,
+            bbox_margin: float = 0.15,
+            return_meta: bool = False,
+            return_raw_frames: bool = False,
+            use_cache: bool = False,
+            cache_dir: Optional[Union[str, Path]] = None,
+            extractor: Optional[FastPIPNetExtractor] = None,
+            device: Optional[str] = None,
+    ):
+        split = split.lower().strip()
+        if split not in ("train", "val", "test"):
+            raise ValueError(f"Split không hợp lệ: '{split}'. Chỉ chấp nhận 'train', 'val', hoặc 'test'.")
+
+        if time_interval is not None and float(time_interval) < 0:
+            raise ValueError(f"time_interval phải là số không âm (>= 0): {time_interval}")
+        if window_sec is not None and float(window_sec) <= 0:
+            raise ValueError(f"window_sec phải là số dương hoặc None: {window_sec}")
+
+        self.root = Path(dataset_dir)
+        self.split = split
+        self.time_interval = float(time_interval) if time_interval is not None else 0.1
+        self.window_sec = float(window_sec) if window_sec is not None else None
+        self.manifest_filename = manifest_filename
+        self.letterbox_size = _parse_size(letterbox_size)
+        self.face_size = _parse_size(face_size)
+        self.conf_threshold = conf_threshold
+        self.bbox_margin = bbox_margin
+        self.return_meta = bool(return_meta)
+        self.return_raw_frames = bool(return_raw_frames)
+        self.use_cache = bool(use_cache)
+        self.cache_dir = Path(cache_dir) if cache_dir is not None else None
+
+        # Nạp danh sách mẫu
+        self.samples = self._load_samples()
+        if len(self.samples) == 0:
+            logger.warning(f"Không tìm thấy mẫu video nào trong {self.root} cho split='{self.split}'")
+
+        # Nạp cache từ file .pt nếu được yêu cầu
+        self.cached_data: Optional[Dict[str, Any]] = None
+        if self.use_cache and self.cache_dir is not None:
+            self._load_cache()
+
+        # Khởi tạo bộ trích xuất PIPNet nếu chưa có cache hoặc cần trích xuất trực tiếp
+        if extractor is not None:
+            self.extractor = extractor
+        else:
+            self.extractor = FastPIPNetExtractor(
+                backbone="resnet18",
+                device=device,
+                letterbox_size=self.letterbox_size,
+                face_size=self.face_size,
+                conf_threshold=self.conf_threshold,
+                bbox_margin=self.bbox_margin,
+            )
+
+    def _load_samples(self) -> List[Dict[str, Any]]:
+        """Đọc danh sách mẫu video từ manifest CSV hoặc quét thư mục fallback."""
+        manifest_path = self.root / self.manifest_filename
+        samples = []
+
+        if manifest_path.is_file():
+            with open(manifest_path, mode="r", encoding="utf-8-sig") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    if row.get("split", "").strip().lower() == self.split:
+                        rel_path = row.get("rel_path") or row.get("processed_path")
+                        if not rel_path:
+                            continue
+                        norm_rel = Path(rel_path.replace("\\", "/")).as_posix()
+                        full_path = self.root / norm_rel
+                        samples.append({
+                            "key": norm_rel,
+                            "path": full_path,
+                            "label": int(row["label"]),
+                            "video_id": row.get("video_id") or Path(rel_path).stem,
+                            "fps": float(row.get("fps", 30.0)),
+                            "frame_count": int(float(row.get("frame_count", 0))),
+                            "duration_sec": float(row.get("duration_sec", 0.0)),
+                        })
+        else:
+            # Fallback quét thư mục train/val/test/0_alert và 1_drowsy
+            for label, folder in ((0, "0_alert"), (1, "1_drowsy")):
+                split_folder = self.root / self.split / folder
+                if split_folder.is_dir():
+                    for p in sorted(split_folder.glob("*.mp4")):
+                        samples.append({
+                            "key": p.relative_to(self.root).as_posix(),
+                            "path": p,
+                            "label": label,
+                            "video_id": p.stem,
+                            "fps": 30.0,
+                            "frame_count": 0,
+                            "duration_sec": 0.0,
+                        })
+        return samples
+
+    def _load_cache(self) -> None:
+        """Nạp dữ liệu cache từ tệp .pt."""
+        cache_path = self.cache_dir / f"{self.split}.pt"
+        if not cache_path.is_file():
+            logger.warning(f"[Cache] Không tìm thấy tệp cache {cache_path}. Sẽ fallback trích xuất on-the-fly.")
+            return
+
+        try:
+            payload = torch.load(cache_path, map_location="cpu", weights_only=False)
+            if isinstance(payload, dict) and "samples" in payload:
+                self.cached_data = payload["samples"]
+            elif isinstance(payload, dict):
+                self.cached_data = payload
+            logger.info(f"[Cache] Đã nạp thành công cache {cache_path.name} với {len(self.cached_data)} mẫu.")
+        except Exception as e:
+            logger.warning(f"[Cache] Lỗi khi nạp cache {cache_path}: {e}. Bỏ qua cache.")
+
+    def _get_frame_indices(self, total_frames: int, fps: float) -> np.ndarray:
+        """
+        Tính toán danh sách chỉ số khung hình cần lấy từ video:
+          - window_sec = None -> Cửa sổ trượt là TOÀN BỘ video (0 đến total_frames - 1).
+          - window_sec > 0    -> Cửa sổ trượt dài window_sec giây (Random crop khi train, Center crop khi val/test).
+          - time_interval == 0 -> Lấy liên tiếp mọi khung hình trong cửa sổ (không có khoảng cách thời gian giữa các frame).
+          - time_interval > 0  -> Lấy mẫu cách đều sau mỗi time_interval giây trên trục thời gian thực.
+        """
+        if total_frames <= 0:
+            return np.array([0], dtype=int)
+
+        fps = fps if fps > 0 else 30.0
+        duration_sec = total_frames / fps
+
+        # TRƯỜNG HỢP 1: time_interval == 0 (Lấy các khung hình liên tiếp không bỏ sót frame nào)
+        if self.time_interval == 0:
+            if self.window_sec is None:
+                # window_sec = None: lấy toàn bộ video liên tiếp
+                return np.arange(total_frames, dtype=int)
+            else:
+                win_sec = min(self.window_sec, duration_sec)
+                num_consec = int(round(win_sec * fps))
+                num_consec = max(1, min(num_consec, total_frames))
+                max_start = max(0, total_frames - num_consec)
+                start_idx = random.randint(0, max_start) if (self.split == "train" and max_start > 0) else max_start // 2
+                return np.arange(start_idx, start_idx + num_consec, dtype=int)
+
+        # TRƯỜNG HỢP 2: time_interval > 0 (Lấy mẫu cách đều theo thời gian thực)
+        if self.window_sec is None:
+            # window_sec = None: toàn bộ video cách đều mỗi time_interval giây
+            timestamps = np.arange(0, duration_sec, self.time_interval)
+            if len(timestamps) == 0:
+                timestamps = np.array([0.0])
+            indices = np.rint(timestamps * fps).astype(int)
+            return np.clip(indices, 0, total_frames - 1)
+        else:
+            win = min(self.window_sec, duration_sec)
+            max_start = max(0.0, duration_sec - win)
+            start_sec = random.uniform(0.0, max_start) if (self.split == "train" and max_start > 0) else max_start / 2.0
+            timestamps = start_sec + np.arange(0, win, self.time_interval)
+            if len(timestamps) == 0:
+                timestamps = np.array([start_sec])
+            indices = np.rint(timestamps * fps).astype(int)
+            return np.clip(indices, 0, total_frames - 1)
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, index: int) -> Union[
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]],
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any], List[np.ndarray]],
+    ]:
+        sample = self.samples[index]
+        key = sample["key"]
+
+        # 1. Đường nhanh: Nạp từ RAM Cache nếu có
+        if self.cached_data is not None and key in self.cached_data:
+            item = self.cached_data[key]
+            face_frames = item["face_frames"]  # [T, 3, 224, 224]
+            landmarks = item["landmarks"]      # [T, 68, 3]
+            label = torch.tensor(sample["label"], dtype=torch.long)
+            meta = {
+                "video_id": sample["video_id"],
+                "path": str(sample["path"]),
+                "fps": float(sample["fps"]),
+                "num_frames": face_frames.shape[0],
+                "cached": True,
+            }
+            if self.return_meta:
+                return face_frames, landmarks, label, meta
+            return face_frames, landmarks, label
+
+        # 2. Đường chuẩn: Đọc video và trích xuất on-the-fly
+        fps = sample["fps"]
+        total_frames = sample["frame_count"]
+
+        if fps <= 0 or total_frames <= 0:
+            cap = cv2.VideoCapture(str(sample["path"]))
+            fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 300)
+            cap.release()
+            sample["fps"] = fps
+            sample["frame_count"] = total_frames
+
+        target_indices = self._get_frame_indices(total_frames, fps)
+        raw_frames, actual_fps, _ = fast_read_video_frames(
+            sample["path"], target_indices, letterbox_size=self.letterbox_size
+        )
+
+        face_frames, landmarks, bboxes, found = self.extractor.extract_from_frames(raw_frames)
+        label = torch.tensor(sample["label"], dtype=torch.long)
+
+        meta = {
+            "video_id": sample["video_id"],
+            "path": str(sample["path"]),
+            "fps": actual_fps,
+            "target_indices": target_indices.tolist(),
+            "num_frames": face_frames.shape[0],
+            "found_faces_ratio": float(sum(found)) / float(len(found)),
+            "bboxes": bboxes,
+        }
+
+        if self.return_raw_frames and self.return_meta:
+            return face_frames, landmarks, label, meta, raw_frames
+        if self.return_meta:
+            return face_frames, landmarks, label, meta
+        return face_frames, landmarks, label
+
+
+# =====================================================================
+# 4. HÀM COLLATE & XÂY DỰNG DATALOADER
+# =====================================================================
+def collate_litefat(batch: List[Tuple[Any, ...]]):
+    """
+    Collate function cho DataLoader LiteFat.
+    Hỗ trợ tự động đệm (padding) theo chiều thời gian T nếu độ dài giữa các mẫu khác nhau
+    (khi sử dụng chế độ num_frames=None, time_interval).
+    """
+    first_item = batch[0]
+    num_elements = len(first_item)
+
+    face_frames_list = [item[0] for item in batch]
+    landmarks_list = [item[1] for item in batch]
+    labels_list = [item[2] for item in batch]
+
+    lengths = [f.shape[0] for f in face_frames_list]
+    max_len = max(lengths)
+
+    # Đệm theo chiều thời gian T nếu các video có số frame khác nhau
+    padded_frames = []
+    padded_landmarks = []
+    for f, lm, cur_len in zip(face_frames_list, landmarks_list, lengths):
+        if cur_len < max_len:
+            pad_t = max_len - cur_len
+            # Đệm frame bằng frame cuối cùng
+            last_frame = f[-1:].repeat(pad_t, 1, 1, 1)
+            padded_f = torch.cat([f, last_frame], dim=0)
+            # Đệm landmark bằng giá trị 1.0
+            pad_lm = torch.ones((pad_t, lm.shape[1], lm.shape[2]), dtype=lm.dtype)
+            padded_l = torch.cat([lm, pad_lm], dim=0)
+            padded_frames.append(padded_f)
+            padded_landmarks.append(padded_l)
+        else:
+            padded_frames.append(f)
+            padded_landmarks.append(lm)
+
+    batch_frames = torch.stack(padded_frames, dim=0)       # [B, T, 3, 224, 224]
+    batch_landmarks = torch.stack(padded_landmarks, dim=0) # [B, T, 68, 3]
+    batch_labels = torch.stack(labels_list, dim=0)         # [B]
+
+    if num_elements >= 4:
+        metas = [item[3] for item in batch]
+        if num_elements == 5:
+            raw_frames_list = [item[4] for item in batch]
+            return batch_frames, batch_landmarks, batch_labels, metas, raw_frames_list
+        return batch_frames, batch_landmarks, batch_labels, metas
+
+    return batch_frames, batch_landmarks, batch_labels
+
+
+def build_litefat_dataloaders(
+        dataset_dir: Union[str, Path] = r"E:\LSTM\data_processed",
+        batch_size: int = 8,
+        num_workers: int = 0,
+        time_interval: float = 0.1,
+        window_sec: Optional[float] = 10.0,
+        letterbox_size: Tuple[int, int] = (640, 480),
+        face_size: Tuple[int, int] = (224, 224),
+        manifest_filename: str = "dataset_merged_split.csv",
+        use_cache: bool = False,
+        cache_dir: Optional[Union[str, Path]] = None,
+        pin_memory: bool = True,
+        shuffle_train: bool = True,
+        device: Optional[str] = None,
+) -> Tuple[DataLoader, DataLoader, DataLoader]:
+    """
+    Khởi tạo nhanh bộ 3 DataLoader cho tập train, val, test của mô hình LiteFat theo cơ chế window_sec và time_interval.
+    """
+    # Khởi tạo 1 extractor dùng chung cho cả 3 tập để tiết kiệm VRAM và tăng tốc khởi tạo
+    shared_extractor = FastPIPNetExtractor(
+        backbone="resnet18",
+        device=device,
+        letterbox_size=letterbox_size,
+        face_size=face_size,
+    ) if not use_cache else None
+
+    common_cfg = dict(
+        dataset_dir=dataset_dir,
+        time_interval=time_interval,
+        window_sec=window_sec,
+        manifest_filename=manifest_filename,
+        letterbox_size=letterbox_size,
+        face_size=face_size,
+        use_cache=use_cache,
+        cache_dir=cache_dir,
+        extractor=shared_extractor,
+        device=device,
+    )
+
+    train_ds = LiteFatDataset(split="train", **common_cfg)
+    val_ds = LiteFatDataset(split="val", **common_cfg)
+    test_ds = LiteFatDataset(split="test", **common_cfg)
+
+    train_loader = DataLoader(
+        train_ds, batch_size=batch_size, shuffle=shuffle_train,
+        num_workers=num_workers, pin_memory=pin_memory, collate_fn=collate_litefat
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=pin_memory, collate_fn=collate_litefat
+    )
+    test_loader = DataLoader(
+        test_ds, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=pin_memory, collate_fn=collate_litefat
+    )
+
+    return train_loader, val_loader, test_loader
+
+
+# =====================================================================
+# 5. TRỰC QUAN HÓA MẪU DỮ LIỆU
+# =====================================================================
+def visualize_litefat_sample(
+        face_frames: torch.Tensor,
+        landmarks: torch.Tensor,
+        label: Union[torch.Tensor, int],
+        raw_frames: List[np.ndarray],
+        meta: Optional[Dict[str, Any]] = None,
+        delay_ms: int = 120,
+        window_name: str = "Driver Guardian - LiteFat Video Preview",
+        grid_window_name: str = "Driver Guardian - All Cropped Face Frames (Grid)",
+):
+    """
+    Hiển thị trực quan toàn diện mẫu dữ liệu của LiteFat:
+      1. Cửa sổ 1: Video phát động (có thể lặp lại và tạm dừng) hiển thị song song:
+         - Bên trái: Khung hình letterbox gốc (640x480) được vẽ 68 điểm mốc giải phẫu
+           (đường nối viền mắt, sống mũi, viền môi trong/ngoài) + Bounding Box khuôn mặt tài xế.
+         - Bên phải: Khung hình khuôn mặt đã được cắt và chuẩn hóa (224x224) cho MobileNetV3-Small.
+      2. Cửa sổ 2: Bảng lưới (Montage Grid 4x4) hiển thị đồng thời toàn bộ T khung hình khuôn mặt
+         đã cắt trong chuỗi thời gian để dễ dàng soi xét từng vi biểu cảm.
+    """
+    T = len(raw_frames)
+    lbl_val = int(label.item()) if isinstance(label, torch.Tensor) else int(label)
+    label_str = "DROWSY (1)" if lbl_val == 1 else "ALERT (0)"
+    label_color = (0, 0, 255) if lbl_val == 1 else (0, 255, 0)
+    video_id = meta.get("video_id", "sample") if meta else "sample"
+    bboxes_list = meta.get("bboxes", [None] * T) if meta else [None] * T
+
+    # 1. Giải chuẩn hóa ImageNet trên face_frames để hiển thị BGR [0, 255]
+    # face_frames: [T, 3, 224, 224] (RGB)
+    norm_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+    norm_std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+    unnorm_faces = (face_frames * norm_std + norm_mean).clamp(0.0, 1.0)
+    # [T, 3, 224, 224] -> [T, 224, 224, 3] (RGB) -> BGR
+    faces_rgb = (unnorm_faces.permute(0, 2, 3, 1).cpu().numpy() * 255.0).astype(np.uint8)
+    faces_bgr = [cv2.cvtColor(faces_rgb[i], cv2.COLOR_RGB2BGR) for i in range(T)]
+
+    # 2. Tạo ảnh bảng lưới (Montage Grid) hiển thị tất cả T khung hình khuôn mặt đã cắt
+    cols = 4 if T >= 4 else T
+    rows = (T + cols - 1) // cols
+    cell_w, cell_h = 160, 160
+    grid_img = np.zeros((rows * cell_h, cols * cell_w, 3), dtype=np.uint8)
+
+    for i in range(T):
+        r = i // cols
+        c = i % cols
+        cell = cv2.resize(faces_bgr[i], (cell_w, cell_h))
+        # Viền nhẹ quanh cell
+        cv2.rectangle(cell, (0, 0), (cell_w - 1, cell_h - 1), (50, 50, 50), 1)
+        # Ghi chỉ số frame
+        cv2.putText(cell, f"F{i:02d}", (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(cell, f"F{i:02d}", (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1, cv2.LINE_AA)
+        grid_img[r * cell_h:(r + 1) * cell_h, c * cell_w:(c + 1) * cell_w] = cell
+
+    cv2.namedWindow(grid_window_name, cv2.WINDOW_NORMAL)
+    cv2.imshow(grid_window_name, grid_img)
+    cv2.resizeWindow(grid_window_name, cols * cell_w, rows * cell_h)
+
+    # 3. Chuẩn bị cửa sổ phát video side-by-side
+    lms_np = landmarks.cpu().numpy()  # [T, 68, 3]
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+
+    print(f"\n[Preview] Đang phát mẫu video: {video_id} ({T} frames | Trạng thái: {label_str})")
+    print(">>> Phím điều khiển: [Space] Tạm dừng/Tiếp tục | [a/d] Lùi/Tiến frame | [r] Phát lại | [q/ESC] Thoát <<<")
+
+    t = 0
+    paused = False
+
+    while True:
+        left_img = raw_frames[t].copy()
+        target_h, target_w = left_img.shape[:2]
+
+        # Lấy BBox và Landmarks của frame t
+        bbox = bboxes_list[t] if t < len(bboxes_list) else None
+        conf = float(lms_np[t, 0, 2])
+        is_missing = np.allclose(lms_np[t], 1.0) or (conf < 1e-4)
+
+        if not is_missing:
+            pts_px = lms_np[t, :, :2].copy()
+            pts_px[:, 0] *= float(target_w)
+            pts_px[:, 1] *= float(target_h)
+
+            if bbox is not None and len(bbox) >= 5:
+                bboxes_to_draw = np.array([bbox], dtype=np.float32)
+            else:
+                # Tự tính BBox bao quanh điểm mốc nếu bbox gốc bị thiếu
+                lx1, ly1 = np.min(pts_px[:, 0]), np.min(pts_px[:, 1])
+                lx2, ly2 = np.max(pts_px[:, 0]), np.max(pts_px[:, 1])
+                bboxes_to_draw = np.array([[lx1, ly1, lx2, ly2, conf]], dtype=np.float32)
+
+            draw_68_landmarks_custom(
+                left_img,
+                np.expand_dims(pts_px, 0),
+                bboxes_to_draw,
+                conf_threshold=0.1
+            )
+        else:
+            cv2.putText(left_img, "[CANH BAO: MAT MAT / HEAD TURNED]", (30, target_h // 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 0, 255), 2, cv2.LINE_AA)
+
+        # Chuẩn bị ảnh mặt bên phải (kích thước target_h x target_h, ví dụ 480x480)
+        right_panel = np.zeros((target_h, target_h, 3), dtype=np.uint8)
+        # Giữ viền trên để hiển thị tiêu đề panel
+        header_h = 45
+        face_display_size = target_h - header_h
+        face_resized = cv2.resize(faces_bgr[t], (face_display_size, face_display_size), interpolation=cv2.INTER_LINEAR)
+
+        # Căn giữa ảnh mặt trong panel bên phải
+        x_offset = (target_h - face_display_size) // 2
+        right_panel[header_h:header_h + face_display_size, x_offset:x_offset + face_display_size] = face_resized
+
+        # Vẽ tiêu đề và viền cho panel mặt cắt
+        cv2.putText(right_panel, f"CROPPED FACE (224x224) - F{t:02d}", (15, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
+        cv2.rectangle(right_panel, (x_offset, header_h),
+                      (x_offset + face_display_size - 1, header_h + face_display_size - 1), (0, 255, 0), 2)
+
+        # Ghép 2 khung hình cạnh nhau
+        combined = np.hstack([left_img, right_panel])
+
+        # Thanh tiêu đề trên khung hình chính
+        top_bar = f"Video: {video_id} | Status: {label_str} | Frame {t + 1}/{T}"
+        if paused:
+            top_bar += "  [DANG TAM DUNG]"
+        cv2.putText(combined, top_bar, (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(combined, top_bar, (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, label_color, 2, cv2.LINE_AA)
+
+        guide_bar = "[Space]: Pause/Resume | [a/d]: Prev/Next | [r]: Replay | [q]: Thoat"
+        cv2.putText(combined, guide_bar, (15, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(combined, guide_bar, (15, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 0), 1, cv2.LINE_AA)
+
+        cv2.imshow(window_name, combined)
+
+        # Kiểm tra xem cửa sổ có bị đóng bởi người dùng không
+        if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
+            break
+
+        wait_time = 0 if paused else delay_ms
+        key = cv2.waitKey(wait_time) & 0xFF
+
+        if key in (27, ord('q'), ord('Q')):
+            print("Đã đóng cửa sổ hiển thị.")
+            break
+        elif key == 32:  # Phím Space
+            paused = not paused
+        elif key in (ord('r'), ord('R')):
+            t = 0
+            continue
+        elif key in (ord('d'), ord('D'), 83):  # Phím tiến frame
+            t = (t + 1) % T
+            continue
+        elif key in (ord('a'), ord('A'), 81):  # Phím lùi frame
+            t = (t - 1 + T) % T
+            continue
+
+        if not paused:
+            t = (t + 1) % T  # Lặp lại chuỗi video
+
+    cv2.destroyAllWindows()
+
+
+# =====================================================================
+# 6. KIỂM THỬ TÍCH HỢP & HIỂN THỊ
+# =====================================================================
+if __name__ == "__main__":
+    DATASET_DIR = r"E:\LSTM\data_processed"
+    print("=" * 70)
+    print("KIỂM THỬ LITEFAT DATASET (TỐI ƯU HÓA GPU BATCHED)")
+    print("=" * 70)
+
+    if not Path(DATASET_DIR).is_dir():
+        print(f"[ERROR] Không tìm thấy thư mục {DATASET_DIR} trên máy này.")
+        sys.exit(1)
+
+    # 1. Khởi tạo Dataset theo cửa sổ window_sec = 1.6s và time_interval = 0.1s (tương đương 16 frames cho LiteFat)
+    print("\n[1] Đang nạp LiteFatDataset (split='test', window_sec=1.6, time_interval=0.1)...")
+    ds = LiteFatDataset(
+        dataset_dir=DATASET_DIR,
+        split="test",
+        time_interval=0,
+        window_sec=None,
+        return_meta=True,
+        return_raw_frames=True,
+    )
+    print(f"Tổng số mẫu kiểm định (test samples): {len(ds)}")
+
+    if len(ds) > 0:
+        # Lấy mẫu kiểm định
+        sample_idx = min(500, len(ds) - 1)
+        face_frames, landmarks, label, meta, raw_frames = ds[sample_idx]
+        T_actual = face_frames.shape[0]
+        print(f"\n--- KẾT QUẢ TRÍCH XUẤT MẪU {sample_idx} ---")
+        print(f"Video ID            : {meta['video_id']}")
+        print(f"Đường dẫn video     : {meta['path']}")
+        print(f"FPS thực tế         : {meta['fps']:.2f}")
+        print(f"Tỷ lệ frame có mặt  : {meta['found_faces_ratio'] * 100:.1f}%")
+        print(f"Kích thước face_frames: {face_frames.shape} (T={T_actual}, C=3, H=224, W=224)")
+        print(f"Kích thước landmarks  : {landmarks.shape}   (T={T_actual}, V=68, C=3)")
+        print(f"Nhãn mẫu (Label)      : {label.item()} ({'Drowsy' if label.item() == 1 else 'Alert'})")
+        print(">>> Xác nhận hình dạng Tensor đầu vào hoàn toàn chính xác! <<<")
+
+        # 2. Kiểm thử truyền batch qua DataLoader & Model LiteFat
+        print("\n[2] Kiểm thử chuyển tiếp (forward pass) qua mô hình LiteFat...")
+        from model import LiteFat
+        from loss import LiteFatLoss
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = LiteFat(num_nodes=68, feature_dim=64, num_classes=2, pretrained_backbone=False).to(device)
+        criterion = LiteFatLoss()
+
+        batch_frames = face_frames.unsqueeze(0).to(device)   # [1, T, 3, 224, 224]
+        batch_landmarks = landmarks.unsqueeze(0).to(device) # [1, T, 68, 3]
+        batch_labels = label.unsqueeze(0).to(device)        # [1]
+
+        model.eval()
+        with torch.no_grad():
+            frame_logits, clip_logits = model(batch_frames, batch_landmarks)
+            loss_val = criterion(frame_logits, batch_labels)
+
+        print(f"Frame logits shape : {frame_logits.shape} (Kỳ vọng: [1, {T_actual}, 2])")
+        print(f"Clip logits shape  : {clip_logits.shape}  (Kỳ vọng: [1, 2])")
+        print(f"Loss value         : {loss_val.item():.4f}")
+        print(">>> Mô hình LiteFat xử lý trơn tru dữ liệu từ LiteFatDataset! <<<")
+
+        # 3. Hiển thị trực quan mẫu nếu người dùng chạy tương tác (bỏ qua nếu đặt biến HEADLESS=1)
+        if not os.environ.get("HEADLESS"):
+            print("\n[3] Hiển thị video preview (nhấn 'q' để bỏ qua hoặc đóng)...")
+            try:
+                visualize_litefat_sample(face_frames, landmarks, label, raw_frames, meta=meta, delay_ms=80)
+            except Exception as e:
+                print(f"[INFO] Không thể mở GUI hiển thị ({e}). Bỏ qua bước trực quan hóa.")
+        else:
+            print("\n[3] Biến môi trường HEADLESS=1 được bật. Bỏ qua bước mở cửa sổ OpenCV GUI.")

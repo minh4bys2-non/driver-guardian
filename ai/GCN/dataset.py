@@ -1,11 +1,13 @@
 # File: dataset.py
 from __future__ import annotations
 import csv
+import json
 import logging
 import math
 import os
 import random
 import sys
+import warnings
 from pathlib import Path
 from typing import List, Tuple, Dict, Any, Optional
 
@@ -479,14 +481,99 @@ class GCNDataset(Dataset):
                         })
         return samples
 
+    @staticmethod
+    def _emit_cache_warning(msg: str) -> None:
+        """Phát cảnh báo đồng thời qua logger.warning và warnings.warn (nếu logger chưa gắn handler)."""
+        logger.warning(msg)
+        if not logger.handlers and not logging.getLogger().handlers:
+            warnings.warn(msg, UserWarning, stacklevel=2)
+
+    def _check_cache_config_mismatches(self, cache_path: Path, payload: Dict[str, Any]) -> None:
+        """
+        Kiểm tra toàn diện sự sai lệch giữa metadata lưu trong file cache (.pt & config.json)
+        với cấu hình hiện tại của GCNDataset / TrainConfig và phát cảnh báo chi tiết.
+        """
+        cache_cfg_data: Dict[str, Any] = {}
+        if self.cache_dir is not None:
+            cfg_json_path = self.cache_dir / "config.json"
+            if cfg_json_path.is_file():
+                try:
+                    with open(cfg_json_path, "r", encoding="utf-8") as f:
+                        loaded = json.load(f)
+                        if isinstance(loaded, dict):
+                            cache_cfg_data = loaded
+                except Exception:
+                    pass
+
+        # 1. Kiểm tra split
+        cache_split = payload.get("split")
+        if cache_split is not None and str(cache_split).strip().lower() != self.split:
+            self._emit_cache_warning(
+                f"[CACHE MISMATCH] {cache_path.name}: split trong cache ('{cache_split}') "
+                f"khác với split đang khởi tạo ('{self.split}')!"
+            )
+
+        # 2. Kiểm tra time_interval
+        raw_ti = payload.get("time_interval", cache_cfg_data.get("time_interval", None))
+        if raw_ti is not None:
+            cache_ti = float(raw_ti)
+            self.cache_time_interval = cache_ti if cache_ti >= 0 else self.time_interval
+            if abs(cache_ti - self.time_interval) > 1e-6:
+                self._emit_cache_warning(
+                    f"[CACHE MISMATCH] {cache_path.name}: time_interval trong cache ({cache_ti}s) "
+                    f"khác cấu hình hiện tại ({self.time_interval}s). "
+                    f"Tự động đồng bộ bước cắt cửa sổ theo time_interval={cache_ti}s của cache."
+                )
+        else:
+            self.cache_time_interval = self.time_interval
+
+        # 3. Kiểm tra letterbox_size
+        raw_lbs = payload.get("letterbox_size", cache_cfg_data.get("letterbox_size", None))
+        if raw_lbs is not None:
+            try:
+                cache_lbs = _parse_letterbox_size(raw_lbs)
+                if cache_lbs != self.letterbox_size:
+                    self._emit_cache_warning(
+                        f"[CACHE MISMATCH] {cache_path.name}: letterbox_size trong cache ({cache_lbs}) "
+                        f"khác cấu hình hiện tại ({self.letterbox_size})."
+                    )
+            except Exception:
+                pass
+
+        # 4. Kiểm tra det_size
+        raw_det = payload.get("det_size", cache_cfg_data.get("det_size", None))
+        if raw_det is not None and isinstance(raw_det, (list, tuple)) and len(raw_det) == 2:
+            cache_det = (int(raw_det[0]), int(raw_det[1]))
+            if cache_det != tuple(self.det_size):
+                self._emit_cache_warning(
+                    f"[CACHE MISMATCH] {cache_path.name}: det_size trong cache ({cache_det}) "
+                    f"khác cấu hình hiện tại ({self.det_size})."
+                )
+
+        # 5. Kiểm tra model_name (InsightFace)
+        cache_model = payload.get("model_name", cache_cfg_data.get("landmark_model_name", None))
+        if cache_model is not None and str(cache_model).strip() != str(self.model_name).strip():
+            self._emit_cache_warning(
+                f"[CACHE MISMATCH] {cache_path.name}: landmark model_name trong cache ('{cache_model}') "
+                f"khác cấu hình hiện tại ('{self.model_name}')."
+            )
+
+        # 6. Kiểm tra manifest_filename từ config.json của cache (nếu có)
+        cache_manifest = cache_cfg_data.get("manifest_filename", None)
+        if cache_manifest is not None and str(cache_manifest).strip() != str(self.manifest_filename).strip():
+            self._emit_cache_warning(
+                f"[CACHE MISMATCH] {cache_path.name}: manifest_filename khi tạo cache ('{cache_manifest}') "
+                f"khác cấu hình hiện tại ('{self.manifest_filename}')."
+            )
+
     def _load_cache(self) -> None:
-        """Nạp chuỗi landmark toàn thời lượng từ {cache_dir}/{split}.pt vào RAM."""
+        """Nạp chuỗi landmark toàn thời lượng từ {cache_dir}/{split}.pt vào RAM và kiểm tra sai lệch cấu hình."""
         if not self.use_cache or self.cache_dir is None:
             return
 
         cache_path = self.cache_dir / f"{self.split}.pt"
         if not cache_path.is_file():
-            logger.warning(
+            self._emit_cache_warning(
                 f"[CACHE] Không tìm thấy {cache_path}. Sẽ fallback trích xuất trực tiếp từ video."
             )
             return
@@ -500,28 +587,41 @@ class GCNDataset(Dataset):
             payload = torch.load(cache_path, map_location="cpu")
 
         if isinstance(payload, dict) and "samples" in payload:
-            cache_ti = float(payload.get("time_interval", self.time_interval))
-            self.cache_time_interval = cache_ti if cache_ti >= 0 else self.time_interval
-            if abs(cache_ti - self.time_interval) > 1e-6:
-                logger.warning(
-                    f"[CACHE] {cache_path.name} được tạo với time_interval={cache_ti}s (cấu hình hiện tại={self.time_interval}s). "
-                    f"Tự động đồng bộ cắt cửa sổ theo time_interval={cache_ti}s của cache."
-                )
+            self._check_cache_config_mismatches(cache_path, payload)
             self.cached = payload["samples"]
         elif isinstance(payload, dict):
             self.cache_time_interval = self.time_interval
             self.cached = payload
         else:
+            self._emit_cache_warning(
+                f"[CACHE] Định dạng dữ liệu trong {cache_path} không hợp lệ ({type(payload)}). Bỏ qua cache."
+            )
             return
 
-        hit = sum(1 for s in self.samples if s["key"] in self.cached)
+        hit = 0
+        label_mismatches = 0
+        for s in self.samples:
+            key = s["key"]
+            if key in self.cached:
+                hit += 1
+                cached_item = self.cached[key]
+                if isinstance(cached_item, dict) and "label" in cached_item:
+                    if int(cached_item["label"]) != int(s["label"]):
+                        label_mismatches += 1
+
         logger.info(
             f"[CACHE] Đã nạp {cache_path.name}: {len(self.cached)} video trong cache | "
             f"khớp {hit}/{len(self.samples)} mẫu của split '{self.split}'."
         )
         if hit < len(self.samples):
-            logger.warning(
-                f"[CACHE] Thiếu {len(self.samples) - hit} mẫu trong cache; các mẫu này sẽ được trích xuất trực tiếp từ video."
+            self._emit_cache_warning(
+                f"[CACHE MISMATCH] Thiếu {len(self.samples) - hit}/{len(self.samples)} mẫu của split '{self.split}' "
+                f"trong {cache_path.name}; các mẫu thiếu sẽ được trích xuất trực tiếp từ video."
+            )
+        if label_mismatches > 0:
+            self._emit_cache_warning(
+                f"[CACHE MISMATCH] Phát hiện {label_mismatches} mẫu trong {cache_path.name} có nhãn 'label' "
+                f"khác với manifest hiện tại ('{self.manifest_filename}')!"
             )
 
     def _slice_temporal_window(self, full_lm: torch.Tensor, fps: float, duration_sec: float) -> torch.Tensor:

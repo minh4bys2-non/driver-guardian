@@ -19,7 +19,8 @@ class MobileNetV3ContextEncoder(nn.Module):
             out_dim: int = 64,
             proj_hidden_dim: int = 192,
             pretrained: bool = True,
-            dropout: float = 0.2
+            dropout: float = 0.2,
+            freeze_backbone: bool = False
     ):
         super().__init__()
         weights = MobileNet_V3_Small_Weights.DEFAULT if pretrained else None
@@ -36,6 +37,49 @@ class MobileNetV3ContextEncoder(nn.Module):
             nn.Dropout(p=dropout),
             nn.Linear(proj_hidden_dim, out_dim)
         )
+
+        if freeze_backbone:
+            self.freeze_backbone(freeze=True)
+
+    def freeze_backbone(self, freeze: bool = True, freeze_projector: bool = False) -> None:
+        """
+        Bật hoặc tắt đóng băng tham số của xương sống MobileNetV3-Small.
+
+        Args:
+            freeze: True để đóng băng (requires_grad = False), False để mở khóa.
+            freeze_projector: True để đóng băng cả tầng chiếu projector (576 -> out_dim).
+                              Mặc định là False (giữ projector khả học để thích nghi không gian đặc trưng).
+        """
+        for param in self.features.parameters():
+            param.requires_grad = not freeze
+        if freeze_projector:
+            for param in self.projector.parameters():
+                param.requires_grad = not freeze
+        elif not freeze:
+            # Khi unfreeze hoàn toàn, mở khóa cả projector
+            for param in self.projector.parameters():
+                param.requires_grad = True
+
+    def unfreeze_backbone(self) -> None:
+        """Mở khóa đóng băng tất cả tham số của MobileNetV3-Small và projector."""
+        self.freeze_backbone(freeze=False, freeze_projector=False)
+
+    @property
+    def is_backbone_frozen(self) -> bool:
+        """Kiểm tra xem các tham số của MobileNetV3-Small (self.features) có đang bị đóng băng hay không."""
+        return not any(p.requires_grad for p in self.features.parameters())
+
+    def train(self, mode: bool = True):
+        """
+        Ghi đè chế độ train: Nếu backbone đang bị đóng băng, giữ các tầng BatchNorm2d
+        của self.features ở chế độ eval() để ngăn chặn trôi running mean và running variance.
+        """
+        super().train(mode)
+        if mode and self.is_backbone_frozen:
+            for m in self.features.modules():
+                if isinstance(m, (nn.BatchNorm2d, nn.SyncBatchNorm)):
+                    m.eval()
+        return self
 
     def forward(self, frame_tensor: torch.Tensor) -> torch.Tensor:
         """
@@ -320,7 +364,8 @@ class LiteFat(nn.Module):
             layers_per_block: int = 2,
             kernel_size: int = 2,
             pretrained_backbone: bool = True,
-            dropout: float = 0.2
+            dropout: float = 0.2,
+            freeze_backbone: bool = False
     ):
         super().__init__()
         self.num_nodes = num_nodes
@@ -332,7 +377,8 @@ class LiteFat(nn.Module):
             out_dim=feature_dim,
             proj_hidden_dim=mobilenet_proj_hidden,
             pretrained=pretrained_backbone,
-            dropout=dropout
+            dropout=dropout,
+            freeze_backbone=freeze_backbone
         )
 
         # Thành phần 2: Dung hợp đa phương thức X = (C * w) * d^T
@@ -445,6 +491,42 @@ class LiteFat(nn.Module):
         probs = F.softmax(clip_logits, dim=-1)
         return probs, d_updated
 
+    def freeze_backbone(self, freeze: bool = True, freeze_projector: bool = False) -> None:
+        """
+        Ủy quyền bật/tắt đóng băng tham số của xương sống MobileNetV3-Small.
+
+        Args:
+            freeze: True để đóng băng (requires_grad = False), False để mở khóa.
+            freeze_projector: True để đóng băng cả tầng chiếu projector. Mặc định là False.
+        """
+        self.context_encoder.freeze_backbone(freeze=freeze, freeze_projector=freeze_projector)
+
+    def unfreeze_backbone(self) -> None:
+        """Mở khóa đóng băng tất cả tham số của MobileNetV3-Small và projector."""
+        self.context_encoder.unfreeze_backbone()
+
+    @property
+    def is_backbone_frozen(self) -> bool:
+        """Kiểm tra trạng thái đóng băng của backbone MobileNetV3-Small."""
+        return self.context_encoder.is_backbone_frozen
+
+    def get_trainable_params_count(self) -> dict:
+        """
+        Thống kê chi tiết số lượng tham số khả học (trainable) và tổng tham số của mô hình.
+        """
+        total = sum(p.numel() for p in self.parameters())
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        backbone_total = sum(p.numel() for p in self.context_encoder.features.parameters())
+        backbone_trainable = sum(p.numel() for p in self.context_encoder.features.parameters() if p.requires_grad)
+        return {
+            "total_params": total,
+            "trainable_params": trainable,
+            "frozen_params": total - trainable,
+            "backbone_total": backbone_total,
+            "backbone_trainable": backbone_trainable,
+            "is_backbone_frozen": self.is_backbone_frozen
+        }
+
 
 # =====================================================================
 # 8. KIỂM TRA SỐ THAM SỐ, LUỒNG DỮ LIỆU & VÒNG LẶP HUẤN LUYỆN (Section IV)
@@ -465,20 +547,37 @@ if __name__ == "__main__":
         pretrained_backbone=False
     ).to(device)
 
-    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Tổng số tham số của LiteFat: {total_params:,} (~{total_params / 1e6:.2f}M)")
+    # 1. Kiem tra ban dau khi chua freeze
+    stats_init = model.get_trainable_params_count()
+    print("=== 1. TRANG THAI BAN DAU (CHUA DONG BANG) ===")
+    print(f"Tong tham so: {stats_init['total_params']:,}")
+    print(f"Tham so Trainable: {stats_init['trainable_params']:,} | Frozen: {stats_init['frozen_params']:,}")
+    print(f"MobileNetV3 backbone trainable: {stats_init['backbone_trainable']:,} / {stats_init['backbone_total']:,}")
+    print(f"Trang thai is_backbone_frozen: {model.is_backbone_frozen}")
+    assert not model.is_backbone_frozen, "Backbone phai o trang thai unfrozen ban dau!"
 
-    # Giả lập 1 batch gồm B=2 đoạn video, mỗi đoạn T=16 khung hình (Section IV-A)
+    # 2. Bat dong bang backbone (freeze_backbone=True)
+    print("\n=== 2. KICH HOAT DONG BANG (FREEZE BACKBONE) ===")
+    model.freeze_backbone(freeze=True, freeze_projector=False)
+    stats_frozen = model.get_trainable_params_count()
+    print(f"Tham so Trainable: {stats_frozen['trainable_params']:,} | Frozen: {stats_frozen['frozen_params']:,}")
+    print(f"MobileNetV3 backbone trainable: {stats_frozen['backbone_trainable']:,} / {stats_frozen['backbone_total']:,}")
+    print(f"Trang thai is_backbone_frozen: {model.is_backbone_frozen}")
+    assert model.is_backbone_frozen, "Backbone phai o trang thai frozen sau khi freeze_backbone(True)!"
+    assert stats_frozen['backbone_trainable'] == 0, "Backbone trainable params phai bang 0!"
+
+    # Gia lap 1 batch gom B=2 doan video, moi doan T=16 khung hinh (Section IV-A)
     B, T, N = 2, 16, 68
     dummy_frames = torch.randn(B, T, 3, 224, 224, device=device)
     dummy_landmarks = torch.rand(B, T, N, 3, device=device)
     dummy_labels = torch.tensor([0, 1], dtype=torch.long, device=device)
 
-    # Thiết lập bộ tối ưu hóa đúng theo Section IV-A: Adam, lr = 1e-4
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    # Thiet lap bo toi uu hoa chi nhan cac tham so requires_grad
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.Adam(trainable_params, lr=1e-4)
     criterion = LiteFatLoss()
 
-    # 1 bước huấn luyện (Forward + Backward)
+    # 1 buoc huan luyen khi backbone bi dong bang
     model.train()
     optimizer.zero_grad()
     frame_logits, clip_logits = model(dummy_frames, dummy_landmarks)
@@ -486,17 +585,32 @@ if __name__ == "__main__":
     loss.backward()
     optimizer.step()
 
-    print(f"Kích thước frame_logits: {frame_logits.shape} | clip_logits: {clip_logits.shape}")
-    print(f"Giá trị Loss (Eq. 6): {loss.item():.4f}")
+    # Xac nhan khong co gradient nao tich luy tren backbone
+    no_grad_on_backbone = all(p.grad is None for p in model.context_encoder.features.parameters())
+    print(f"Gia tri Loss khi freeze: {loss.item():.4f}")
+    print(f"Xac nhan khong co gradient tren MobileNetV3 features: {no_grad_on_backbone}")
+    assert no_grad_on_backbone, "Cac tham so cua backbone khong duoc phep co gradient khi dang bi dong bang!"
 
-    # Kiểm thử chế độ Bất đối xứng (Asymmetric Step) cho Snapdragon 680
+    # 3. Mo khoa dong bang (Unfreeze)
+    print("\n=== 3. MO KHOA DONG BANG (UNFREEZE BACKBONE) ===")
+    model.unfreeze_backbone()
+    stats_unfrozen = model.get_trainable_params_count()
+    print(f"Tham so Trainable: {stats_unfrozen['trainable_params']:,} | Frozen: {stats_unfrozen['frozen_params']:,}")
+    print(f"MobileNetV3 backbone trainable: {stats_unfrozen['backbone_trainable']:,} / {stats_unfrozen['backbone_total']:,}")
+    print(f"Trang thai is_backbone_frozen: {model.is_backbone_frozen}")
+    assert not model.is_backbone_frozen, "Backbone phai o trang thai unfrozen sau khi unfreeze_backbone()!"
+    assert stats_unfrozen['trainable_params'] == stats_init['total_params'], "So tham so trainable phai phuc hoi 100%!"
+
+    # 4. Kiem thu che do Bat doi xung (Asymmetric Step) cho Snapdragon 680
+    print("\n=== 4. KIEM THU ASYMMETRIC INFERENCE ===")
     model.eval()
     d_cache = torch.zeros(1, T, 64, device=device)
     lm_window = torch.rand(1, T, N, 3, device=device)
     single_frame = torch.randn(1, 3, 224, 224, device=device)
 
-    # Frame 0: Cập nhật cả MobileNetV3 và Đồ thị STGL
+    # Frame 0: Cap nhat ca MobileNetV3 va Do thi STGL
     probs_f0, d_cache = model.forward_asymmetric_step(lm_window, d_cache, current_frame=single_frame)
-    # Frame 1: Bỏ qua MobileNetV3 (current_frame=None), chỉ chạy Đồ thị STGL
+    # Frame 1: Bo qua MobileNetV3 (current_frame=None), chi chay Do thi STGL
     probs_f1, d_cache = model.forward_asymmetric_step(lm_window, d_cache, current_frame=None)
-    print(f"Xác suất dự đoán thời gian thực (Frame 1 - Fast Path): {probs_f1.cpu().numpy()}")
+    print(f"Xac suat du doan thoi gian thuc (Frame 1 - Fast Path): {probs_f1.cpu().numpy()}")
+    print("\n>>> TAT CA CAC BUOC KIEM TRA THANH CONG VUOT QUA! <<<")

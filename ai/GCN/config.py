@@ -173,7 +173,7 @@ class TrainConfig:
             json.dump(data, f, indent=4, ensure_ascii=False)
 
     @classmethod
-    def load(cls, path: str | Path) -> TrainConfig:
+    def load(cls, path: str | Path) -> "TrainConfig":
         """Nạp cấu hình từ tệp JSON hoặc YAML (tương thích ngược với các phiên bản cũ/mới)."""
         p = Path(path)
         if not p.is_file():

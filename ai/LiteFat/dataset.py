@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 # Monkey patch cho scipy >= 1.14 để tương thích với torchlm metrics
 import scipy.integrate
+
 if not hasattr(scipy.integrate, "simps"):
     scipy.integrate.simps = scipy.integrate.simpson
 
@@ -172,7 +173,7 @@ class FastPIPNetExtractor:
             device if device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
         )
         self.letterbox_size = _parse_size(letterbox_size)  # (target_w, target_h)
-        self.face_size = _parse_size(face_size)            # (crop_w, crop_h)
+        self.face_size = _parse_size(face_size)  # (crop_w, crop_h)
         self.conf_threshold = float(conf_threshold)
         self.nms_threshold = float(nms_threshold)
         self.bbox_margin = float(bbox_margin)
@@ -181,7 +182,8 @@ class FastPIPNetExtractor:
 
         # Khởi tạo mô hình thông qua runtime của torchlm
         from torchlm.runtime._wrappers import RuntimeWrapper
-        if getattr(RuntimeWrapper, "face_base", None) is None or getattr(RuntimeWrapper, "landmarks_base", None) is None:
+        if getattr(RuntimeWrapper, "face_base", None) is None or getattr(RuntimeWrapper, "landmarks_base",
+                                                                         None) is None:
             init_pipnet_68_gpu(backbone=backbone)
 
         self.face_base = RuntimeWrapper.face_base
@@ -442,7 +444,8 @@ class FastPIPNetExtractor:
             chunk_lms = torch.stack([final_x, final_y], dim=-1).cpu().numpy()  # [cur_B, 68, 2] in [0, 1]
             batched_lms_list.append(chunk_lms)
 
-        batched_lms = np.concatenate(batched_lms_list, axis=0) if batched_lms_list else np.empty((0, 68, 2), dtype=np.float32)
+        batched_lms = np.concatenate(batched_lms_list, axis=0) if batched_lms_list else np.empty((0, 68, 2),
+                                                                                                 dtype=np.float32)
 
         # Ánh xạ ngược tọa độ từ crop về khung hình letterbox
         for i, idx in enumerate(valid_indices):
@@ -522,7 +525,8 @@ class FastPIPNetExtractor:
         if not valid_indices:
             side = min(target_w, target_h) * 0.8
             cx, cy = target_w / 2.0, target_h / 2.0
-            default_box = np.array([cx - side / 2.0, cy - side / 2.0, cx + side / 2.0, cy + side / 2.0], dtype=np.float32)
+            default_box = np.array([cx - side / 2.0, cy - side / 2.0, cx + side / 2.0, cy + side / 2.0],
+                                   dtype=np.float32)
             for t in range(T):
                 raw_boxes[t] = default_box
         else:
@@ -912,7 +916,8 @@ class LiteFatDataset(Dataset):
                 num_consec = int(round(win_sec * fps))
                 num_consec = max(1, min(num_consec, total_frames))
                 max_start = max(0, total_frames - num_consec)
-                start_idx = random.randint(0, max_start) if (self.split == "train" and max_start > 0) else max_start // 2
+                start_idx = random.randint(0, max_start) if (
+                            self.split == "train" and max_start > 0) else max_start // 2
                 return np.arange(start_idx, start_idx + num_consec, dtype=int)
 
         # TRƯỜNG HỢP 2: time_interval > 0 (Lấy mẫu cách đều theo thời gian thực)
@@ -963,7 +968,8 @@ class LiteFatDataset(Dataset):
                 num_consec = int(round(win_sec / cache_dt))
                 num_consec = max(1, min(num_consec, T_cache))
                 max_start = max(0, T_cache - num_consec)
-                start_idx = random.randint(0, max_start) if (self.split == "train" and max_start > 0) else max_start // 2
+                start_idx = random.randint(0, max_start) if (
+                            self.split == "train" and max_start > 0) else max_start // 2
                 return np.arange(start_idx, start_idx + num_consec, dtype=int)
 
         # TRƯỜNG HỢP 2: time_interval > 0 (Lấy mẫu cách đều theo thời gian)
@@ -1190,8 +1196,8 @@ def collate_litefat(batch: List[Tuple[Any, ...]]):
             padded_landmarks.append(lm)
 
     batch_frames = torch.stack(padded_frames, dim=0) if has_face_frames else None  # [B, T, 3, 224, 224] hoặc None
-    batch_landmarks = torch.stack(padded_landmarks, dim=0)                         # [B, T, 68, 3]
-    batch_labels = torch.stack(labels_list, dim=0)                                 # [B]
+    batch_landmarks = torch.stack(padded_landmarks, dim=0)  # [B, T, 68, 3]
+    batch_labels = torch.stack(labels_list, dim=0)  # [B]
 
     if num_elements >= 4:
         metas = [item[3] for item in batch]
@@ -1399,7 +1405,8 @@ def visualize_litefat_sample(
             right_panel = np.zeros((target_h, target_h, 3), dtype=np.uint8)
             header_h = 45
             face_display_size = target_h - header_h
-            face_resized = cv2.resize(faces_bgr[t], (face_display_size, face_display_size), interpolation=cv2.INTER_LINEAR)
+            face_resized = cv2.resize(faces_bgr[t], (face_display_size, face_display_size),
+                                      interpolation=cv2.INTER_LINEAR)
 
             x_offset = (target_h - face_display_size) // 2
             right_panel[header_h:header_h + face_display_size, x_offset:x_offset + face_display_size] = face_resized
@@ -1469,7 +1476,9 @@ if __name__ == "__main__":
     print("\n[1] Đang nạp LiteFatDataset (split='test', window_sec=1.6, time_interval=0.1)...")
     ds = LiteFatDataset(
         dataset_dir=DATASET_DIR,
-        split="test",
+        use_cache=True,
+        cache_dir=r"E:\LSTM\LiteFat\cache_pt",
+        split="val",
         time_interval=0.05,
         window_sec=None,
         return_meta=True,
@@ -1501,9 +1510,9 @@ if __name__ == "__main__":
         model = LiteFat(num_nodes=68, feature_dim=64, num_classes=2, pretrained_backbone=False).to(device)
         criterion = LiteFatLoss()
 
-        batch_frames = face_frames.unsqueeze(0).to(device)   # [1, T, 3, 224, 224]
-        batch_landmarks = landmarks.unsqueeze(0).to(device) # [1, T, 68, 3]
-        batch_labels = label.unsqueeze(0).to(device)        # [1]
+        batch_frames = face_frames.unsqueeze(0).to(device)  # [1, T, 3, 224, 224]
+        batch_landmarks = landmarks.unsqueeze(0).to(device)  # [1, T, 68, 3]
+        batch_labels = label.unsqueeze(0).to(device)  # [1]
 
         model.eval()
         with torch.no_grad():

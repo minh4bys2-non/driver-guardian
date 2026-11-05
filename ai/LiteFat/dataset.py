@@ -93,6 +93,49 @@ def compute_iou(box_a: np.ndarray, box_b: np.ndarray) -> float:
     return float(inter / union)
 
 
+def crop_faces_from_boxes(
+        frames: List[np.ndarray],
+        crop_boxes: Union[np.ndarray, torch.Tensor],
+        face_size: Tuple[int, int] = (224, 224),
+) -> torch.Tensor:
+    """
+    Cắt vùng khuôn mặt chuẩn hóa 224x224 cho nhánh MobileNetV3-Small từ crop_boxes:
+      - Nhận vào danh sách frames BGR (đã qua letterbox) và crop_boxes [T, 4] dạng [x1, y1, x2, y2].
+      - Resize về face_size (w, h), chuyển sang RGB [0, 1] và chuẩn hóa ImageNet mean/std.
+      - Trả về torch.Tensor [T, 3, crop_h, crop_w]. Hoàn toàn độc lập với GPU PIPNet extractor.
+    """
+    T = len(frames)
+    crop_w, crop_h = _parse_size(face_size)
+    if T == 0:
+        return torch.empty((0, 3, crop_h, crop_w), dtype=torch.float32)
+
+    if isinstance(crop_boxes, torch.Tensor):
+        crop_boxes = crop_boxes.detach().cpu().numpy()
+    crop_boxes = np.asarray(crop_boxes, dtype=np.int32)
+
+    face_crops = np.zeros((T, crop_h, crop_w, 3), dtype=np.uint8)
+
+    for t in range(T):
+        if t < len(crop_boxes):
+            x1, y1, x2, y2 = crop_boxes[t]
+        else:
+            x1, y1, x2, y2 = 0, 0, frames[t].shape[1], frames[t].shape[0]
+
+        crop = frames[t][y1:y2, x1:x2, :]  # BGR
+        if crop.size == 0 or crop.shape[0] < 2 or crop.shape[1] < 2:
+            crop = frames[t]
+
+        resized = cv2.resize(crop, (crop_w, crop_h), interpolation=cv2.INTER_LINEAR)
+        face_crops[t] = resized[:, :, ::-1]  # Chuyển BGR sang RGB
+
+    # Chuẩn hóa ImageNet vector hóa cho toàn bộ chuỗi T ảnh
+    face_tensor = torch.from_numpy(face_crops).permute(0, 3, 1, 2).float() / 255.0
+    norm_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+    norm_std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+    face_tensor = (face_tensor - norm_mean) / norm_std
+    return face_tensor
+
+
 # =====================================================================
 # 1. BỘ TRÍCH XUẤT PIPNET TỐI ƯU HÓA CAO CẤP (FAST PIPNET EXTRACTOR)
 # =====================================================================
@@ -256,6 +299,7 @@ class FastPIPNetExtractor:
         found: List[bool] = [False] * T
 
         prev_box: Optional[np.ndarray] = None
+        prev_box_area = 1.0
 
         for t in range(T):
             dets = all_dets[t]
@@ -419,25 +463,26 @@ class FastPIPNetExtractor:
 
         return landmarks_norm, landmarks_px
 
-    def _crop_faces_for_litefat(
+    def compute_face_crop_boxes(
             self,
-            frames: List[np.ndarray],
             chosen_bboxes: List[Optional[np.ndarray]],
             landmarks_px: np.ndarray,
             found: List[bool],
-    ) -> torch.Tensor:
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Cắt vùng khuôn mặt chuẩn hóa 224x224 cho nhánh MobileNetV3-Small:
-          - Kết hợp BBox và bao đóng 68 điểm mốc (Landmark-Guided BBox Refinement).
-          - Mở rộng lề margin 15% đối xứng, giữ tỷ lệ khung hình vuông (1:1).
-          - Nội suy tuyến tính cho các frame mất mặt và làm mượt thời gian (EMA).
-          - Trả về Tensor FloatTensor [T, 3, 224, 224] chuẩn hóa ImageNet.
-        """
-        T = len(frames)
-        target_w, target_h = self.letterbox_size
-        crop_w, crop_h = self.face_size
+        Tính toán tọa độ điểm cắt khuôn mặt vuông cho từng khung hình:
+          1. Kết hợp BBox và cực trị 68 điểm mốc (Landmark-Guided BBox Refinement).
+          2. Mở rộng lề margin 15% đối xứng, giữ tỷ lệ khung hình vuông (1:1).
+          3. Nội suy tuyến tính (Linear Interpolation) cho các frame mất mặt.
+          4. Làm mượt thời gian bằng bộ lọc EMA (Exponential Moving Average).
+          5. Bounding và ép kiểu nguyên [x1, y1, x2, y2] trong khung hình letterbox.
 
-        # 1. Tính toán hộp bao khuôn mặt thô cho từng khung hình
+        Returns:
+          - crop_boxes: np.ndarray [T, 4] dtype=np.int32: [x1, y1, x2, y2]
+          - smoothed_boxes: np.ndarray [T, 4] dtype=np.float32: tọa độ float sau EMA
+        """
+        T = len(chosen_bboxes)
+        target_w, target_h = self.letterbox_size
         raw_boxes = np.zeros((T, 4), dtype=np.float32)
 
         for t in range(T):
@@ -472,25 +517,21 @@ class FastPIPNetExtractor:
                     center_y + side / 2.0
                 ]
 
-        # 2. Nội suy tuyến tính (Linear Interpolation) cho các frame mất mặt
+        # 2. Nội suy tuyến tính cho các frame mất mặt
         valid_indices = [t for t in range(T) if found[t]]
         if not valid_indices:
-            # Fallback toàn video mất mặt: lấy chính giữa khung hình
             side = min(target_w, target_h) * 0.8
             cx, cy = target_w / 2.0, target_h / 2.0
             default_box = np.array([cx - side / 2.0, cy - side / 2.0, cx + side / 2.0, cy + side / 2.0], dtype=np.float32)
             for t in range(T):
                 raw_boxes[t] = default_box
         else:
-            # Điền đầu video
             first_idx = valid_indices[0]
             for t in range(first_idx):
                 raw_boxes[t] = raw_boxes[first_idx]
-            # Điền cuối video
             last_idx = valid_indices[-1]
             for t in range(last_idx + 1, T):
                 raw_boxes[t] = raw_boxes[last_idx]
-            # Nội suy giữa các mốc
             for i in range(len(valid_indices) - 1):
                 idx_a = valid_indices[i]
                 idx_b = valid_indices[i + 1]
@@ -501,54 +542,57 @@ class FastPIPNetExtractor:
                         alpha = float(t - idx_a) / float(idx_b - idx_a)
                         raw_boxes[t] = (1.0 - alpha) * box_a + alpha * box_b
 
-        # 3. Làm mượt thời gian bằng bộ lọc EMA (Exponential Moving Average)
+        # 3. Làm mượt thời gian bằng bộ lọc EMA
         smoothed_boxes = np.zeros_like(raw_boxes)
         smoothed_boxes[0] = raw_boxes[0]
         alpha = self.box_smooth_alpha
         for t in range(1, T):
             smoothed_boxes[t] = alpha * raw_boxes[t] + (1.0 - alpha) * smoothed_boxes[t - 1]
 
-        # 4. Cắt vùng mặt, resize về 224x224 và chuẩn hóa ImageNet
-        face_crops = np.zeros((T, crop_h, crop_w, 3), dtype=np.uint8)
+        # 4. Giới hạn tọa độ trong kích thước khung letterbox và ép kiểu int32
+        crop_boxes = np.zeros((T, 4), dtype=np.int32)
         for t in range(T):
             bx1, by1, bx2, by2 = smoothed_boxes[t]
             x1 = max(0, min(target_w - 2, int(round(bx1))))
             y1 = max(0, min(target_h - 2, int(round(by1))))
             x2 = max(x1 + 1, min(target_w, int(round(bx2))))
             y2 = max(y1 + 1, min(target_h, int(round(by2))))
+            crop_boxes[t] = [x1, y1, x2, y2]
 
-            crop = frames[t][y1:y2, x1:x2, :]  # BGR
-            if crop.size == 0 or crop.shape[0] < 2 or crop.shape[1] < 2:
-                crop = frames[t]
+        return crop_boxes, smoothed_boxes
 
-            resized = cv2.resize(crop, (crop_w, crop_h), interpolation=cv2.INTER_LINEAR)
-            face_crops[t] = resized[:, :, ::-1]  # Chuyển sang RGB
-
-        # Chuẩn hóa vector hóa cho cả chuỗi T ảnh
-        # [T, 224, 224, 3] -> [T, 3, 224, 224] float32 trong [0, 1]
-        face_tensor = torch.from_numpy(face_crops).permute(0, 3, 1, 2).float() / 255.0
-        norm_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
-        norm_std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
-        face_tensor = (face_tensor - norm_mean) / norm_std
-
-        return face_tensor
+    def _crop_faces_for_litefat(
+            self,
+            frames: List[np.ndarray],
+            crop_boxes: np.ndarray,
+    ) -> torch.Tensor:
+        """
+        Cắt vùng khuôn mặt chuẩn hóa 224x224 cho nhánh MobileNetV3-Small từ crop_boxes.
+        """
+        return crop_faces_from_boxes(frames, crop_boxes, face_size=self.face_size)
 
     def extract_from_frames(
             self,
-            frames: List[np.ndarray]
-    ) -> Tuple[torch.Tensor, torch.Tensor, List[Optional[np.ndarray]], List[bool]]:
+            frames: List[np.ndarray],
+            crop_faces: bool = True,
+            return_crop_boxes: bool = False,
+    ) -> Union[
+        Tuple[Optional[torch.Tensor], torch.Tensor, List[Optional[np.ndarray]], List[bool]],
+        Tuple[Optional[torch.Tensor], torch.Tensor, List[Optional[np.ndarray]], List[bool], np.ndarray],
+    ]:
         """
         Pipeline trích xuất hoàn chỉnh từ chuỗi khung hình đã qua letterbox:
           - Phát hiện mặt batched GPU.
           - Chọn khuôn mặt tài xế ổn định.
           - Trích xuất 68 điểm mốc batched GPU.
-          - Cắt và chuẩn hóa khung hình mặt cho LiteFat.
+          - Tính tọa độ điểm cắt khung mặt và (tùy chọn) cắt/chuẩn hóa khung hình mặt.
 
         Returns:
-          - face_frames: Tensor [T, 3, 224, 224]
+          - face_frames: Tensor [T, 3, 224, 224] (hoặc None nếu crop_faces=False)
           - landmarks:   Tensor [T, 68, 3] (X, Y, Conf)
           - bboxes:      Danh sách BBox chọn lọc của từng frame
           - found:       Danh sách boolean đánh dấu phát hiện được mặt
+          - crop_boxes:  (kèm theo nếu return_crop_boxes=True) mảng np.ndarray [T, 4] dạng [x1, y1, x2, y2]
         """
         target_w, target_h = self.letterbox_size
         # Đảm bảo mọi frame đầu vào đúng kích thước letterbox
@@ -570,13 +614,18 @@ class FastPIPNetExtractor:
             uniform_frames, chosen_bboxes, found
         )
 
-        # 4. Cắt khung hình khuôn mặt cho MobileNetV3-Small
-        face_frames_tensor = self._crop_faces_for_litefat(
-            uniform_frames, chosen_bboxes, landmarks_px, found
-        )
+        # 4. Tính toán tọa độ điểm cắt khuôn mặt
+        crop_boxes, _ = self.compute_face_crop_boxes(chosen_bboxes, landmarks_px, found)
+
+        # 5. Cắt khung hình khuôn mặt nếu cần
+        face_frames_tensor = None
+        if crop_faces:
+            face_frames_tensor = self._crop_faces_for_litefat(uniform_frames, crop_boxes)
 
         landmarks_tensor = torch.from_numpy(landmarks_norm).float()
 
+        if return_crop_boxes:
+            return face_frames_tensor, landmarks_tensor, chosen_bboxes, found, crop_boxes
         return face_frames_tensor, landmarks_tensor, chosen_bboxes, found
 
 
@@ -673,6 +722,10 @@ class LiteFatDataset(Dataset):
             cache_dir: Optional[Union[str, Path]] = None,
             extractor: Optional[FastPIPNetExtractor] = None,
             device: Optional[str] = None,
+            extract_crops_only: bool = False,
+            pipnet_backbone: str = "resnet18",
+            nms_threshold: float = 0.3,
+            box_smooth_alpha: float = 0.7,
     ):
         split = split.lower().strip()
         if split not in ("train", "val", "test"):
@@ -691,34 +744,65 @@ class LiteFatDataset(Dataset):
         self.letterbox_size = _parse_size(letterbox_size)
         self.face_size = _parse_size(face_size)
         self.conf_threshold = conf_threshold
+        self.nms_threshold = nms_threshold
         self.bbox_margin = bbox_margin
+        self.box_smooth_alpha = box_smooth_alpha
+        self.pipnet_backbone = pipnet_backbone
+        self.device = device
         self.return_meta = bool(return_meta)
         self.return_raw_frames = bool(return_raw_frames)
         self.use_cache = bool(use_cache)
         self.cache_dir = Path(cache_dir) if cache_dir is not None else None
+        self.extract_crops_only = bool(extract_crops_only)
 
-        # Nạp danh sách mẫu
-        self.samples = self._load_samples()
-        if len(self.samples) == 0:
-            logger.warning(f"Không tìm thấy mẫu video nào trong {self.root} cho split='{self.split}'")
+        self.cache_meta: Dict[str, Any] = {}
+        self.cached_data: Optional[Dict[str, Any]] = None
 
         # Nạp cache từ file .pt nếu được yêu cầu
-        self.cached_data: Optional[Dict[str, Any]] = None
         if self.use_cache and self.cache_dir is not None:
             self._load_cache()
 
-        # Khởi tạo bộ trích xuất PIPNet nếu chưa có cache hoặc cần trích xuất trực tiếp
-        if extractor is not None:
-            self.extractor = extractor
-        else:
+        # Nạp danh sách mẫu (ưu tiên manifest CSV hoặc quét thư mục, nếu rỗng thì lấy từ cache)
+        self.samples = self._load_samples()
+        if len(self.samples) == 0:
+            if self.cached_data is not None and len(self.cached_data) > 0:
+                logger.info(f"[Cache] Tự động khởi tạo {len(self.cached_data)} mẫu từ file cache .pt.")
+                for k, it in self.cached_data.items():
+                    m = it.get("meta", {})
+                    rel_p = m.get("key", k)
+                    self.samples.append({
+                        "key": rel_p,
+                        "path": self.root / rel_p,
+                        "label": int(it.get("label", m.get("label", 0))),
+                        "video_id": m.get("video_id", Path(rel_p).stem),
+                        "fps": float(m.get("fps", 30.0)),
+                        "frame_count": int(float(m.get("total_frames", 0))),
+                        "duration_sec": float(m.get("duration_sec", 0.0)),
+                    })
+            else:
+                logger.warning(f"Không tìm thấy mẫu video nào trong {self.root} cho split='{self.split}'")
+
+        # Khởi tạo bộ trích xuất PIPNet:
+        # Nếu đã có cache và không cung cấp extractor từ ngoài, trì hoãn (Lazy Init)
+        # để không tốn VRAM tải FaceBoxesV2 + PIPNet khi chỉ nạp từ cache.
+        self.extractor = extractor
+        if self.extractor is None and not (self.use_cache and self.cached_data is not None):
+            self.extractor = self._get_or_create_extractor()
+
+    def _get_or_create_extractor(self) -> FastPIPNetExtractor:
+        """Khởi tạo trễ (Lazy init) FastPIPNetExtractor khi thực sự cần trích xuất trực tiếp."""
+        if self.extractor is None:
             self.extractor = FastPIPNetExtractor(
-                backbone="resnet18",
-                device=device,
+                backbone=self.pipnet_backbone,
+                device=self.device,
                 letterbox_size=self.letterbox_size,
                 face_size=self.face_size,
                 conf_threshold=self.conf_threshold,
+                nms_threshold=self.nms_threshold,
                 bbox_margin=self.bbox_margin,
+                box_smooth_alpha=self.box_smooth_alpha,
             )
+        return self.extractor
 
     def _load_samples(self) -> List[Dict[str, Any]]:
         """Đọc danh sách mẫu video từ manifest CSV hoặc quét thư mục fallback."""
@@ -762,7 +846,7 @@ class LiteFatDataset(Dataset):
         return samples
 
     def _load_cache(self) -> None:
-        """Nạp dữ liệu cache từ tệp .pt."""
+        """Nạp dữ liệu cache từ tệp .pt và lưu trữ metadata của cache."""
         cache_path = self.cache_dir / f"{self.split}.pt"
         if not cache_path.is_file():
             logger.warning(f"[Cache] Không tìm thấy tệp cache {cache_path}. Sẽ fallback trích xuất on-the-fly.")
@@ -772,8 +856,34 @@ class LiteFatDataset(Dataset):
             payload = torch.load(cache_path, map_location="cpu", weights_only=False)
             if isinstance(payload, dict) and "samples" in payload:
                 self.cached_data = payload["samples"]
+                self.cache_meta = {
+                    "format_version": payload.get("format_version", 1),
+                    "split": payload.get("split", self.split),
+                    "time_interval": float(payload.get("time_interval", 0.05)),
+                    "window_sec": payload.get("window_sec", None),
+                    "letterbox_size": tuple(payload.get("letterbox_size", self.letterbox_size)),
+                    "face_size": tuple(payload.get("face_size", self.face_size)),
+                    "bbox_margin": float(payload.get("bbox_margin", self.bbox_margin)),
+                    "box_smooth_alpha": float(payload.get("box_smooth_alpha", self.box_smooth_alpha)),
+                    "num_samples": payload.get("num_samples", len(self.cached_data)),
+                }
             elif isinstance(payload, dict):
                 self.cached_data = payload
+                self.cache_meta = {
+                    "time_interval": 0.05,
+                    "window_sec": None,
+                    "letterbox_size": self.letterbox_size,
+                    "face_size": self.face_size,
+                }
+
+            cached_lbs = self.cache_meta.get("letterbox_size")
+            if cached_lbs and tuple(cached_lbs) != tuple(self.letterbox_size):
+                logger.warning(
+                    f"[Cache] File {cache_path.name} được trích xuất với letterbox_size={cached_lbs}, "
+                    f"khác với cấu hình hiện tại {self.letterbox_size}. "
+                    f"Sẽ sử dụng letterbox_size của cache để bảo đảm tọa độ crop_boxes khớp tuyệt đối."
+                )
+
             logger.info(f"[Cache] Đã nạp thành công cache {cache_path.name} với {len(self.cached_data)} mẫu.")
         except Exception as e:
             logger.warning(f"[Cache] Lỗi khi nạp cache {cache_path}: {e}. Bỏ qua cache.")
@@ -823,13 +933,66 @@ class LiteFatDataset(Dataset):
             indices = np.rint(timestamps * fps).astype(int)
             return np.clip(indices, 0, total_frames - 1)
 
+    def _slice_cached_sequence(self, item: Dict[str, Any], fps: float) -> np.ndarray:
+        """
+        Xác định các chỉ số khung hình (pos) cần lấy từ chuỗi cache .pt:
+          - Dựa vào time_interval và window_sec được cấu hình trong LiteFatDataset.
+          - Tự động phát hiện khoảng cách thời gian giữa các frame trong cache (cache_dt).
+          - Hỗ trợ cắt ngẫu nhiên (train) và cắt chính giữa (val/test).
+        """
+        landmarks = item["landmarks"]
+        T_cache = int(landmarks.shape[0])
+        if T_cache <= 0:
+            return np.array([0], dtype=int)
+
+        cache_dt = float(self.cache_meta.get("time_interval", 0.05))
+        if cache_dt <= 0:
+            cache_dt = 1.0 / (fps if fps > 0 else 30.0)
+
+        meta = item.get("meta", {})
+        duration_sec = float(meta.get("duration_sec", T_cache * cache_dt))
+        if duration_sec <= 0:
+            duration_sec = T_cache * cache_dt
+
+        # TRƯỜNG HỢP 1: time_interval == 0 (Lấy chuỗi khung hình liên tiếp)
+        if self.time_interval == 0:
+            if self.window_sec is None:
+                return np.arange(T_cache, dtype=int)
+            else:
+                win_sec = min(self.window_sec, duration_sec)
+                num_consec = int(round(win_sec / cache_dt))
+                num_consec = max(1, min(num_consec, T_cache))
+                max_start = max(0, T_cache - num_consec)
+                start_idx = random.randint(0, max_start) if (self.split == "train" and max_start > 0) else max_start // 2
+                return np.arange(start_idx, start_idx + num_consec, dtype=int)
+
+        # TRƯỜNG HỢP 2: time_interval > 0 (Lấy mẫu cách đều theo thời gian)
+        if self.window_sec is None:
+            # Nếu time_interval cấu hình trùng khớp với cache_dt: giữ nguyên toàn bộ cache
+            if abs(self.time_interval - cache_dt) < 1e-5:
+                return np.arange(T_cache, dtype=int)
+            timestamps = np.arange(0, duration_sec, self.time_interval)
+            if len(timestamps) == 0:
+                timestamps = np.array([0.0])
+            pos = np.rint(timestamps / cache_dt).astype(int)
+            return np.clip(pos, 0, T_cache - 1)
+        else:
+            win = min(self.window_sec, duration_sec)
+            max_start = max(0.0, duration_sec - win)
+            start_sec = random.uniform(0.0, max_start) if (self.split == "train" and max_start > 0) else max_start / 2.0
+            timestamps = start_sec + np.arange(0, win, self.time_interval)
+            if len(timestamps) == 0:
+                timestamps = np.array([start_sec])
+            pos = np.rint(timestamps / cache_dt).astype(int)
+            return np.clip(pos, 0, T_cache - 1)
+
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, index: int) -> Union[
-        Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-        Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]],
-        Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any], List[np.ndarray]],
+        Tuple[Optional[torch.Tensor], torch.Tensor, torch.Tensor],
+        Tuple[Optional[torch.Tensor], torch.Tensor, torch.Tensor, Dict[str, Any]],
+        Tuple[Optional[torch.Tensor], torch.Tensor, torch.Tensor, Dict[str, Any], List[np.ndarray]],
     ]:
         sample = self.samples[index]
         key = sample["key"]
@@ -837,21 +1000,91 @@ class LiteFatDataset(Dataset):
         # 1. Đường nhanh: Nạp từ RAM Cache nếu có
         if self.cached_data is not None and key in self.cached_data:
             item = self.cached_data[key]
-            face_frames = item["face_frames"]  # [T, 3, 224, 224]
-            landmarks = item["landmarks"]      # [T, 68, 3]
+            fps = float(sample.get("fps") or item.get("meta", {}).get("fps", 30.0))
+            pos = self._slice_cached_sequence(item, fps)
+
+            # Cắt các đặc trưng mốc và hộp giới hạn theo pos
+            landmarks = item["landmarks"][pos]  # [T, 68, 3]
+            crop_boxes = item["crop_boxes"][pos] if "crop_boxes" in item else None
+            bboxes = item["bboxes"][pos] if "bboxes" in item else None
+            found = item["found"][pos] if "found" in item else None
+
+            # Lấy target_indices tương ứng trong video gốc
+            cached_target_indices = item.get("target_indices")
+            if cached_target_indices is None and "meta" in item and isinstance(item["meta"], dict):
+                cached_target_indices = item["meta"].get("target_indices")
+
+            if cached_target_indices is not None:
+                if isinstance(cached_target_indices, torch.Tensor):
+                    selected_target_indices = cached_target_indices[pos].long().cpu().numpy()
+                else:
+                    selected_target_indices = np.asarray(cached_target_indices, dtype=int)[pos]
+            else:
+                cache_dt = float(self.cache_meta.get("time_interval", 0.05))
+                selected_target_indices = np.rint(pos * (cache_dt * fps)).astype(int)
+
+            cache_lbs = self.cache_meta.get("letterbox_size", self.letterbox_size)
+            face_frames = item.get("face_frames", None)
+            if face_frames is not None:
+                face_frames = face_frames[pos]
+
+            raw_frames: Optional[List[np.ndarray]] = None
+
+            # Đọc video nếu cần tạo face_frames (cho MobileNetV3) hoặc người dùng yêu cầu return_raw_frames
+            need_video_read = (not self.extract_crops_only and face_frames is None) or self.return_raw_frames
+            if need_video_read:
+                raw_frames, actual_fps, _ = fast_read_video_frames(
+                    sample["path"], selected_target_indices, letterbox_size=cache_lbs
+                )
+                if not self.extract_crops_only and face_frames is None and crop_boxes is not None:
+                    face_frames = crop_faces_from_boxes(raw_frames, crop_boxes, face_size=self.face_size)
+
             label = torch.tensor(sample["label"], dtype=torch.long)
+
+            if found is not None:
+                found_t = torch.as_tensor(found, dtype=torch.bool)
+                found_ratio = float(found_t.sum().item()) / float(max(1, len(found_t)))
+            else:
+                found_t = torch.ones(len(pos), dtype=torch.bool)
+                found_ratio = 1.0
+
             meta = {
+                "key": key,
                 "video_id": sample["video_id"],
                 "path": str(sample["path"]),
-                "fps": float(sample["fps"]),
-                "num_frames": face_frames.shape[0],
+                "split": self.split,
+                "label": int(sample["label"]),
+                "fps": float(fps),
+                "total_frames": int(sample.get("frame_count") or item.get("meta", {}).get("total_frames", 0)),
+                "duration_sec": float(sample.get("duration_sec") or item.get("meta", {}).get("duration_sec", 0.0)),
+                "target_indices": torch.as_tensor(selected_target_indices, dtype=torch.long),
+                "num_frames": int(landmarks.shape[0]),
+                "found_faces_ratio": found_ratio,
+                "letterbox_size": cache_lbs,
                 "cached": True,
             }
+            if crop_boxes is not None:
+                meta["crop_boxes"] = torch.as_tensor(crop_boxes, dtype=torch.int32)
+            if bboxes is not None:
+                meta["bboxes"] = torch.as_tensor(bboxes, dtype=torch.float32)
+            if found is not None:
+                meta["found"] = found_t
+
+            if "meta" in item and isinstance(item["meta"], dict):
+                for k_meta, v_meta in item["meta"].items():
+                    if k_meta not in meta and k_meta != "path":
+                        meta[k_meta] = v_meta
+                if "path" in item["meta"] and str(item["meta"]["path"]) != str(sample["path"]):
+                    meta["remote_path"] = str(item["meta"]["path"])
+
+            if self.return_raw_frames and self.return_meta:
+                return face_frames, landmarks, label, meta, (raw_frames if raw_frames is not None else [])
             if self.return_meta:
                 return face_frames, landmarks, label, meta
             return face_frames, landmarks, label
 
         # 2. Đường chuẩn: Đọc video và trích xuất on-the-fly
+        extractor = self._get_or_create_extractor()
         fps = sample["fps"]
         total_frames = sample["frame_count"]
 
@@ -868,17 +1101,42 @@ class LiteFatDataset(Dataset):
             sample["path"], target_indices, letterbox_size=self.letterbox_size
         )
 
-        face_frames, landmarks, bboxes, found = self.extractor.extract_from_frames(raw_frames)
+        crop_faces = not self.extract_crops_only
+        face_frames, landmarks, bboxes, found, crop_boxes = extractor.extract_from_frames(
+            raw_frames,
+            crop_faces=crop_faces,
+            return_crop_boxes=True,
+        )
         label = torch.tensor(sample["label"], dtype=torch.long)
 
+        # Chuẩn hóa BBoxes và Found thành Tensor để dễ lưu .pt và xử lý
+        T_frames = len(found)
+        bboxes_tensor = torch.zeros((T_frames, 5), dtype=torch.float32)
+        for t_idx, b in enumerate(bboxes):
+            if b is not None and len(b) >= 4:
+                b_arr = np.asarray(b, dtype=np.float32)
+                bboxes_tensor[t_idx, :min(5, len(b_arr))] = torch.from_numpy(b_arr[:min(5, len(b_arr))])
+        found_tensor = torch.tensor(found, dtype=torch.bool)
+        crop_boxes_tensor = torch.from_numpy(crop_boxes).int()
+
         meta = {
+            "key": key,
             "video_id": sample["video_id"],
             "path": str(sample["path"]),
-            "fps": actual_fps,
-            "target_indices": target_indices.tolist(),
-            "num_frames": face_frames.shape[0],
-            "found_faces_ratio": float(sum(found)) / float(len(found)),
-            "bboxes": bboxes,
+            "split": self.split,
+            "label": int(sample["label"]),
+            "fps": float(actual_fps),
+            "total_frames": int(total_frames),
+            "duration_sec": float(total_frames / actual_fps) if actual_fps > 0 else 0.0,
+            "target_indices": torch.from_numpy(target_indices).long(),
+            "num_frames": int(landmarks.shape[0]),
+            "found_faces_ratio": float(sum(found)) / float(max(1, len(found))),
+            "letterbox_size": self.letterbox_size,
+            "crop_boxes": crop_boxes_tensor,
+            "bboxes": bboxes_tensor,
+            "found": found_tensor,
+            "raw_bboxes_list": bboxes,
+            "cached": False,
         }
 
         if self.return_raw_frames and self.return_meta:
@@ -896,6 +1154,7 @@ def collate_litefat(batch: List[Tuple[Any, ...]]):
     Collate function cho DataLoader LiteFat.
     Hỗ trợ tự động đệm (padding) theo chiều thời gian T nếu độ dài giữa các mẫu khác nhau
     (khi sử dụng chế độ num_frames=None, time_interval).
+    Hỗ trợ cả trường hợp face_frames là None (khi chạy ở chế độ extract_crops_only=True).
     """
     first_item = batch[0]
     num_elements = len(first_item)
@@ -904,30 +1163,35 @@ def collate_litefat(batch: List[Tuple[Any, ...]]):
     landmarks_list = [item[1] for item in batch]
     labels_list = [item[2] for item in batch]
 
-    lengths = [f.shape[0] for f in face_frames_list]
+    lengths = [lm.shape[0] for lm in landmarks_list]
     max_len = max(lengths)
+
+    has_face_frames = all(f is not None for f in face_frames_list)
 
     # Đệm theo chiều thời gian T nếu các video có số frame khác nhau
     padded_frames = []
     padded_landmarks = []
-    for f, lm, cur_len in zip(face_frames_list, landmarks_list, lengths):
+    for idx, (lm, cur_len) in enumerate(zip(landmarks_list, lengths)):
+        f = face_frames_list[idx]
         if cur_len < max_len:
             pad_t = max_len - cur_len
-            # Đệm frame bằng frame cuối cùng
-            last_frame = f[-1:].repeat(pad_t, 1, 1, 1)
-            padded_f = torch.cat([f, last_frame], dim=0)
-            # Đệm landmark bằng giá trị 1.0
+            if has_face_frames and f is not None:
+                # Đệm frame bằng frame cuối cùng
+                last_frame = f[-1:].repeat(pad_t, 1, 1, 1)
+                padded_f = torch.cat([f, last_frame], dim=0)
+                padded_frames.append(padded_f)
+            # Đệm landmark bằng giá trị 1.0 (chuẩn bài báo LiteFat Section III-B)
             pad_lm = torch.ones((pad_t, lm.shape[1], lm.shape[2]), dtype=lm.dtype)
             padded_l = torch.cat([lm, pad_lm], dim=0)
-            padded_frames.append(padded_f)
             padded_landmarks.append(padded_l)
         else:
-            padded_frames.append(f)
+            if has_face_frames and f is not None:
+                padded_frames.append(f)
             padded_landmarks.append(lm)
 
-    batch_frames = torch.stack(padded_frames, dim=0)       # [B, T, 3, 224, 224]
-    batch_landmarks = torch.stack(padded_landmarks, dim=0) # [B, T, 68, 3]
-    batch_labels = torch.stack(labels_list, dim=0)         # [B]
+    batch_frames = torch.stack(padded_frames, dim=0) if has_face_frames else None  # [B, T, 3, 224, 224] hoặc None
+    batch_landmarks = torch.stack(padded_landmarks, dim=0)                         # [B, T, 68, 3]
+    batch_labels = torch.stack(labels_list, dim=0)                                 # [B]
 
     if num_elements >= 4:
         metas = [item[3] for item in batch]
@@ -953,16 +1217,26 @@ def build_litefat_dataloaders(
         pin_memory: bool = True,
         shuffle_train: bool = True,
         device: Optional[str] = None,
+        pipnet_backbone: str = "resnet18",
+        conf_threshold: float = 0.5,
+        nms_threshold: float = 0.3,
+        bbox_margin: float = 0.15,
+        box_smooth_alpha: float = 0.7,
+        extract_crops_only: bool = False,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """
     Khởi tạo nhanh bộ 3 DataLoader cho tập train, val, test của mô hình LiteFat theo cơ chế window_sec và time_interval.
     """
-    # Khởi tạo 1 extractor dùng chung cho cả 3 tập để tiết kiệm VRAM và tăng tốc khởi tạo
+    # Khởi tạo 1 extractor dùng chung cho cả 3 tập nếu không dùng cache để tiết kiệm VRAM và tăng tốc khởi tạo
     shared_extractor = FastPIPNetExtractor(
-        backbone="resnet18",
+        backbone=pipnet_backbone,
         device=device,
         letterbox_size=letterbox_size,
         face_size=face_size,
+        conf_threshold=conf_threshold,
+        nms_threshold=nms_threshold,
+        bbox_margin=bbox_margin,
+        box_smooth_alpha=box_smooth_alpha,
     ) if not use_cache else None
 
     common_cfg = dict(
@@ -972,10 +1246,16 @@ def build_litefat_dataloaders(
         manifest_filename=manifest_filename,
         letterbox_size=letterbox_size,
         face_size=face_size,
+        conf_threshold=conf_threshold,
+        nms_threshold=nms_threshold,
+        bbox_margin=bbox_margin,
+        box_smooth_alpha=box_smooth_alpha,
+        pipnet_backbone=pipnet_backbone,
         use_cache=use_cache,
         cache_dir=cache_dir,
         extractor=shared_extractor,
         device=device,
+        extract_crops_only=extract_crops_only,
     )
 
     train_ds = LiteFatDataset(split="train", **common_cfg)
@@ -1002,7 +1282,7 @@ def build_litefat_dataloaders(
 # 5. TRỰC QUAN HÓA MẪU DỮ LIỆU
 # =====================================================================
 def visualize_litefat_sample(
-        face_frames: torch.Tensor,
+        face_frames: Optional[torch.Tensor],
         landmarks: torch.Tensor,
         label: Union[torch.Tensor, int],
         raw_frames: List[np.ndarray],
@@ -1015,10 +1295,10 @@ def visualize_litefat_sample(
     Hiển thị trực quan toàn diện mẫu dữ liệu của LiteFat:
       1. Cửa sổ 1: Video phát động (có thể lặp lại và tạm dừng) hiển thị song song:
          - Bên trái: Khung hình letterbox gốc (640x480) được vẽ 68 điểm mốc giải phẫu
-           (đường nối viền mắt, sống mũi, viền môi trong/ngoài) + Bounding Box khuôn mặt tài xế.
-         - Bên phải: Khung hình khuôn mặt đã được cắt và chuẩn hóa (224x224) cho MobileNetV3-Small.
+           (đường nối viền mắt, sống mũi, viền môi trong/ngoài) + Bounding Box khuôn mặt tài xế + CropBox viền vàng.
+         - Bên phải: Khung hình khuôn mặt đã được cắt và chuẩn hóa (224x224) cho MobileNetV3-Small (nếu có).
       2. Cửa sổ 2: Bảng lưới (Montage Grid 4x4) hiển thị đồng thời toàn bộ T khung hình khuôn mặt
-         đã cắt trong chuỗi thời gian để dễ dàng soi xét từng vi biểu cảm.
+         đã cắt trong chuỗi thời gian để dễ dàng soi xét từng vi biểu cảm (nếu có face_frames).
     """
     T = len(raw_frames)
     lbl_val = int(label.item()) if isinstance(label, torch.Tensor) else int(label)
@@ -1026,36 +1306,36 @@ def visualize_litefat_sample(
     label_color = (0, 0, 255) if lbl_val == 1 else (0, 255, 0)
     video_id = meta.get("video_id", "sample") if meta else "sample"
     bboxes_list = meta.get("bboxes", [None] * T) if meta else [None] * T
+    crop_boxes_list = meta.get("crop_boxes", None) if meta else None
 
-    # 1. Giải chuẩn hóa ImageNet trên face_frames để hiển thị BGR [0, 255]
-    # face_frames: [T, 3, 224, 224] (RGB)
-    norm_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
-    norm_std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
-    unnorm_faces = (face_frames * norm_std + norm_mean).clamp(0.0, 1.0)
-    # [T, 3, 224, 224] -> [T, 224, 224, 3] (RGB) -> BGR
-    faces_rgb = (unnorm_faces.permute(0, 2, 3, 1).cpu().numpy() * 255.0).astype(np.uint8)
-    faces_bgr = [cv2.cvtColor(faces_rgb[i], cv2.COLOR_RGB2BGR) for i in range(T)]
+    # 1. Giải chuẩn hóa ImageNet trên face_frames (nếu có) để hiển thị BGR [0, 255]
+    has_faces = face_frames is not None
+    faces_bgr = []
+    if has_faces:
+        norm_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+        norm_std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+        unnorm_faces = (face_frames * norm_std + norm_mean).clamp(0.0, 1.0)
+        faces_rgb = (unnorm_faces.permute(0, 2, 3, 1).cpu().numpy() * 255.0).astype(np.uint8)
+        faces_bgr = [cv2.cvtColor(faces_rgb[i], cv2.COLOR_RGB2BGR) for i in range(T)]
 
-    # 2. Tạo ảnh bảng lưới (Montage Grid) hiển thị tất cả T khung hình khuôn mặt đã cắt
-    cols = 4 if T >= 4 else T
-    rows = (T + cols - 1) // cols
-    cell_w, cell_h = 160, 160
-    grid_img = np.zeros((rows * cell_h, cols * cell_w, 3), dtype=np.uint8)
+        # 2. Tạo ảnh bảng lưới (Montage Grid) hiển thị tất cả T khung hình khuôn mặt đã cắt
+        cols = 4 if T >= 4 else T
+        rows = (T + cols - 1) // cols
+        cell_w, cell_h = 160, 160
+        grid_img = np.zeros((rows * cell_h, cols * cell_w, 3), dtype=np.uint8)
 
-    for i in range(T):
-        r = i // cols
-        c = i % cols
-        cell = cv2.resize(faces_bgr[i], (cell_w, cell_h))
-        # Viền nhẹ quanh cell
-        cv2.rectangle(cell, (0, 0), (cell_w - 1, cell_h - 1), (50, 50, 50), 1)
-        # Ghi chỉ số frame
-        cv2.putText(cell, f"F{i:02d}", (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
-        cv2.putText(cell, f"F{i:02d}", (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1, cv2.LINE_AA)
-        grid_img[r * cell_h:(r + 1) * cell_h, c * cell_w:(c + 1) * cell_w] = cell
+        for i in range(T):
+            r = i // cols
+            c = i % cols
+            cell = cv2.resize(faces_bgr[i], (cell_w, cell_h))
+            cv2.rectangle(cell, (0, 0), (cell_w - 1, cell_h - 1), (50, 50, 50), 1)
+            cv2.putText(cell, f"F{i:02d}", (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
+            cv2.putText(cell, f"F{i:02d}", (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1, cv2.LINE_AA)
+            grid_img[r * cell_h:(r + 1) * cell_h, c * cell_w:(c + 1) * cell_w] = cell
 
-    cv2.namedWindow(grid_window_name, cv2.WINDOW_NORMAL)
-    cv2.imshow(grid_window_name, grid_img)
-    cv2.resizeWindow(grid_window_name, cols * cell_w, rows * cell_h)
+        cv2.namedWindow(grid_window_name, cv2.WINDOW_NORMAL)
+        cv2.imshow(grid_window_name, grid_img)
+        cv2.resizeWindow(grid_window_name, cols * cell_w, rows * cell_h)
 
     # 3. Chuẩn bị cửa sổ phát video side-by-side
     lms_np = landmarks.cpu().numpy()  # [T, 68, 3]
@@ -1081,8 +1361,15 @@ def visualize_litefat_sample(
             pts_px[:, 0] *= float(target_w)
             pts_px[:, 1] *= float(target_h)
 
-            if bbox is not None and len(bbox) >= 5:
-                bboxes_to_draw = np.array([bbox], dtype=np.float32)
+            bbox_arr = None
+            if bbox is not None:
+                if isinstance(bbox, torch.Tensor):
+                    bbox_arr = bbox.detach().cpu().numpy()
+                else:
+                    bbox_arr = np.asarray(bbox, dtype=np.float32)
+
+            if bbox_arr is not None and len(bbox_arr) >= 5 and float(bbox_arr[4]) > 0:
+                bboxes_to_draw = np.array([bbox_arr[:5]], dtype=np.float32)
             else:
                 # Tự tính BBox bao quanh điểm mốc nếu bbox gốc bị thiếu
                 lx1, ly1 = np.min(pts_px[:, 0]), np.min(pts_px[:, 1])
@@ -1099,27 +1386,33 @@ def visualize_litefat_sample(
             cv2.putText(left_img, "[CANH BAO: MAT MAT / HEAD TURNED]", (30, target_h // 2),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 0, 255), 2, cv2.LINE_AA)
 
-        # Chuẩn bị ảnh mặt bên phải (kích thước target_h x target_h, ví dụ 480x480)
-        right_panel = np.zeros((target_h, target_h, 3), dtype=np.uint8)
-        # Giữ viền trên để hiển thị tiêu đề panel
-        header_h = 45
-        face_display_size = target_h - header_h
-        face_resized = cv2.resize(faces_bgr[t], (face_display_size, face_display_size), interpolation=cv2.INTER_LINEAR)
+        # Vẽ viền crop_box nếu có
+        if crop_boxes_list is not None and t < len(crop_boxes_list):
+            cb = crop_boxes_list[t]
+            if isinstance(cb, torch.Tensor):
+                cb = cb.detach().cpu().numpy()
+            if len(cb) >= 4:
+                cx1, cy1, cx2, cy2 = int(cb[0]), int(cb[1]), int(cb[2]), int(cb[3])
+                cv2.rectangle(left_img, (cx1, cy1), (cx2, cy2), (0, 255, 255), 1, cv2.LINE_AA)
 
-        # Căn giữa ảnh mặt trong panel bên phải
-        x_offset = (target_h - face_display_size) // 2
-        right_panel[header_h:header_h + face_display_size, x_offset:x_offset + face_display_size] = face_resized
+        if has_faces:
+            right_panel = np.zeros((target_h, target_h, 3), dtype=np.uint8)
+            header_h = 45
+            face_display_size = target_h - header_h
+            face_resized = cv2.resize(faces_bgr[t], (face_display_size, face_display_size), interpolation=cv2.INTER_LINEAR)
 
-        # Vẽ tiêu đề và viền cho panel mặt cắt
-        cv2.putText(right_panel, f"CROPPED FACE (224x224) - F{t:02d}", (15, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
-        cv2.rectangle(right_panel, (x_offset, header_h),
-                      (x_offset + face_display_size - 1, header_h + face_display_size - 1), (0, 255, 0), 2)
+            x_offset = (target_h - face_display_size) // 2
+            right_panel[header_h:header_h + face_display_size, x_offset:x_offset + face_display_size] = face_resized
 
-        # Ghép 2 khung hình cạnh nhau
-        combined = np.hstack([left_img, right_panel])
+            cv2.putText(right_panel, f"CROPPED FACE (224x224) - F{t:02d}", (15, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
+            cv2.rectangle(right_panel, (x_offset, header_h),
+                          (x_offset + face_display_size - 1, header_h + face_display_size - 1), (0, 255, 0), 2)
 
-        # Thanh tiêu đề trên khung hình chính
+            combined = np.hstack([left_img, right_panel])
+        else:
+            combined = left_img
+
         top_bar = f"Video: {video_id} | Status: {label_str} | Frame {t + 1}/{T}"
         if paused:
             top_bar += "  [DANG TAM DUNG]"
@@ -1132,7 +1425,6 @@ def visualize_litefat_sample(
 
         cv2.imshow(window_name, combined)
 
-        # Kiểm tra xem cửa sổ có bị đóng bởi người dùng không
         if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
             break
 
@@ -1147,15 +1439,15 @@ def visualize_litefat_sample(
         elif key in (ord('r'), ord('R')):
             t = 0
             continue
-        elif key in (ord('d'), ord('D'), 83):  # Phím tiến frame
+        elif key in (ord('d'), ord('D'), 83):
             t = (t + 1) % T
             continue
-        elif key in (ord('a'), ord('A'), 81):  # Phím lùi frame
+        elif key in (ord('a'), ord('A'), 81):
             t = (t - 1 + T) % T
             continue
 
         if not paused:
-            t = (t + 1) % T  # Lặp lại chuỗi video
+            t = (t + 1) % T
 
     cv2.destroyAllWindows()
 
@@ -1178,8 +1470,8 @@ if __name__ == "__main__":
     ds = LiteFatDataset(
         dataset_dir=DATASET_DIR,
         split="test",
-        time_interval=1,
-        window_sec=10,
+        time_interval=0.05,
+        window_sec=None,
         return_meta=True,
         return_raw_frames=True,
     )
@@ -1187,7 +1479,7 @@ if __name__ == "__main__":
 
     if len(ds) > 0:
         # Lấy mẫu kiểm định
-        sample_idx = min(700, len(ds) - 1)
+        sample_idx = min(10, len(ds) - 1)
         face_frames, landmarks, label, meta, raw_frames = ds[sample_idx]
         T_actual = face_frames.shape[0]
         print(f"\n--- KẾT QUẢ TRÍCH XUẤT MẪU {sample_idx} ---")

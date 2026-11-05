@@ -1178,8 +1178,8 @@ if __name__ == "__main__":
     ds = LiteFatDataset(
         dataset_dir=DATASET_DIR,
         split="test",
-        time_interval=0,
-        window_sec=None,
+        time_interval=1,
+        window_sec=10,
         return_meta=True,
         return_raw_frames=True,
     )
@@ -1187,7 +1187,7 @@ if __name__ == "__main__":
 
     if len(ds) > 0:
         # Lấy mẫu kiểm định
-        sample_idx = min(500, len(ds) - 1)
+        sample_idx = min(700, len(ds) - 1)
         face_frames, landmarks, label, meta, raw_frames = ds[sample_idx]
         T_actual = face_frames.shape[0]
         print(f"\n--- KẾT QUẢ TRÍCH XUẤT MẪU {sample_idx} ---")

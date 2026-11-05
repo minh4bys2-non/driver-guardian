@@ -190,44 +190,103 @@ class MobileNetV3ContextEncoder(nn.Module):
 
 class MultimodalFusionModule(nn.Module):
     """
-    Thực hiện phép dung hợp đa phương thức theo Phương trình (1):
-        X = (C * w) * d^T
+    Thực hiện phép dung hợp đa phương thức theo Phương trình (1) có tích hợp KinematicFeatureExtractor:
+        X = (C_kinematic * w) * d^T
     Trong đó:
-        - C in R^{N x 3}: Ma trận tọa độ điểm mốc (X, Y, Confidence)
-        - w in R^{3 x 1}: Vector trọng số khả học
-        - d in R^{D x 1}: Vector đặc trưng ngữ cảnh từ MobileNetV3-Small
-        - X in R^{N x D}: Ma trận đặc trưng nút đồ thị tại mỗi khung hình
+        - coords in R^{B x T x N x 2}: Ma trận tọa độ điểm mốc tĩnh (x, y)
+          (Hỗ trợ tự động cắt coords[..., :2] nếu nhận cache 3 kênh cũ).
+        - C_kinematic in R^{B x T x N x 6}: Đặc trưng động học [x_norm, y_norm, dx_norm, dy_norm, d2x_norm, d2y_norm]
+          được chuẩn hóa theo tâm mũi (điểm 30) và tỷ lệ IOD (khoảng cách 2 mắt 36 <-> 45).
+        - w in R^{6 x 1}: Vector trọng số khả học cho 6 kênh đặc trưng động học.
+        - d in R^{B x T x D}: Vector đặc trưng ngữ cảnh từ MobileNetV3-Small.
+        - X in R^{B x D x N x T}: Tensor đặc trưng đồ thị không gian - thời gian cho STGL.
     """
 
-    def __init__(self):
+    def __init__(
+            self,
+            num_features: int = 6,
+            nose_idx: int = 30,
+            left_eye_idx: int = 36,
+            right_eye_idx: int = 45,
+            eps: float = 1e-6,
+    ):
         super().__init__()
-        # Vector trọng số khả học w in R^{3 x 1}
-        self.w = nn.Parameter(torch.ones(3, 1) / 3.0)
+        self.left_eye_idx = left_eye_idx
+        self.right_eye_idx = right_eye_idx
+        self.eps = eps
 
-    @staticmethod
-    def handle_missing_landmarks(coords: torch.Tensor, conf_threshold: float = 1e-4) -> torch.Tensor:
-        """
-        Theo Section III-B: Nếu bộ dò điểm mốc thất bại ở một khung hình
-        (khi tài xế cúi gập đầu hoặc quay mặt đi), gán toàn bộ phần tử
-        của ma trận tọa độ C tại khung hình đó về 1.0.
-        """
-        # coords shape: [B, T, N, 3]
-        conf_sum = coords[..., 2].abs().sum(dim=-1, keepdim=True).unsqueeze(-1)  # [B, T, 1, 1]
-        invalid_mask = conf_sum < conf_threshold
-        return torch.where(invalid_mask, torch.ones_like(coords), coords)
+        # Khối trích xuất đặc trưng động học không gian - thời gian
+        self.kinematic = KinematicFeatureExtractor(
+            nose_idx=nose_idx,
+            left_eye_idx=left_eye_idx,
+            right_eye_idx=right_eye_idx,
+            eps=eps,
+        )
 
-    def forward(self, coords: torch.Tensor, d: torch.Tensor) -> torch.Tensor:
+        # Vector trọng số khả học w in R^{6 x 1}
+        self.w = nn.Parameter(torch.ones(num_features, 1) / float(num_features))
+
+    def detect_missing_mask(self, coords: torch.Tensor) -> torch.Tensor:
+        """
+        Nhận diện các khung hình mất khuôn mặt hoặc padding đệm:
+          - coords shape: [B, T, N, 2]
+          - Trả về boolean mask: [B, T, 1, 1] (True là mất mặt/pad, False là hợp lệ).
+        """
+        p_left = coords[:, :, self.left_eye_idx, :]
+        p_right = coords[:, :, self.right_eye_idx, :]
+        raw_iod = torch.norm(p_right - p_left, p=2, dim=-1, keepdim=True).unsqueeze(-1)  # [B, T, 1, 1]
+
+        all_ones = (coords == 1.0).all(dim=-1, keepdim=True).all(dim=-2, keepdim=True)  # [B, T, 1, 1]
+        all_zeros = (coords == 0.0).all(dim=-1, keepdim=True).all(dim=-2, keepdim=True)  # [B, T, 1, 1]
+        is_missing = (raw_iod < 1e-4) | all_ones | all_zeros
+        return is_missing
+
+    def forward(
+            self,
+            coords: torch.Tensor,
+            d: torch.Tensor,
+            mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Args:
-            coords: Ma trận điểm mốc C có kích thước [B, T, N, 3]
+            coords: Ma trận điểm mốc có kích thước [B, T, N, 2] (hoặc [B, T, N, 3] từ cache cũ)
             d: Vector ngữ cảnh MobileNetV3 có kích thước [B, T, D]
+            mask: Temporal mask tùy chọn kích thước [B, 1, T, 1]
         Returns:
             X: Tensor đặc trưng đồ thị không gian - thời gian [B, D, N, T]
         """
-        coords = self.handle_missing_landmarks(coords)
+        # Hỗ trợ tương thích ngược: tự động lấy 2 kênh tọa độ (x, y) nếu có 3 kênh
+        if coords.dim() == 4:
+            if coords.size(-1) >= 2:
+                coords_xy = coords[..., :2]
+            elif coords.size(1) >= 2:
+                # Shape dạng [B, C, T, N]
+                coords_xy = coords[:, :2, :, :].permute(0, 2, 3, 1).contiguous()
+            else:
+                coords_xy = coords
+        else:
+            coords_xy = coords
 
-        # (C * w): [B, T, N, 3] @ [3, 1] -> [B, T, N, 1]
-        node_scalar = torch.matmul(coords, self.w)
+        is_missing = self.detect_missing_mask(coords_xy)  # [B, T, 1, 1]
+
+        # Tạo temporal mask (1.0 = hợp lệ, 0.0 = mất mặt/pad) cho KinematicFeatureExtractor
+        if mask is None:
+            temporal_mask = (~is_missing).permute(0, 3, 1, 2).float()  # [B, 1, T, 1]
+        else:
+            temporal_mask = mask
+
+        # Đưa về [B, 2, T, N] để tính các kênh động học
+        x_in = coords_xy.permute(0, 3, 1, 2).contiguous()
+        feat_kin = self.kinematic(x_in, mask=temporal_mask)  # [B, 6, T, N]
+
+        # Đưa về [B, T, N, 6]
+        C_kin = feat_kin.permute(0, 2, 3, 1).contiguous()
+
+        # Section III-B: Nếu frame mất mặt, gán toàn bộ C về 1.0 (fall back về d^T)
+        C_fused = torch.where(is_missing, torch.ones_like(C_kin), C_kin)
+
+        # (C_fused * w): [B, T, N, 6] @ [6, 1] -> [B, T, N, 1]
+        node_scalar = torch.matmul(C_fused, self.w)
 
         # d^T: [B, T, 1, D]
         d_row = d.unsqueeze(2)
@@ -518,7 +577,7 @@ class LiteFat(nn.Module):
         Chế độ chuẩn (Huấn luyện & Đánh giá đồng bộ):
         Args:
             video_frames: Chuỗi khung hình [B, T, 3, H, W] (ví dụ H=W=224)
-            landmarks: Chuỗi điểm mốc khuôn mặt [B, T, N, 3] (N=68)
+            landmarks: Chuỗi điểm mốc khuôn mặt [B, T, N, 2] (N=68, tọa độ x, y)
         Returns:
             frame_logits: Điểm dự đoán cho từng khung hình [B, T, num_classes]
             clip_logits: Điểm dự đoán cho cả đoạn video [B, num_classes]
@@ -530,7 +589,7 @@ class LiteFat(nn.Module):
         d_flat = self.context_encoder(frames_flat)  # [B * T, D]
         d = d_flat.view(B, T, self.feature_dim)  # [B, T, D]
 
-        # 2. Dung hợp đa phương thức: X = (C * w) * d^T -> [B, D, N, T]
+        # 2. Dung hợp đa phương thức qua KinematicFeatureExtractor: X = (C * w) * d^T -> [B, D, N, T]
         X = self.fusion(landmarks, d)
 
         # 3. Đưa qua mạng đồ thị không gian - thời gian STGL
@@ -548,7 +607,7 @@ class LiteFat(nn.Module):
           - Ở khung hình cần cập nhật ngữ cảnh (mỗi 3 frame): truyền `current_frame` [1, 3, H, W]
             để chạy MobileNetV3-Small và đẩy vector d_t mới vào `d_history`.
           - Ở các khung hình xen kẽ: đặt `current_frame=None`, tái sử dụng vector d gần nhất
-            nhưng vẫn cập nhật `landmark_window` [1, T, 68, 3] ở tốc độ 30 FPS.
+            nhưng vẫn cập nhật `landmark_window` [1, T, 68, 2] ở tốc độ 30 FPS.
         """
         if current_frame is not None:
             d_new = self.context_encoder(current_frame).unsqueeze(1)  # [1, 1, D]
@@ -638,7 +697,7 @@ if __name__ == "__main__":
     # Gia lap 1 batch gom B=2 doan video, moi doan T=16 khung hinh (Section IV-A)
     B, T, N = 2, 16, 68
     dummy_frames = torch.randn(B, T, 3, 224, 224, device=device)
-    dummy_landmarks = torch.rand(B, T, N, 3, device=device)
+    dummy_landmarks = torch.rand(B, T, N, 2, device=device)
     dummy_labels = torch.tensor([0, 1], dtype=torch.long, device=device)
 
     # Thiet lap bo toi uu hoa chi nhan cac tham so requires_grad
@@ -674,7 +733,7 @@ if __name__ == "__main__":
     print("\n=== 4. KIEM THU ASYMMETRIC INFERENCE ===")
     model.eval()
     d_cache = torch.zeros(1, T, 64, device=device)
-    lm_window = torch.rand(1, T, N, 3, device=device)
+    lm_window = torch.rand(1, T, N, 2, device=device)
     single_frame = torch.randn(1, 3, 224, 224, device=device)
 
     # Frame 0: Cap nhat ca MobileNetV3 va Do thi STGL

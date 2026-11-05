@@ -350,7 +350,7 @@ class FastPIPNetExtractor:
         Đảm bảo giữ chính xác công thức căn chỉnh vùng cắt của PIPNet 300W:
           extend = 0.2 -> x1 -= 0.1*w, y1 += 0.1*h, x2 += 0.1*w, y2 += 0.1*h
         Trả về:
-          - landmarks_norm: [T, 68, 3] gồm (x/W, y/H, confidence)
+          - landmarks_norm: [T, 68, 2] gồm (x/W, y/H)
           - landmarks_px:   [T, 68, 2] tọa độ pixel tuyệt đối trên khung hình letterbox
         """
         T = len(frames)
@@ -360,7 +360,7 @@ class FastPIPNetExtractor:
         valid_indices = [t for t in range(T) if found[t] and chosen_bboxes[t] is not None]
 
         # Khởi tạo ma trận điểm mốc: mặc định gán 1.0 khi mất mặt (theo Section III-B bài báo LiteFat)
-        landmarks_norm = np.ones((T, 68, 3), dtype=np.float32)
+        landmarks_norm = np.ones((T, 68, 2), dtype=np.float32)
         landmarks_px = np.zeros((T, 68, 2), dtype=np.float32)
 
         if not valid_indices:
@@ -459,10 +459,9 @@ class FastPIPNetExtractor:
             landmarks_px[idx, :, 0] = abs_x
             landmarks_px[idx, :, 1] = abs_y
 
-            # Chuẩn hóa về [0, 1] trên kích thước letterbox
+            # Chuẩn hóa về [0, 1] trên kích thước letterbox (chỉ lấy tọa độ x, y)
             landmarks_norm[idx, :, 0] = abs_x / float(target_w)
             landmarks_norm[idx, :, 1] = abs_y / float(target_h)
-            landmarks_norm[idx, :, 2] = score
 
         return landmarks_norm, landmarks_px
 
@@ -593,7 +592,7 @@ class FastPIPNetExtractor:
 
         Returns:
           - face_frames: Tensor [T, 3, 224, 224] (hoặc None nếu crop_faces=False)
-          - landmarks:   Tensor [T, 68, 3] (X, Y, Conf)
+          - landmarks:   Tensor [T, 68, 2] (X, Y)
           - bboxes:      Danh sách BBox chọn lọc của từng frame
           - found:       Danh sách boolean đánh dấu phát hiện được mặt
           - crop_boxes:  (kèm theo nếu return_crop_boxes=True) mảng np.ndarray [T, 4] dạng [x1, y1, x2, y2]
@@ -1009,8 +1008,10 @@ class LiteFatDataset(Dataset):
             fps = float(sample.get("fps") or item.get("meta", {}).get("fps", 30.0))
             pos = self._slice_cached_sequence(item, fps)
 
-            # Cắt các đặc trưng mốc và hộp giới hạn theo pos
-            landmarks = item["landmarks"][pos]  # [T, 68, 3]
+            # Cắt các đặc trưng mốc và hộp giới hạn theo pos (tương thích cache 2 kênh hoặc 3 kênh cũ)
+            landmarks = item["landmarks"][pos]
+            if landmarks.shape[-1] > 2:
+                landmarks = landmarks[..., :2]
             crop_boxes = item["crop_boxes"][pos] if "crop_boxes" in item else None
             bboxes = item["bboxes"][pos] if "bboxes" in item else None
             found = item["found"][pos] if "found" in item else None
@@ -1196,7 +1197,7 @@ def collate_litefat(batch: List[Tuple[Any, ...]]):
             padded_landmarks.append(lm)
 
     batch_frames = torch.stack(padded_frames, dim=0) if has_face_frames else None  # [B, T, 3, 224, 224] hoặc None
-    batch_landmarks = torch.stack(padded_landmarks, dim=0)  # [B, T, 68, 3]
+    batch_landmarks = torch.stack(padded_landmarks, dim=0)  # [B, T, 68, 2]
     batch_labels = torch.stack(labels_list, dim=0)  # [B]
 
     if num_elements >= 4:
@@ -1285,8 +1286,374 @@ def build_litefat_dataloaders(
 
 
 # =====================================================================
-# 5. TRỰC QUAN HÓA MẪU DỮ LIỆU
+# 5. TRỰC QUAN HÓA MẪU DỮ LIỆU & MÔ PHỎNG KINEMATIC FEATURE EXTRACTOR
 # =====================================================================
+# Các đường nối giải phẫu 68 điểm mốc theo chuẩn iBUG 300W cho mô phỏng động học
+KINEMATIC_REGIONS = [
+    (0, 17, False, (255, 190, 0)),   # Đường viền hàm (0 - 16) - Xanh lam
+    (17, 22, False, (0, 230, 255)),  # Lông mày trái (17 - 21) - Vàng
+    (22, 27, False, (0, 230, 255)),  # Lông mày phải (22 - 26) - Vàng
+    (27, 31, False, (220, 0, 255)),  # Sống mũi (27 - 30) - Tím hồng
+    (31, 36, False, (220, 0, 255)),  # Chóp mũi dưới (31 - 35) - Tím hồng
+    (36, 42, True, (0, 255, 100)),   # Mắt trái (36 - 41) - Xanh lá
+    (42, 48, True, (0, 255, 100)),   # Mắt phải (42 - 47) - Xanh lá
+    (48, 60, True, (0, 160, 255)),   # Viền môi ngoài (48 - 59) - Cam
+    (60, 68, True, (0, 70, 255))     # Viền môi trong (60 - 67) - Đỏ
+]
+
+
+def render_kinematic_frame(
+        pos_t: np.ndarray,
+        vel_t: np.ndarray,
+        acc_t: np.ndarray,
+        vel_all: np.ndarray,
+        acc_all: np.ndarray,
+        t: int,
+        T: int,
+        is_missing: bool = False,
+        video_id: str = "sample",
+        label_str: str = "",
+        label_color: Tuple[int, int, int] = (0, 255, 0),
+        raw_iod: float = 0.0,
+        raw_landmarks: Optional[np.ndarray] = None,
+        target_w: int = 640,
+        target_h: int = 480,
+        zoom_scale: float = 260.0,
+) -> np.ndarray:
+    """
+    Dựng khung hình trực quan hóa mô phỏng cho lớp KinematicFeatureExtractor:
+      - Kích thước: 1280 x 720 pixel (chuẩn HD 720p, nền tối than chì sang trọng).
+      - Panel trái (720x672): Hệ tọa độ Cục bộ Tâm Mũi (0, 0), tỷ lệ phóng to zoom_scale,
+        chỉ vẽ các điểm mốc và đoạn thẳng nằm trong vùng nhìn (Viewport), xén viền tự nhiên qua cv2.clipLine,
+        không dính mép viền, Quiver Velocity Arrows, và Vết quỹ đạo rơi của đầu (Motion Trail).
+      - Panel phải (560x672):
+        + Bảng chỉ số Telemetry HUD thời gian thực (Vận tốc gục đầu, Gia tốc, Tỷ lệ IOD, Số node nhìn thấy).
+        + Hai đồ thị sóng thời gian thực lớn Vy(t) và Ay(t) có vạch con trỏ chạy đồng bộ theo frame t.
+    """
+    canvas = np.full((720, 1280, 3), (22, 26, 32), dtype=np.uint8)
+
+    # 1. Thanh tiêu đề Header
+    cv2.rectangle(canvas, (0, 0), (1280, 48), (14, 17, 22), -1)
+    cv2.putText(canvas, "DRIVER GUARDIAN | KINEMATIC FEATURE EXTRACTOR SIMULATION", (20, 32),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 0), 2, cv2.LINE_AA)
+    top_info = f"Clip: {video_id} | Frame {t + 1}/{T} | State: {label_str} | Zoom: {zoom_scale:.0f}px"
+    cv2.putText(canvas, top_info, (740, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.52, label_color, 2, cv2.LINE_AA)
+    cv2.line(canvas, (0, 48), (1280, 48), (45, 55, 70), 1)
+
+    # Đường phân tách 2 Panel (Left 720, Right 560)
+    cv2.line(canvas, (720, 48), (720, 720), (45, 55, 70), 1)
+
+    # 2. PANEL TRÁI: Hệ tọa độ Cục bộ Tâm mũi (0,0) & IOD = 1.0 (Phóng to)
+    vx1, vy1, vx2, vy2 = 15, 55, 705, 705
+    viewport_rect = (vx1, vy1, vx2 - vx1, vy2 - vy1)  # (15, 55, 690, 650)
+    cx, cy = 360, 380
+    S = float(zoom_scale)
+
+    cv2.putText(canvas, "LOCAL NOSE-CENTERED SPACE (0,0) & IOD = 1.0 (ZOOMED VIEW)", (25, 78),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.48, (130, 160, 190), 1, cv2.LINE_AA)
+
+    # Vẽ trục tọa độ chữ thập xén trong Viewport
+    cv2.line(canvas, (vx1, cy), (vx2, cy), (38, 48, 60), 1, cv2.LINE_AA)
+    cv2.line(canvas, (cx, vy1), (cx, vy2), (38, 48, 60), 1, cv2.LINE_AA)
+
+    # Vòng tròn bán kính tham chiếu IOD = 1.0 (R = S) và IOD = 0.5
+    cv2.circle(canvas, (cx, cy), int(S), (32, 40, 52), 1, cv2.LINE_AA)
+    cv2.circle(canvas, (cx, cy), int(S * 0.5), (28, 35, 45), 1, cv2.LINE_AA)
+    if cx + int(S) - 65 < vx2:
+        cv2.putText(canvas, "R=1.0 IOD", (cx + int(S) - 65, cy - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (70, 90, 110), 1)
+    if cx + int(S * 0.5) - 40 < vx2:
+        cv2.putText(canvas, "R=0.5", (cx + int(S * 0.5) - 40, cy - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (60, 80, 100), 1)
+
+    # Tọa độ gốc tâm mũi (0,0)
+    cv2.circle(canvas, (cx, cy), 6, (0, 255, 255), -1, cv2.LINE_AA)
+    cv2.circle(canvas, (cx, cy), 11, (0, 200, 255), 1, cv2.LINE_AA)
+    cv2.putText(canvas, "Nose (0,0)", (cx + 15, cy - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
+
+    num_visible = 0
+    if is_missing:
+        cv2.putText(canvas, "[CANH BAO: MAT MAT / HEAD TURNED]", (120, cy - 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 0, 255), 2, cv2.LINE_AA)
+        cv2.putText(canvas, "C_kinematic = 1.0 (Fallback to d^T)", (165, cy + 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.58, (0, 165, 255), 1, cv2.LINE_AA)
+    else:
+        # Tính tọa độ pixel chưa xén cho tất cả 68 điểm mốc
+        pts_raw = []
+        for i in range(68):
+            px = int(round(cx + pos_t[i, 0] * S))
+            py = int(round(cy + pos_t[i, 1] * S))
+            pts_raw.append((px, py))
+
+        # 1. Vẽ các đường nối giải phẫu (Anatomical Mesh) được xén bằng cv2.clipLine
+        for start, end, is_closed, color in KINEMATIC_REGIONS:
+            pts_region = pts_raw[start:end]
+            n_pts = len(pts_region)
+            for j in range(n_pts - 1):
+                ret, c1, c2 = cv2.clipLine(viewport_rect, pts_region[j], pts_region[j + 1])
+                if ret:
+                    cv2.line(canvas, c1, c2, color, 2, cv2.LINE_AA)
+            if is_closed and n_pts > 2:
+                ret, c1, c2 = cv2.clipLine(viewport_rect, pts_region[-1], pts_region[0])
+                if ret:
+                    cv2.line(canvas, c1, c2, color, 2, cv2.LINE_AA)
+
+        # 2. Vẽ đường IOD giữa 2 mắt (36 <-> 45) có xén biên
+        ret, c1, c2 = cv2.clipLine(viewport_rect, pts_raw[36], pts_raw[45])
+        if ret:
+            cv2.line(canvas, c1, c2, (255, 255, 0), 1, cv2.LINE_AA)
+            iod_mid = ((c1[0] + c2[0]) // 2 - 25, (c1[1] + c2[1]) // 2 - 8)
+            cv2.putText(canvas, "IOD=1.0", iod_mid, cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 0), 1, cv2.LINE_AA)
+
+        # 3. Vẽ các chấm điểm mốc: CHỈ vẽ nếu nằm hoàn toàn TRONG vùng nhìn (không dính mép)
+        for i in range(68):
+            px, py = pts_raw[i]
+            if vx1 <= px <= vx2 and vy1 <= py <= vy2:
+                cv2.circle(canvas, (px, py), 3, (0, 255, 120), -1, cv2.LINE_AA)
+                num_visible += 1
+
+        # 4. Vẽ Quiver Velocity Arrows cho các điểm mốc (chỉ vẽ từ các điểm trong Viewport)
+        S_v = 40.0  # Hệ số khuếch đại vector vận tốc
+        for i in range(68):
+            sp = pts_raw[i]
+            if vx1 <= sp[0] <= vx2 and vy1 <= sp[1] <= vy2:
+                vx = vel_t[i, 0] * S_v
+                vy = vel_t[i, 1] * S_v
+                v_mag = float(np.hypot(vx, vy))
+                if v_mag > 2.0:
+                    ep = (int(round(sp[0] + vx)), int(round(sp[1] + vy)))
+                    ret, c1, c2 = cv2.clipLine(viewport_rect, sp, ep)
+                    if ret:
+                        arr_c = (0, 0, 255) if v_mag > 15 else ((0, 165, 255) if v_mag > 7 else (0, 255, 255))
+                        cv2.arrowedLine(canvas, c1, c2, arr_c, 1, tipLength=0.35, line_type=cv2.LINE_AA)
+
+        # 5. Làm nổi bật Vector vận tốc gục đầu của Tâm Mũi (Point 30)
+        nvx = float(vel_t[30, 0]) * S_v * 1.8
+        nvy = float(vel_t[30, 1]) * S_v * 1.8
+        n_mag = float(np.hypot(nvx, nvy))
+        if n_mag > 1.5:
+            nep = (int(round(cx + nvx)), int(round(cy + nvy)))
+            ret, c1, c2 = cv2.clipLine(viewport_rect, (cx, cy), nep)
+            if ret:
+                cv2.arrowedLine(canvas, c1, c2, (0, 69, 255), 3, tipLength=0.25, line_type=cv2.LINE_AA)
+                cv2.putText(canvas, f"V_head ({vel_t[30, 0]:+.2f}, {vel_t[30, 1]:+.2f})",
+                            (c2[0] + 8, c2[1] + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 69, 255), 1, cv2.LINE_AA)
+
+        # 6. Vẽ vết quỹ đạo di chuyển của đầu (Motion Trail) qua các frame trước
+        if raw_landmarks is not None and len(raw_landmarks) > 0 and raw_iod > 1.0:
+            trail_pts = []
+            for k in range(max(0, t - 10), t + 1):
+                rdx = (raw_landmarks[k, 30, 0] - raw_landmarks[t, 30, 0]) * target_w / max(1.0, raw_iod)
+                rdy = (raw_landmarks[k, 30, 1] - raw_landmarks[t, 30, 1]) * target_h / max(1.0, raw_iod)
+                tx = int(round(cx + rdx * S))
+                ty = int(round(cy + rdy * S))
+                trail_pts.append((tx, ty))
+            for k in range(len(trail_pts) - 1):
+                ret, c1, c2 = cv2.clipLine(viewport_rect, trail_pts[k], trail_pts[k + 1])
+                if ret:
+                    alpha = int(90 + (k / max(1, len(trail_pts) - 1)) * 165)
+                    cv2.line(canvas, c1, c2, (0, alpha, 255), 2, cv2.LINE_AA)
+
+    # Khung viền mỏng quanh Viewport
+    cv2.rectangle(canvas, (vx1, vy1), (vx2, vy2), (45, 55, 70), 1)
+
+    # 3. PANEL PHẢI: Telemetry HUD & Real-time Waveform Graphs
+    # 3.1 Bảng Telemetry HUD
+    hud_x1, hud_x2, hud_y1, hud_y2 = 740, 1260, 60, 225
+    cv2.rectangle(canvas, (hud_x1, hud_y1), (hud_x2, hud_y2), (16, 20, 26), -1)
+    cv2.rectangle(canvas, (hud_x1, hud_y1), (hud_x2, hud_y2), (40, 50, 65), 1)
+
+    cv2.putText(canvas, "REAL-TIME KINEMATIC TELEMETRY", (hud_x1 + 18, hud_y1 + 25),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 0), 1, cv2.LINE_AA)
+
+    nvx_val = float(vel_t[30, 0])
+    nvy_val = float(vel_t[30, 1])
+    nv_mag_val = float(np.hypot(nvx_val, nvy_val))
+    nax_val = float(acc_t[30, 0])
+    nay_val = float(acc_t[30, 1])
+    na_mag_val = float(np.hypot(nax_val, nay_val))
+
+    cv2.putText(canvas, f"Head Velocity (Nose)    : |V| = {nv_mag_val:.4f}  [Vx: {nvx_val:+.4f}, Vy: {nvy_val:+.4f}]",
+                (hud_x1 + 18, hud_y1 + 54), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (220, 220, 220), 1, cv2.LINE_AA)
+    cv2.putText(canvas, f"Head Acceleration       : |A| = {na_mag_val:.4f}  [Ax: {nax_val:+.4f}, Ay: {nay_val:+.4f}]",
+                (hud_x1 + 18, hud_y1 + 80), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (220, 220, 220), 1, cv2.LINE_AA)
+    cv2.putText(canvas, f"Inter-Ocular Distance   : Raw = {raw_iod:.1f} px  ->  Normalized IOD = 1.000",
+                (hud_x1 + 18, hud_y1 + 106), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (220, 220, 220), 1, cv2.LINE_AA)
+    cv2.putText(canvas, f"Active Landmark Nodes   : {num_visible}/68 Visible in Viewport (Auto-Clipped)",
+                (hud_x1 + 18, hud_y1 + 132), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (0, 255, 255), 1, cv2.LINE_AA)
+
+    # Đánh giá trạng thái động học
+    if nvy_val > 0.04:
+        motion_state = "MOTION: HEAD DROPPING DOWNWARD (NGUY CO NGU GAT)"
+        motion_c = (0, 0, 255)
+    elif nvy_val < -0.04:
+        motion_state = "MOTION: HEAD RECOVERING UPWARD (NGANG DAU LEN)"
+        motion_c = (0, 255, 255)
+    else:
+        motion_state = "MOTION: HEAD POSTURE STABLE (TU THE ON DINH)"
+        motion_c = (0, 255, 0)
+    cv2.putText(canvas, motion_state, (hud_x1 + 18, hud_y1 + 158),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.46, motion_c, 1, cv2.LINE_AA)
+
+    # 3.2 Đồ thị sóng thời gian thực Vy(t)
+    g1_x1, g1_x2, g1_y1, g1_y2 = 740, 1260, 250, 465
+    cv2.rectangle(canvas, (g1_x1, g1_y1), (g1_x2, g1_y2), (12, 14, 18), -1)
+    cv2.rectangle(canvas, (g1_x1, g1_y1), (g1_x2, g1_y2), (40, 50, 65), 1)
+    cv2.putText(canvas, "Vertical Velocity Vy(t) [Guc dau / Roi dau]", (g1_x1 + 15, g1_y1 - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
+
+    # Đường trục 0
+    zy1 = (g1_y1 + g1_y2) // 2
+    cv2.line(canvas, (g1_x1, zy1), (g1_x2, zy1), (35, 45, 60), 1, cv2.LINE_AA)
+
+    # Vẽ đường cong Vy(t)
+    vy_max = 0.15
+    pts_vy = []
+    for i in range(T):
+        gx = int(g1_x1 + (i / max(1, T - 1)) * (g1_x2 - g1_x1))
+        val = np.clip(float(vel_all[i, 30, 1]), -vy_max, vy_max)
+        gy = int(zy1 - (val / vy_max) * ((g1_y2 - g1_y1) // 2 - 15))
+        pts_vy.append((gx, gy))
+
+    for i in range(len(pts_vy) - 1):
+        cv2.line(canvas, pts_vy[i], pts_vy[i + 1], (0, 255, 255), 2, cv2.LINE_AA)
+    for p in pts_vy:
+        cv2.circle(canvas, p, 3, (0, 200, 200), -1, cv2.LINE_AA)
+
+    # Vạch con trỏ đỏ tại frame t hiện tại
+    cur_x_t = int(g1_x1 + (t / max(1, T - 1)) * (g1_x2 - g1_x1))
+    cv2.line(canvas, (cur_x_t, g1_y1), (cur_x_t, g1_y2), (0, 0, 255), 2, cv2.LINE_AA)
+    cv2.putText(canvas, f"F{t+1}", (cur_x_t - 12, g1_y1 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (0, 0, 255), 1, cv2.LINE_AA)
+
+    # 3.3 Đồ thị sóng thời gian thực Ay(t)
+    g2_x1, g2_x2, g2_y1, g2_y2 = 740, 1260, 490, 705
+    cv2.rectangle(canvas, (g2_x1, g2_y1), (g2_x2, g2_y2), (12, 14, 18), -1)
+    cv2.rectangle(canvas, (g2_x1, g2_y1), (g2_x2, g2_y2), (40, 50, 65), 1)
+    cv2.putText(canvas, "Vertical Acceleration Ay(t) [Gia toc xung luc]", (g2_x1 + 15, g2_y1 - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
+
+    zy2 = (g2_y1 + g2_y2) // 2
+    cv2.line(canvas, (g2_x1, zy2), (g2_x2, zy2), (35, 45, 60), 1, cv2.LINE_AA)
+
+    ay_max = 0.15
+    pts_ay = []
+    for i in range(T):
+        gx = int(g2_x1 + (i / max(1, T - 1)) * (g2_x2 - g2_x1))
+        val = np.clip(float(acc_all[i, 30, 1]), -ay_max, ay_max)
+        gy = int(zy2 - (val / ay_max) * ((g2_y2 - g2_y1) // 2 - 15))
+        pts_ay.append((gx, gy))
+
+    for i in range(len(pts_ay) - 1):
+        cv2.line(canvas, pts_ay[i], pts_ay[i + 1], (255, 100, 220), 2, cv2.LINE_AA)
+    for p in pts_ay:
+        cv2.circle(canvas, p, 3, (200, 80, 180), -1, cv2.LINE_AA)
+
+    cur_x_t2 = int(g2_x1 + (t / max(1, T - 1)) * (g2_x2 - g2_x1))
+    cv2.line(canvas, (cur_x_t2, g2_y1), (cur_x_t2, g2_y2), (0, 0, 255), 2, cv2.LINE_AA)
+    cv2.putText(canvas, f"F{t+1}", (cur_x_t2 - 12, g2_y1 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (0, 0, 255), 1, cv2.LINE_AA)
+
+    # Hướng dẫn phím tắt ở góc dưới
+    cv2.putText(canvas, "[Space]: Tam dung | [a/d]: Lui/Tien frame | [+/-]: Zoom In/Out | [0]: Reset Zoom | [r]: Phat lai | [q]: Thoat",
+                (25, 715), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (130, 150, 170), 1, cv2.LINE_AA)
+
+    return canvas
+
+
+def visualize_kinematic_simulation(
+        landmarks: torch.Tensor,
+        label: Union[torch.Tensor, int] = 0,
+        video_id: str = "sample",
+        delay_ms: int = 100,
+        window_name: str = "Driver Guardian - KinematicFeatureExtractor Simulation",
+):
+    """
+    Hàm độc lập để hiển thị trực quan hóa mô phỏng KinematicFeatureExtractor từ tensor điểm mốc:
+      - Nhận vào landmarks [T, 68, 2] hoặc [1, T, 68, 2] hoặc [T, 68, 3].
+      - Không yêu cầu tệp video gốc hay ảnh khuôn mặt.
+    """
+    if landmarks.dim() == 4:
+        landmarks = landmarks.squeeze(0)
+    if landmarks.shape[-1] > 2:
+        landmarks = landmarks[..., :2]
+
+    T = landmarks.shape[0]
+    lms_np = landmarks.cpu().numpy()
+    lbl_val = int(label.item()) if isinstance(label, torch.Tensor) else int(label)
+    label_str = "DROWSY (1)" if lbl_val == 1 else "ALERT (0)"
+    label_color = (0, 0, 255) if lbl_val == 1 else (0, 255, 0)
+
+    from model import KinematicFeatureExtractor
+    kfe = KinematicFeatureExtractor()
+    lms_in = landmarks.unsqueeze(0).permute(0, 3, 1, 2).float()
+    kfe_out = kfe(lms_in)
+    pos_norm_all = kfe_out[0, :2].permute(1, 2, 0).cpu().numpy()
+    vel_norm_all = kfe_out[0, 2:4].permute(1, 2, 0).cpu().numpy()
+    acc_norm_all = kfe_out[0, 4:6].permute(1, 2, 0).cpu().numpy()
+
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_name, 1280, 720)
+
+    t = 0
+    paused = False
+    zoom_scale = 260.0
+    while True:
+        is_missing = np.allclose(lms_np[t], 1.0)
+        p_left = lms_np[t, 36, :2] * np.array([640, 480])
+        p_right = lms_np[t, 45, :2] * np.array([640, 480])
+        raw_iod = float(np.linalg.norm(p_right - p_left)) if not is_missing else 0.0
+
+        canvas = render_kinematic_frame(
+            pos_t=pos_norm_all[t],
+            vel_t=vel_norm_all[t],
+            acc_t=acc_norm_all[t],
+            vel_all=vel_norm_all,
+            acc_all=acc_norm_all,
+            t=t,
+            T=T,
+            is_missing=is_missing,
+            video_id=video_id,
+            label_str=label_str,
+            label_color=label_color,
+            raw_iod=raw_iod,
+            raw_landmarks=lms_np,
+            target_w=640,
+            target_h=480,
+            zoom_scale=zoom_scale,
+        )
+        cv2.imshow(window_name, canvas)
+
+        if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
+            break
+
+        wait_time = 0 if paused else delay_ms
+        key = cv2.waitKey(wait_time) & 0xFF
+        if key in (27, ord('q'), ord('Q')):
+            break
+        elif key == 32:
+            paused = not paused
+        elif key in (ord('r'), ord('R')):
+            t = 0
+            continue
+        elif key in (ord('d'), ord('D'), 83):
+            t = (t + 1) % T
+            continue
+        elif key in (ord('a'), ord('A'), 81):
+            t = (t - 1 + T) % T
+            continue
+        elif key in (ord('+'), ord('=')):
+            zoom_scale = min(600.0, zoom_scale + 30.0)
+            continue
+        elif key in (ord('-'), ord('_')):
+            zoom_scale = max(100.0, zoom_scale - 30.0)
+            continue
+        elif key == ord('0'):
+            zoom_scale = 260.0
+            continue
+
+        if not paused:
+            t = (t + 1) % T
+
+    cv2.destroyAllWindows()
+
+
 def visualize_litefat_sample(
         face_frames: Optional[torch.Tensor],
         landmarks: torch.Tensor,
@@ -1296,6 +1663,8 @@ def visualize_litefat_sample(
         delay_ms: int = 120,
         window_name: str = "Driver Guardian - LiteFat Video Preview",
         grid_window_name: str = "Driver Guardian - All Cropped Face Frames (Grid)",
+        kinematic_window_name: str = "Driver Guardian - KinematicFeatureExtractor Simulation",
+        show_kinematic: bool = True,
 ):
     """
     Hiển thị trực quan toàn diện mẫu dữ liệu của LiteFat:
@@ -1305,6 +1674,8 @@ def visualize_litefat_sample(
          - Bên phải: Khung hình khuôn mặt đã được cắt và chuẩn hóa (224x224) cho MobileNetV3-Small (nếu có).
       2. Cửa sổ 2: Bảng lưới (Montage Grid 4x4) hiển thị đồng thời toàn bộ T khung hình khuôn mặt
          đã cắt trong chuỗi thời gian để dễ dàng soi xét từng vi biểu cảm (nếu có face_frames).
+      3. Cửa sổ 3: Mô phỏng không gian chuẩn hóa và trường vận tốc/gia tốc động học của lớp
+         KinematicFeatureExtractor (Tâm mũi, IOD=1.0, Quiver Arrows, Waveform Graphs).
     """
     T = len(raw_frames)
     lbl_val = int(label.item()) if isinstance(label, torch.Tensor) else int(label)
@@ -1343,15 +1714,34 @@ def visualize_litefat_sample(
         cv2.imshow(grid_window_name, grid_img)
         cv2.resizeWindow(grid_window_name, cols * cell_w, rows * cell_h)
 
-    # 3. Chuẩn bị cửa sổ phát video side-by-side
-    lms_np = landmarks.cpu().numpy()  # [T, 68, 3]
+    # 3. Chuẩn bị trích xuất đặc trưng động học KinematicFeatureExtractor (nếu show_kinematic=True)
+    has_kinematics = False
+    pos_norm_all, vel_norm_all, acc_norm_all = None, None, None
+    if show_kinematic and landmarks is not None and len(landmarks) > 0:
+        try:
+            from model import KinematicFeatureExtractor
+            kfe = KinematicFeatureExtractor()
+            lms_in = landmarks.unsqueeze(0).permute(0, 3, 1, 2).float()
+            kfe_out = kfe(lms_in)
+            pos_norm_all = kfe_out[0, :2].permute(1, 2, 0).cpu().numpy()
+            vel_norm_all = kfe_out[0, 2:4].permute(1, 2, 0).cpu().numpy()
+            acc_norm_all = kfe_out[0, 4:6].permute(1, 2, 0).cpu().numpy()
+            has_kinematics = True
+            cv2.namedWindow(kinematic_window_name, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(kinematic_window_name, 1280, 720)
+        except Exception as e:
+            logger.warning(f"Không thể khởi tạo KinematicFeatureExtractor cho trực quan hóa: {e}")
+
+    # 4. Chuẩn bị cửa sổ phát video side-by-side
+    lms_np = landmarks.cpu().numpy()  # [T, 68, 2]
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
 
     print(f"\n[Preview] Đang phát mẫu video: {video_id} ({T} frames | Trạng thái: {label_str})")
-    print(">>> Phím điều khiển: [Space] Tạm dừng/Tiếp tục | [a/d] Lùi/Tiến frame | [r] Phát lại | [q/ESC] Thoát <<<")
+    print(">>> Phím điều khiển: [Space] Tạm dừng/Tiếp tục | [a/d] Lùi/Tiến frame | [+/-] Zoom In/Out | [0] Reset Zoom | [r] Phát lại | [q/ESC] Thoát <<<")
 
     t = 0
     paused = False
+    zoom_scale = 260.0
 
     while True:
         left_img = raw_frames[t].copy()
@@ -1359,8 +1749,7 @@ def visualize_litefat_sample(
 
         # Lấy BBox và Landmarks của frame t
         bbox = bboxes_list[t] if t < len(bboxes_list) else None
-        conf = float(lms_np[t, 0, 2])
-        is_missing = np.allclose(lms_np[t], 1.0) or (conf < 1e-4)
+        is_missing = np.allclose(lms_np[t], 1.0)
 
         if not is_missing:
             pts_px = lms_np[t, :, :2].copy()
@@ -1374,13 +1763,14 @@ def visualize_litefat_sample(
                 else:
                     bbox_arr = np.asarray(bbox, dtype=np.float32)
 
+            bbox_score = float(bbox_arr[4]) if (bbox_arr is not None and len(bbox_arr) >= 5) else 1.0
             if bbox_arr is not None and len(bbox_arr) >= 5 and float(bbox_arr[4]) > 0:
                 bboxes_to_draw = np.array([bbox_arr[:5]], dtype=np.float32)
             else:
                 # Tự tính BBox bao quanh điểm mốc nếu bbox gốc bị thiếu
                 lx1, ly1 = np.min(pts_px[:, 0]), np.min(pts_px[:, 1])
                 lx2, ly2 = np.max(pts_px[:, 0]), np.max(pts_px[:, 1])
-                bboxes_to_draw = np.array([[lx1, ly1, lx2, ly2, conf]], dtype=np.float32)
+                bboxes_to_draw = np.array([[lx1, ly1, lx2, ly2, bbox_score]], dtype=np.float32)
 
             draw_68_landmarks_custom(
                 left_img,
@@ -1426,13 +1816,43 @@ def visualize_litefat_sample(
         cv2.putText(combined, top_bar, (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 3, cv2.LINE_AA)
         cv2.putText(combined, top_bar, (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, label_color, 2, cv2.LINE_AA)
 
-        guide_bar = "[Space]: Pause/Resume | [a/d]: Prev/Next | [r]: Replay | [q]: Thoat"
+        guide_bar = "[Space]: Pause/Resume | [a/d]: Prev/Next | [+/-]: Zoom | [0]: Reset Zoom | [r]: Replay | [q]: Thoat"
         cv2.putText(combined, guide_bar, (15, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 3, cv2.LINE_AA)
         cv2.putText(combined, guide_bar, (15, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 0), 1, cv2.LINE_AA)
 
         cv2.imshow(window_name, combined)
 
-        if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
+        # Hiển thị cửa sổ mô phỏng KinematicFeatureExtractor (nếu show_kinematic=True)
+        if has_kinematics and pos_norm_all is not None:
+            raw_iod_val = 0.0
+            if not is_missing:
+                p_left = lms_np[t, 36, :2] * np.array([target_w, target_h])
+                p_right = lms_np[t, 45, :2] * np.array([target_w, target_h])
+                raw_iod_val = float(np.linalg.norm(p_right - p_left))
+
+            kin_canvas = render_kinematic_frame(
+                pos_t=pos_norm_all[t],
+                vel_t=vel_norm_all[t],
+                acc_t=acc_norm_all[t],
+                vel_all=vel_norm_all,
+                acc_all=acc_norm_all,
+                t=t,
+                T=T,
+                is_missing=is_missing,
+                video_id=video_id,
+                label_str=label_str,
+                label_color=label_color,
+                raw_iod=raw_iod_val,
+                raw_landmarks=lms_np,
+                target_w=target_w,
+                target_h=target_h,
+                zoom_scale=zoom_scale,
+            )
+            cv2.imshow(kinematic_window_name, kin_canvas)
+
+        if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1 or (
+                has_kinematics and cv2.getWindowProperty(kinematic_window_name, cv2.WND_PROP_VISIBLE) < 1
+        ):
             break
 
         wait_time = 0 if paused else delay_ms
@@ -1451,6 +1871,15 @@ def visualize_litefat_sample(
             continue
         elif key in (ord('a'), ord('A'), 81):
             t = (t - 1 + T) % T
+            continue
+        elif key in (ord('+'), ord('=')):
+            zoom_scale = min(600.0, zoom_scale + 30.0)
+            continue
+        elif key in (ord('-'), ord('_')):
+            zoom_scale = max(100.0, zoom_scale - 30.0)
+            continue
+        elif key == ord('0'):
+            zoom_scale = 260.0
             continue
 
         if not paused:
@@ -1478,7 +1907,7 @@ if __name__ == "__main__":
         dataset_dir=DATASET_DIR,
         use_cache=True,
         cache_dir=r"E:\LSTM\LiteFat\cache_pt",
-        split="val",
+        split="test",
         time_interval=0.05,
         window_sec=None,
         return_meta=True,
@@ -1488,7 +1917,7 @@ if __name__ == "__main__":
 
     if len(ds) > 0:
         # Lấy mẫu kiểm định
-        sample_idx = min(10, len(ds) - 1)
+        sample_idx = min(800, len(ds) - 1)
         face_frames, landmarks, label, meta, raw_frames = ds[sample_idx]
         T_actual = face_frames.shape[0]
         print(f"\n--- KẾT QUẢ TRÍCH XUẤT MẪU {sample_idx} ---")
@@ -1497,7 +1926,7 @@ if __name__ == "__main__":
         print(f"FPS thực tế         : {meta['fps']:.2f}")
         print(f"Tỷ lệ frame có mặt  : {meta['found_faces_ratio'] * 100:.1f}%")
         print(f"Kích thước face_frames: {face_frames.shape} (T={T_actual}, C=3, H=224, W=224)")
-        print(f"Kích thước landmarks  : {landmarks.shape}   (T={T_actual}, V=68, C=3)")
+        print(f"Kích thước landmarks  : {landmarks.shape}   (T={T_actual}, V=68, C=2)")
         print(f"Nhãn mẫu (Label)      : {label.item()} ({'Drowsy' if label.item() == 1 else 'Alert'})")
         print(">>> Xác nhận hình dạng Tensor đầu vào hoàn toàn chính xác! <<<")
 
@@ -1511,7 +1940,7 @@ if __name__ == "__main__":
         criterion = LiteFatLoss()
 
         batch_frames = face_frames.unsqueeze(0).to(device)  # [1, T, 3, 224, 224]
-        batch_landmarks = landmarks.unsqueeze(0).to(device)  # [1, T, 68, 3]
+        batch_landmarks = landmarks.unsqueeze(0).to(device)  # [1, T, 68, 2]
         batch_labels = label.unsqueeze(0).to(device)  # [1]
 
         model.eval()

@@ -666,36 +666,23 @@ class LiteFat(nn.Module):
 
     def forward(
             self,
-            input1: torch.Tensor,
-            input2: Optional[torch.Tensor] = None,
+            video_frames: Optional[torch.Tensor] = None,
+            landmarks: Optional[torch.Tensor] = None,
             lengths: Optional[torch.Tensor] = None,
             mask: Optional[torch.Tensor] = None,
             return_clip_logits: bool = True,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
-        Hỗ trợ gọi linh hoạt theo 2 cú pháp:
-          1. model(video_frames, landmarks, lengths=...) (Đa phương thức chuẩn)
-          2. model(landmarks, video_frames, lengths=...) (Tự nhận diện thứ tự tham số)
-          3. model(landmarks, lengths=...)              (Chỉ dùng Landmark)
-        """
-        video_frames = None
-        landmarks = None
+        Chuẩn hóa nạp duy nhất một kiểu:
+            model(video_frames=..., landmarks=..., lengths=..., return_clip_logits=...)
 
-        if input2 is None:
-            # Chỉ truyền 1 tensor: phải là landmarks [B, T, N, 2/3]
-            landmarks = input1
-            video_frames = None
-        else:
-            # Nhận 2 tensor: nhận diện dựa vào số chiều
-            if input1.dim() == 5:
-                video_frames = input1
-                landmarks = input2
-            elif input2.dim() == 5:
-                video_frames = input2
-                landmarks = input1
-            else:
-                video_frames = input1
-                landmarks = input2
+        - Khi video_frames is not None và video_frames.numel() > 0:
+            Trích xuất vector ngữ cảnh d [B, T, D] từ MobileNetV3 Context Encoder.
+        - Khi video_frames is None:
+            Chạy chế độ Fast Landmark-Only (d = None, chỉ sử dụng nhánh động học mốc mặt).
+        """
+        if landmarks is None:
+            raise ValueError("Tham số 'landmarks' [B, T, N, 2] bắt buộc phải được cung cấp!")
 
         d = None
         if video_frames is not None and video_frames.numel() > 0:

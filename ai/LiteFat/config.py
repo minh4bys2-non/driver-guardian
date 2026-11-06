@@ -67,7 +67,7 @@ class TrainConfig:
     # Bật/tắt nhánh MobileNetV3-Small trích xuất ngữ cảnh thị giác từ ảnh khuôn mặt.
     # True: Huấn luyện đa phương thức (Landmark + Face Crops).
     # False: Chỉ huấn luyện đồ thị từ Landmark (không cần giải mã video, siêu nhanh).
-    use_visual_context: bool = False
+    use_visual_context: bool = True
 
     # Kích thước ảnh khung hình đưa vào trích xuất điểm mốc letterbox (w, h)
     letterbox_size: Tuple[int, int] = (640, 480)
@@ -127,7 +127,7 @@ class TrainConfig:
     num_blocks: int = 3
     layers_per_block: int = 2
     kernel_size: int = 2
-    dropout: float = 0.3
+    dropout: float = 0.4
     pretrained_backbone: bool = True
 
     # Cặp chỉ số đỉnh giải phẫu dọc mắt (EAR) và dọc miệng (MAR) để tạo cạnh kề cơ sở A_prior
@@ -146,7 +146,7 @@ class TrainConfig:
     # =================================================================
     # 6. THAM SỐ HUẤN LUYỆN & TỐI ƯU HÓA (OPTIMIZATION)
     # =================================================================
-    epochs: int = 5
+    epochs: int = 10
     batch_size: int = 8
     num_workers: int = 0
     pin_memory: bool = True
@@ -165,7 +165,7 @@ class TrainConfig:
     freeze_backbone_epochs: int = 5
 
     # Số epoch làm nóng tốc độ học (Linear Warmup)
-    warmup_epochs: int = 3
+    warmup_epochs: int = 0
 
     # Giới hạn chuẩn đạo hàm để chống nổ gradient (Gradient Clipping)
     grad_clip: float = 1.0
@@ -173,6 +173,11 @@ class TrainConfig:
     # Sử dụng bộ nhớ hỗn hợp Automatic Mixed Precision (AMP float16)
     use_amp: bool = True
 
+    # Lưu lại checkpoint sau mỗi save_freq epoch
+    save_freq: int = 1
+
+    # Đường dẫn tới tệp checkpoint để tiếp tục huấn luyện (ví dụ: "checkpoints/LiteFat/epoch_03.pt" hoặc "checkpoints/LiteFat/last.pt").
+    resume: Optional[str] = r"checkpoints/LiteFat/best.pt"
     # =================================================================
     # 7. HÀM MẤT MÁT (LOSS CONFIGURATION)
     # =================================================================
@@ -185,8 +190,6 @@ class TrainConfig:
     # Hệ số làm mượt nhãn (Label Smoothing) chống overfitting
     label_smoothing: float = 0.1
 
-    # Lưu lại checkpoint sau mỗi save_freq epoch
-    save_freq: int = 5
 
     def to_dict(self) -> Dict[str, Any]:
         """Chuyển cấu hình thành từ điển (Dict)."""
@@ -204,4 +207,7 @@ class TrainConfig:
         """Nạp cấu hình từ file JSON."""
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return cls(**data)
+        import dataclasses
+        valid_fields = {f.name for f in dataclasses.fields(cls)}
+        filtered_data = {k: v for k, v in data.items() if k in valid_fields}
+        return cls(**filtered_data)

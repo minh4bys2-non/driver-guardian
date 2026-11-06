@@ -17,6 +17,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
 
 from config import TrainConfig
 from dataset import build_litefat_dataloaders
@@ -141,9 +142,14 @@ class LiteFatTrainer:
         self.scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
 
         # Các biến theo dõi thực nghiệm
+        self.start_epoch = 1
         self.best_val_f1 = -1.0
         self.best_epoch = -1
         self.history: List[Dict[str, Any]] = []
+
+        # Tự động khôi phục nếu cfg.resume được cấu hình
+        if self.cfg.resume:
+            self.load_checkpoint(self.cfg.resume)
 
     def _build_optimizer(self) -> torch.optim.Optimizer:
         """Thiết lập tốc độ học riêng biệt (Differential LR) cho Backbone và Graph/Head."""
@@ -151,8 +157,6 @@ class LiteFatTrainer:
         graph_params = []
 
         for name, param in self.model.named_parameters():
-            if not param.requires_grad:
-                continue
             if "context_encoder.features" in name:
                 backbone_params.append(param)
             else:
@@ -161,13 +165,111 @@ class LiteFatTrainer:
         param_groups = [
             {"params": graph_params, "lr": self.cfg.lr, "weight_decay": self.cfg.weight_decay},
         ]
-        if backbone_params:
+        if backbone_params and self.cfg.use_visual_context:
             param_groups.append(
                 {"params": backbone_params, "lr": self.cfg.backbone_lr, "weight_decay": self.cfg.weight_decay}
             )
 
         optimizer = torch.optim.AdamW(param_groups)
         return optimizer
+
+    def _safe_load_optimizer(self, opt_state_dict: Dict[str, Any]) -> None:
+        """Nạp an toàn optimizer state dict, xử lý tương thích khi số lượng param_groups khác nhau."""
+        saved_groups = len(opt_state_dict.get("param_groups", []))
+        curr_groups = len(self.optimizer.param_groups)
+
+        if saved_groups == curr_groups:
+            self.optimizer.load_state_dict(opt_state_dict)
+        elif saved_groups == 1 and curr_groups == 2:
+            self.logger.warning(
+                "Checkpoint optimizer state chỉ có 1 nhóm tham số (Graph/Head). "
+                "Tự động ánh xạ nhóm 0 và khởi tạo nhóm Backbone ở trạng thái mới."
+            )
+            adapted_dict = {
+                "state": opt_state_dict.get("state", {}),
+                "param_groups": [
+                    opt_state_dict["param_groups"][0],
+                    self.optimizer.state_dict()["param_groups"][1],
+                ],
+            }
+            self.optimizer.load_state_dict(adapted_dict)
+        else:
+            self.logger.warning(
+                f"Không tương thích số lượng param_groups (checkpoint: {saved_groups}, hiện tại: {curr_groups}). "
+                "Bỏ qua khôi phục optimizer state."
+            )
+
+    def load_checkpoint(self, checkpoint_path: str | Path) -> None:
+        """Nạp toàn bộ trạng thái từ tệp checkpoint để tiếp tục huấn luyện."""
+        ckpt_path = Path(checkpoint_path)
+        if not ckpt_path.is_file():
+            alt_path = self.save_dir / checkpoint_path
+            if alt_path.is_file():
+                ckpt_path = alt_path
+            else:
+                available_ckpts = list(self.save_dir.glob("*.pt"))
+                available_names = [c.name for c in available_ckpts]
+                raise FileNotFoundError(
+                    f"Không tìm thấy tệp checkpoint tại '{checkpoint_path}' hoặc '{alt_path}'. "
+                    f"Các checkpoint hiện có trong {self.save_dir}: {available_names}"
+                )
+
+        self.logger.info(f"Đang nạp checkpoint để tiếp tục huấn luyện từ: {ckpt_path}")
+        checkpoint = torch.load(ckpt_path, map_location=self.device, weights_only=False)
+
+        # 1. Khôi phục trọng số mô hình
+        if "model_state_dict" in checkpoint:
+            self.model.load_state_dict(checkpoint["model_state_dict"])
+        else:
+            self.logger.warning("Checkpoint không chứa 'model_state_dict'!")
+
+        # 2. Khôi phục Optimizer & Scheduler & GradScaler
+        if "optimizer_state_dict" in checkpoint:
+            self._safe_load_optimizer(checkpoint["optimizer_state_dict"])
+        if "scheduler_state_dict" in checkpoint:
+            self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        if "scaler_state_dict" in checkpoint and self.scaler.is_enabled():
+            self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
+
+        # 3. Khôi phục Epochs & Metrics
+        ckpt_epoch = checkpoint.get("epoch", 0)
+        self.start_epoch = ckpt_epoch + 1
+
+        if "best_epoch" in checkpoint and "best_val_f1" in checkpoint:
+            self.best_epoch = checkpoint["best_epoch"]
+            self.best_val_f1 = checkpoint["best_val_f1"]
+        else:
+            # Dự phòng từ best_metrics.json hoặc metrics của checkpoint
+            best_json_path = self.save_dir / "best_metrics.json"
+            if best_json_path.is_file():
+                try:
+                    with open(best_json_path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    if data.get("best_epoch", 0) <= ckpt_epoch:
+                        self.best_epoch = data["best_epoch"]
+                        self.best_val_f1 = data.get("metrics", {}).get("f1", -1.0)
+                except Exception:
+                    pass
+            if self.best_val_f1 < 0 and "val_metrics" in checkpoint:
+                self.best_val_f1 = checkpoint["val_metrics"].get("f1", -1.0)
+                self.best_epoch = ckpt_epoch
+
+        # 4. Đồng bộ trạng thái đóng/mở băng backbone theo start_epoch
+        if self.start_epoch <= self.cfg.freeze_backbone_epochs:
+            self.model.set_backbone_trainable(False)
+        else:
+            self.model.set_backbone_trainable(True, unfreeze_last_n_blocks=3)
+
+        self.logger.info("=" * 70)
+        self.logger.info(f"===> KHÔI PHỤC CHECKPOINT THÀNH CÔNG TỪ: {ckpt_path.name}")
+        self.logger.info(
+            f"===> Đã hoàn thành Epoch {ckpt_epoch}. "
+            f"Sẽ tiếp tục huấn luyện từ Epoch {self.start_epoch} đến Epoch {self.cfg.epochs}."
+        )
+        self.logger.info(
+            f"===> Kỷ lục Best Val F1 hiện tại: {self.best_val_f1:.4f} (tại Epoch {self.best_epoch})"
+        )
+        self.logger.info("=" * 70)
 
     def _build_scheduler(self) -> Any:
         """Thiết lập lịch trình học Cosine Annealing kèm Linear Warmup."""
@@ -199,8 +301,14 @@ class LiteFatTrainer:
         num_batches = len(self.train_loader)
 
         start_time = time.time()
+        pbar = tqdm(
+            self.train_loader,
+            desc=f"Epoch {epoch:02d}/{self.cfg.epochs:02d} [Train]",
+            dynamic_ncols=True,
+            leave=False,
+        )
 
-        for batch_idx, batch in enumerate(self.train_loader):
+        for batch_idx, batch in enumerate(pbar):
             # Nhận dạng các thành phần của batch từ collate_litefat
             if len(batch) == 4:
                 batch_frames, batch_landmarks, batch_labels, batch_lengths = batch
@@ -222,8 +330,8 @@ class LiteFatTrainer:
             # Chạy Forward Pass với AMP
             with torch.amp.autocast(device_type=self.device.type, enabled=self.scaler.is_enabled()):
                 frame_logits, clip_logits = self.model(
-                    input1=batch_frames,
-                    input2=batch_landmarks,
+                    video_frames=batch_frames,
+                    landmarks=batch_landmarks,
                     lengths=batch_lengths,
                     return_clip_logits=True,
                 )
@@ -250,6 +358,13 @@ class LiteFatTrainer:
             all_preds.extend(preds.tolist())
             all_targets.extend(targets.tolist())
 
+            current_lr = self.optimizer.param_groups[0]["lr"]
+            pbar.set_postfix({
+                "loss": f"{loss.item():.4f}",
+                "avg_loss": f"{total_loss / (batch_idx + 1):.4f}",
+                "lr": f"{current_lr:.2e}",
+            })
+
         elapsed = time.time() - start_time
         metrics = compute_metrics(np.array(all_targets), np.array(all_preds))
         metrics["loss"] = total_loss / max(1, num_batches)
@@ -258,7 +373,12 @@ class LiteFatTrainer:
         return metrics
 
     @torch.no_grad()
-    def _evaluate_epoch(self, dataloader: Any, split_name: str = "val") -> Dict[str, float]:
+    def _evaluate_epoch(
+            self,
+            dataloader: Any,
+            split_name: str = "val",
+            epoch: Optional[int] = None,
+    ) -> Dict[str, float]:
         """Đánh giá mô hình trên tập validation hoặc test."""
         self.model.eval()
         total_loss = 0.0
@@ -267,8 +387,19 @@ class LiteFatTrainer:
         num_batches = len(dataloader)
 
         start_time = time.time()
+        desc = (
+            f"Epoch {epoch:02d}/{self.cfg.epochs:02d} [{split_name.capitalize()}]"
+            if epoch is not None
+            else f"[{split_name.capitalize()}]"
+        )
+        pbar = tqdm(
+            dataloader,
+            desc=desc,
+            dynamic_ncols=True,
+            leave=False,
+        )
 
-        for batch in dataloader:
+        for batch_idx, batch in enumerate(pbar):
             if len(batch) == 4:
                 batch_frames, batch_landmarks, batch_labels, batch_lengths = batch
             elif len(batch) >= 5:
@@ -286,8 +417,8 @@ class LiteFatTrainer:
 
             with torch.amp.autocast(device_type=self.device.type, enabled=self.scaler.is_enabled()):
                 frame_logits, clip_logits = self.model(
-                    input1=batch_frames,
-                    input2=batch_landmarks,
+                    video_frames=batch_frames,
+                    landmarks=batch_landmarks,
                     lengths=batch_lengths,
                     return_clip_logits=True,
                 )
@@ -304,6 +435,11 @@ class LiteFatTrainer:
             all_preds.extend(preds.tolist())
             all_targets.extend(targets.tolist())
 
+            pbar.set_postfix({
+                "loss": f"{loss.item():.4f}",
+                "avg_loss": f"{total_loss / (batch_idx + 1):.4f}",
+            })
+
         elapsed = time.time() - start_time
         metrics = compute_metrics(np.array(all_targets), np.array(all_preds))
         metrics["loss"] = total_loss / max(1, num_batches)
@@ -313,21 +449,33 @@ class LiteFatTrainer:
 
     def train(self) -> None:
         """Vòng lặp huấn luyện chính qua toàn bộ các epoch."""
-        self.logger.info("\n>>> BẮT ĐẦU QUÁ TRÌNH HUẤN LUYỆN LITEFAT <<<")
+        if self.start_epoch > self.cfg.epochs:
+            self.logger.warning(
+                f"Checkpoint đã hoàn thành Epoch {self.start_epoch - 1}, trong khi cfg.epochs là {self.cfg.epochs}. "
+                f"Không có epoch mới để huấn luyện. Vui lòng tăng 'epochs' trong TrainConfig "
+                f"(ví dụ: epochs={self.start_epoch + 4}) để tiếp tục."
+            )
+            self.evaluate_test()
+            self.writer.close()
+            return
 
-        for epoch in range(1, self.cfg.epochs + 1):
+        self.logger.info("\n>>> BẮT ĐẦU QUÁ TRÌNH HUẤN LUYỆN LITEFAT <<<")
+        if self.start_epoch > 1:
+            self.logger.info(f"Tiếp tục huấn luyện từ Epoch {self.start_epoch:02d} đến {self.cfg.epochs:02d}")
+
+        for epoch in range(self.start_epoch, self.cfg.epochs + 1):
             train_metrics = self._train_epoch(epoch)
-            val_metrics = self._evaluate_epoch(self.val_loader, split_name="val")
+            val_metrics = self._evaluate_epoch(self.val_loader, split_name="val", epoch=epoch)
 
             self.scheduler.step()
             current_lr = self.optimizer.param_groups[0]["lr"]
 
             # Log chỉ số ra Console
             self.logger.info(
-                f"Epoch [{epoch:02d}/{self.cfg.epochs:02d}] "
-                f"Train Loss: {train_metrics['loss']:.4f} | Train Acc: {train_metrics['accuracy']*100:.2f}% | Train F1: {train_metrics['f1']:.4f} || "
-                f"Val Loss: {val_metrics['loss']:.4f} | Val Acc: {val_metrics['accuracy']*100:.2f}% | Val F1: {val_metrics['f1']:.4f} (Rec: {val_metrics['recall']*100:.1f}%) | "
-                f"LR: {current_lr:.2e} | Time: {train_metrics['time']:.1f}s"
+                f"Epoch [{epoch:02d}/{self.cfg.epochs:02d}] \n"
+                f"\t Train Loss: {train_metrics['loss']:.4f} | Train Acc: {train_metrics['accuracy']*100:.2f}% | Train F1: {train_metrics['f1']:.4f} |\n| "
+                f"\t Val Loss: {val_metrics['loss']:.4f} | Val Acc: {val_metrics['accuracy']*100:.2f}% | Val F1: {val_metrics['f1']:.4f} (Rec: {val_metrics['recall']*100:.1f}%) | \n"
+                f"\t LR: {current_lr:.2e} | Time: {train_metrics['time']:.1f}s"
             )
 
             # Ghi chỉ số vào TensorBoard
@@ -355,7 +503,10 @@ class LiteFatTrainer:
                 "optimizer_state_dict": self.optimizer.state_dict(),
                 "scheduler_state_dict": self.scheduler.state_dict(),
                 "scaler_state_dict": self.scaler.state_dict(),
+                "best_epoch": self.best_epoch,
+                "best_val_f1": self.best_val_f1,
                 "val_metrics": val_metrics,
+                "train_metrics": train_metrics,
                 "config": self.cfg.to_dict(),
             }
             atomic_save(checkpoint_payload, self.save_dir / "last.pt")
@@ -368,6 +519,8 @@ class LiteFatTrainer:
             if val_metrics["f1"] > self.best_val_f1:
                 self.best_val_f1 = val_metrics["f1"]
                 self.best_epoch = epoch
+                checkpoint_payload["best_epoch"] = self.best_epoch
+                checkpoint_payload["best_val_f1"] = self.best_val_f1
                 atomic_save(checkpoint_payload, self.save_dir / "best.pt")
                 with open(self.save_dir / "best_metrics.json", "w", encoding="utf-8") as f:
                     json.dump({"best_epoch": epoch, "metrics": val_metrics}, f, indent=2)

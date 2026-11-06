@@ -49,8 +49,8 @@ import torch.nn.functional as F
 import torchvision
 from torch.utils.data import DataLoader, Dataset
 
-# Import hàm letterbox chuẩn từ ultis.py
-from ultis import letterbox
+# Import hàm chuẩn hóa và tăng cường từ ultis.py
+from ultis import letterbox, _parse_size, compute_iou, crop_faces_from_boxes, augment_multimodal_clip
 
 # Import khởi tạo PIPNet & hàm vẽ điểm mốc từ pipnet_68_camera.py
 from pipnet_68_camera import init_pipnet_68_gpu, draw_68_landmarks_custom
@@ -63,78 +63,7 @@ if not logger.handlers:
     logger.setLevel(logging.INFO)
 
 
-def _parse_size(size: Optional[Union[int, Tuple[int, int], List[int]]]) -> Tuple[int, int]:
-    """
-    Chuẩn hóa kích thước về tuple (width, height).
-    """
-    if size is None:
-        return (640, 480)
-    if isinstance(size, int):
-        return (size, size)
-    if isinstance(size, (tuple, list)) and len(size) == 2:
-        return (int(size[0]), int(size[1]))
-    raise ValueError(f"Kích thước không hợp lệ: {size}. Phải là int hoặc tuple (w, h).")
-
-
-def compute_iou(box_a: np.ndarray, box_b: np.ndarray) -> float:
-    """
-    Tính Intersection over Union (IoU) giữa 2 hộp giới hạn [x1, y1, x2, y2].
-    """
-    xa = max(box_a[0], box_b[0])
-    ya = max(box_a[1], box_b[1])
-    xb = min(box_a[2], box_b[2])
-    yb = min(box_a[3], box_b[3])
-
-    inter = max(0.0, xb - xa) * max(0.0, yb - ya)
-    area_a = max(0.0, box_a[2] - box_a[0]) * max(0.0, box_a[3] - box_a[1])
-    area_b = max(0.0, box_b[2] - box_b[0]) * max(0.0, box_b[3] - box_b[1])
-    union = area_a + area_b - inter
-    if union <= 0.0:
-        return 0.0
-    return float(inter / union)
-
-
-def crop_faces_from_boxes(
-        frames: List[np.ndarray],
-        crop_boxes: Union[np.ndarray, torch.Tensor],
-        face_size: Tuple[int, int] = (224, 224),
-) -> torch.Tensor:
-    """
-    Cắt vùng khuôn mặt chuẩn hóa 224x224 cho nhánh MobileNetV3-Small từ crop_boxes:
-      - Nhận vào danh sách frames BGR (đã qua letterbox) và crop_boxes [T, 4] dạng [x1, y1, x2, y2].
-      - Resize về face_size (w, h), chuyển sang RGB [0, 1] và chuẩn hóa ImageNet mean/std.
-      - Trả về torch.Tensor [T, 3, crop_h, crop_w]. Hoàn toàn độc lập với GPU PIPNet extractor.
-    """
-    T = len(frames)
-    crop_w, crop_h = _parse_size(face_size)
-    if T == 0:
-        return torch.empty((0, 3, crop_h, crop_w), dtype=torch.float32)
-
-    if isinstance(crop_boxes, torch.Tensor):
-        crop_boxes = crop_boxes.detach().cpu().numpy()
-    crop_boxes = np.asarray(crop_boxes, dtype=np.int32)
-
-    face_crops = np.zeros((T, crop_h, crop_w, 3), dtype=np.uint8)
-
-    for t in range(T):
-        if t < len(crop_boxes):
-            x1, y1, x2, y2 = crop_boxes[t]
-        else:
-            x1, y1, x2, y2 = 0, 0, frames[t].shape[1], frames[t].shape[0]
-
-        crop = frames[t][y1:y2, x1:x2, :]  # BGR
-        if crop.size == 0 or crop.shape[0] < 2 or crop.shape[1] < 2:
-            crop = frames[t]
-
-        resized = cv2.resize(crop, (crop_w, crop_h), interpolation=cv2.INTER_LINEAR)
-        face_crops[t] = resized[:, :, ::-1]  # Chuyển BGR sang RGB
-
-    # Chuẩn hóa ImageNet vector hóa cho toàn bộ chuỗi T ảnh
-    face_tensor = torch.from_numpy(face_crops).permute(0, 3, 1, 2).float() / 255.0
-    norm_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
-    norm_std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
-    face_tensor = (face_tensor - norm_mean) / norm_std
-    return face_tensor
+# Các hàm _parse_size, compute_iou, crop_faces_from_boxes đã được tập trung trong ultis.py.
 
 
 # =====================================================================
@@ -729,6 +658,15 @@ class LiteFatDataset(Dataset):
             pipnet_backbone: str = "resnet18",
             nms_threshold: float = 0.3,
             box_smooth_alpha: float = 0.7,
+            selected_datasets: Optional[Union[List[str], str]] = None,
+            use_visual_context: bool = True,
+            augment_train: bool = True,
+            flip_prob: float = 0.5,
+            scale_jitter: float = 0.08,
+            shift_jitter: float = 0.05,
+            landmark_noise_std: float = 0.002,
+            color_jitter: float = 0.2,
+            spatial_dropout: float = 0.15,
     ):
         split = split.lower().strip()
         if split not in ("train", "val", "test"):
@@ -756,7 +694,30 @@ class LiteFatDataset(Dataset):
         self.return_raw_frames = bool(return_raw_frames)
         self.use_cache = bool(use_cache)
         self.cache_dir = Path(cache_dir) if cache_dir is not None else None
-        self.extract_crops_only = bool(extract_crops_only)
+
+        # Cấu hình bối cảnh thị giác (MobileNetV3) & Đa phương thức
+        self.use_visual_context = bool(use_visual_context)
+        self.extract_crops_only = bool(extract_crops_only) or (not self.use_visual_context)
+
+        # Cấu hình lọc bộ dữ liệu con
+        if selected_datasets is not None:
+            if isinstance(selected_datasets, str):
+                self.selected_datasets = [selected_datasets.lower()]
+            else:
+                self.selected_datasets = [str(s).lower() for s in selected_datasets if str(s).strip()]
+                if not self.selected_datasets or any(s in ("all", "*") for s in self.selected_datasets):
+                    self.selected_datasets = None
+        else:
+            self.selected_datasets = None
+
+        # Cấu hình tăng cường dữ liệu
+        self.augment_train = bool(augment_train)
+        self.flip_prob = float(flip_prob)
+        self.scale_jitter = float(scale_jitter)
+        self.shift_jitter = float(shift_jitter)
+        self.landmark_noise_std = float(landmark_noise_std)
+        self.color_jitter = float(color_jitter)
+        self.spatial_dropout = float(spatial_dropout)
 
         self.cache_meta: Dict[str, Any] = {}
         self.cached_data: Optional[Dict[str, Any]] = None
@@ -769,10 +730,12 @@ class LiteFatDataset(Dataset):
         self.samples = self._load_samples()
         if len(self.samples) == 0:
             if self.cached_data is not None and len(self.cached_data) > 0:
-                logger.info(f"[Cache] Tự động khởi tạo {len(self.cached_data)} mẫu từ file cache .pt.")
+                logger.info(f"[Cache] Tự động khởi tạo mẫu từ file cache .pt (selected_datasets={self.selected_datasets}).")
                 for k, it in self.cached_data.items():
                     m = it.get("meta", {})
                     rel_p = m.get("key", k)
+                    if not self._is_dataset_selected(rel_p, m.get("dataset")):
+                        continue
                     self.samples.append({
                         "key": rel_p,
                         "path": self.root / rel_p,
@@ -782,6 +745,7 @@ class LiteFatDataset(Dataset):
                         "frame_count": int(float(m.get("total_frames", 0))),
                         "duration_sec": float(m.get("duration_sec", 0.0)),
                     })
+                logger.info(f"[Cache] Số mẫu sau lọc dataset: {len(self.samples)}")
             else:
                 logger.warning(f"Không tìm thấy mẫu video nào trong {self.root} cho split='{self.split}'")
 
@@ -807,6 +771,15 @@ class LiteFatDataset(Dataset):
             )
         return self.extractor
 
+    def _is_dataset_selected(self, key: str, dataset_field: Optional[str] = None) -> bool:
+        """Kiểm tra xem mẫu có thuộc danh sách selected_datasets được chọn hay không."""
+        if self.selected_datasets is None:
+            return True
+        key_lower = key.lower()
+        if dataset_field and any(ds in dataset_field.lower() for ds in self.selected_datasets):
+            return True
+        return any(ds in key_lower for ds in self.selected_datasets)
+
     def _load_samples(self) -> List[Dict[str, Any]]:
         """Đọc danh sách mẫu video từ manifest CSV hoặc quét thư mục fallback."""
         manifest_path = self.root / self.manifest_filename
@@ -821,6 +794,8 @@ class LiteFatDataset(Dataset):
                         if not rel_path:
                             continue
                         norm_rel = Path(rel_path.replace("\\", "/")).as_posix()
+                        if not self._is_dataset_selected(norm_rel, row.get("dataset")):
+                            continue
                         full_path = self.root / norm_rel
                         samples.append({
                             "key": norm_rel,
@@ -837,8 +812,11 @@ class LiteFatDataset(Dataset):
                 split_folder = self.root / self.split / folder
                 if split_folder.is_dir():
                     for p in sorted(split_folder.glob("*.mp4")):
+                        rel_key = p.relative_to(self.root).as_posix()
+                        if not self._is_dataset_selected(rel_key):
+                            continue
                         samples.append({
-                            "key": p.relative_to(self.root).as_posix(),
+                            "key": rel_key,
                             "path": p,
                             "label": label,
                             "video_id": p.stem,
@@ -1046,6 +1024,22 @@ class LiteFatDataset(Dataset):
                 if not self.extract_crops_only and face_frames is None and crop_boxes is not None:
                     face_frames = crop_faces_from_boxes(raw_frames, crop_boxes, face_size=self.face_size)
 
+            if not self.use_visual_context:
+                face_frames = None
+
+            if self.split == "train" and self.augment_train:
+                face_frames, landmarks = augment_multimodal_clip(
+                    face_frames,
+                    landmarks,
+                    is_train=True,
+                    flip_prob=self.flip_prob,
+                    scale_jitter=self.scale_jitter,
+                    shift_jitter=self.shift_jitter,
+                    landmark_noise_std=self.landmark_noise_std,
+                    color_jitter=self.color_jitter,
+                    spatial_dropout=self.spatial_dropout,
+                )
+
             label = torch.tensor(sample["label"], dtype=torch.long)
 
             if found is not None:
@@ -1114,6 +1108,23 @@ class LiteFatDataset(Dataset):
             crop_faces=crop_faces,
             return_crop_boxes=True,
         )
+
+        if not self.use_visual_context:
+            face_frames = None
+
+        if self.split == "train" and self.augment_train:
+            face_frames, landmarks = augment_multimodal_clip(
+                face_frames,
+                landmarks,
+                is_train=True,
+                flip_prob=self.flip_prob,
+                scale_jitter=self.scale_jitter,
+                shift_jitter=self.shift_jitter,
+                landmark_noise_std=self.landmark_noise_std,
+                color_jitter=self.color_jitter,
+                spatial_dropout=self.spatial_dropout,
+            )
+
         label = torch.tensor(sample["label"], dtype=torch.long)
 
         # Chuẩn hóa BBoxes và Found thành Tensor để dễ lưu .pt và xử lý
@@ -1199,15 +1210,16 @@ def collate_litefat(batch: List[Tuple[Any, ...]]):
     batch_frames = torch.stack(padded_frames, dim=0) if has_face_frames else None  # [B, T, 3, 224, 224] hoặc None
     batch_landmarks = torch.stack(padded_landmarks, dim=0)  # [B, T, 68, 2]
     batch_labels = torch.stack(labels_list, dim=0)  # [B]
+    batch_lengths = torch.tensor(lengths, dtype=torch.long)  # [B]
 
     if num_elements >= 4:
         metas = [item[3] for item in batch]
         if num_elements == 5:
             raw_frames_list = [item[4] for item in batch]
-            return batch_frames, batch_landmarks, batch_labels, metas, raw_frames_list
-        return batch_frames, batch_landmarks, batch_labels, metas
+            return batch_frames, batch_landmarks, batch_labels, batch_lengths, metas, raw_frames_list
+        return batch_frames, batch_landmarks, batch_labels, batch_lengths, metas
 
-    return batch_frames, batch_landmarks, batch_labels
+    return batch_frames, batch_landmarks, batch_labels, batch_lengths
 
 
 def build_litefat_dataloaders(
@@ -1230,6 +1242,15 @@ def build_litefat_dataloaders(
         bbox_margin: float = 0.15,
         box_smooth_alpha: float = 0.7,
         extract_crops_only: bool = False,
+        selected_datasets: Optional[Union[List[str], str]] = None,
+        use_visual_context: bool = True,
+        augment_train: bool = True,
+        flip_prob: float = 0.5,
+        scale_jitter: float = 0.08,
+        shift_jitter: float = 0.05,
+        landmark_noise_std: float = 0.002,
+        color_jitter: float = 0.2,
+        spatial_dropout: float = 0.15,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """
     Khởi tạo nhanh bộ 3 DataLoader cho tập train, val, test của mô hình LiteFat theo cơ chế window_sec và time_interval.
@@ -1263,11 +1284,23 @@ def build_litefat_dataloaders(
         extractor=shared_extractor,
         device=device,
         extract_crops_only=extract_crops_only,
+        selected_datasets=selected_datasets,
+        use_visual_context=use_visual_context,
     )
 
-    train_ds = LiteFatDataset(split="train", **common_cfg)
-    val_ds = LiteFatDataset(split="val", **common_cfg)
-    test_ds = LiteFatDataset(split="test", **common_cfg)
+    train_ds = LiteFatDataset(
+        split="train",
+        augment_train=augment_train,
+        flip_prob=flip_prob,
+        scale_jitter=scale_jitter,
+        shift_jitter=shift_jitter,
+        landmark_noise_std=landmark_noise_std,
+        color_jitter=color_jitter,
+        spatial_dropout=spatial_dropout,
+        **common_cfg,
+    )
+    val_ds = LiteFatDataset(split="val", augment_train=False, **common_cfg)
+    test_ds = LiteFatDataset(split="test", augment_train=False, **common_cfg)
 
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=shuffle_train,
@@ -1917,7 +1950,7 @@ if __name__ == "__main__":
 
     if len(ds) > 0:
         # Lấy mẫu kiểm định
-        sample_idx = min(800, len(ds) - 1)
+        sample_idx = min(10, len(ds) - 1)
         face_frames, landmarks, label, meta, raw_frames = ds[sample_idx]
         T_actual = face_frames.shape[0]
         print(f"\n--- KẾT QUẢ TRÍCH XUẤT MẪU {sample_idx} ---")

@@ -1,18 +1,28 @@
+# =====================================================================
+# File: model.py
+# Dự án: Driver Guardian - Module LiteFat (IEEE/RSJ IROS 2025 Upgraded)
+# Tác vụ: Định nghĩa kiến trúc LiteFat v2 giải quyết triệt để sụp đổ
+#         đồ thị mốc mặt (Landmark Collapse) và hiện tượng học thuộc
+#         lòng khuôn mặt (Shortcut Identity Overfitting) của MobileNetV3.
+# =====================================================================
+from __future__ import annotations
+
+import math
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision.models import mobilenet_v3_small, MobileNet_V3_Small_Weights
-from typing import Optional, Tuple
-
+from torchvision.models import MobileNet_V3_Small_Weights, mobilenet_v3_small
 
 
 class KinematicFeatureExtractor(nn.Module):
     """
-    Khối tiền xử lý chuẩn hóa tọa độ 68 điểm mốc:
-    1. Đưa tọa độ tĩnh (x, y) về Hệ tọa độ Cục bộ Tâm mũi (điểm 30) & chia cho khoảng cách 2 mắt (36 <-> 45).
-    2. Tính Vận tốc (dx, dy) và Gia tốc (d2x, d2y) đã chuẩn hóa theo kích thước khuôn mặt
-       (giữ nguyên được quỹ đạo rơi của đầu khi tài xế ngủ gật).
-    Hỗ trợ temporal mask để triệt tiêu cú sốc số học tại biên zero-padding khi batch có độ dài thay đổi.
+    Khối tiền xử lý chuẩn hóa động học 68 điểm mốc khuôn mặt:
+    1. Đưa tọa độ tĩnh (x, y) về Hệ tọa độ Cục bộ Tâm mũi (điểm 30) & chia cho khoảng cách 2 mắt (IOD: 36 <-> 45).
+    2. Tính Vận tốc (dx, dy) và Gia tốc (d2x, d2y) chuẩn hóa theo IOD.
+    3. Chuẩn hóa phân phối theo từng kênh qua BatchNorm2d(6) để cân bằng biên độ giữa tọa độ và động lực học.
     """
 
     def __init__(
@@ -20,13 +30,16 @@ class KinematicFeatureExtractor(nn.Module):
             nose_idx: int = 30,
             left_eye_idx: int = 36,
             right_eye_idx: int = 45,
-            eps: float = 1e-6,
+            eps: float = 1e-2,
     ):
         super().__init__()
         self.nose_idx = nose_idx
         self.left_eye_idx = left_eye_idx
         self.right_eye_idx = right_eye_idx
         self.eps = eps
+
+        # Chuẩn hóa phân phối riêng cho 6 kênh [x, y, dx, dy, d2x, d2y]
+        self.channel_norm = nn.BatchNorm2d(6, affine=True)
 
     @staticmethod
     def build_temporal_mask(
@@ -36,75 +49,78 @@ class KinematicFeatureExtractor(nn.Module):
     ) -> torch.Tensor:
         """
         Tạo binary float mask kích thước (B, 1, T, 1) biểu diễn các frame hợp lệ (1.0) và frame đệm (0.0).
-        - Nếu lengths được truyền vào: tạo mask chính xác từ lengths.
-        - Nếu lengths is None: tự động nhận diện từ biên độ tọa độ (frame hợp lệ có tọa độ khác 0).
         """
-        B, _, T, _ = x.shape
+        B = x.size(0)
+        T = x.size(2) if x.dim() == 4 else x.size(1)
         device = x.device
         if lengths is not None:
             t_idx = torch.arange(T, device=device).unsqueeze(0)  # (1, T)
             mask = (t_idx < lengths.to(device).unsqueeze(1)).float()  # (B, T)
             return mask.view(B, 1, T, 1)
         else:
-            # Tự nhận diện frame hợp lệ (tổng tọa độ x, y khác 0)
-            frame_activity = x[:, :2].abs().sum(dim=(1, 3), keepdim=True)  # (B, 1, T, 1)
-            return (frame_activity > eps).float()
+            frame_activity = x[:, :2].abs().sum(dim=(1, 3), keepdim=True) if x.dim() == 4 and x.size(1) == 2 else x.abs().sum(dim=(-2, -1), keepdim=True)
+            return (frame_activity > eps).float().view(B, 1, T, 1)
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        Input : (B, 2, T, V=68) - Tọa độ pixel hoặc [0, 1] trong Hệ tọa độ Khung ảnh.
-        mask  : (B, 1, T, 1)    - Float mask (1.0 = valid, 0.0 = padded)
-        Output: (B, 6, T, V=68) - [x_norm, y_norm, dx_norm, dy_norm, d2x_norm, d2y_norm]
+        Input : (B, 2, T, V=68) - Tọa độ [0, 1] trong hệ tọa độ khung ảnh.
+        mask  : (B, 1, T, 1)    - Float mask (1.0 = valid, 0.0 = padded/missing).
+        Output: (B, 6, T, V=68) - [x_norm, y_norm, dx_norm, dy_norm, d2x_norm, d2y_norm].
         """
         if x.size(1) != 2:
             return x * mask if mask is not None else x
 
-        # 1. Tính khoảng cách giải phẫu chuẩn d_t (Inter-Ocular Distance giữa điểm 36 và 45)
-        # eye_dist shape: (B, 1, T, 1)
+        # 1. Tính khoảng cách giải phẫu chuẩn IOD (Inter-Ocular Distance giữa điểm 36 và 45)
         p_left_eye = x[:, :, :, self.left_eye_idx: self.left_eye_idx + 1]  # (B, 2, T, 1)
         p_right_eye = x[:, :, :, self.right_eye_idx: self.right_eye_idx + 1]  # (B, 2, T, 1)
         raw_iod = torch.norm(p_right_eye - p_left_eye, p=2, dim=1, keepdim=True)
-        # Tránh chia cho eps=1e-6 tại các frame pad gây spike số học khổng lồ
         iod_scale = raw_iod.clamp(min=self.eps)
 
         # 2. Chuẩn hóa tọa độ hình thái tĩnh theo Tâm mũi (điểm 30) và tỷ lệ IOD
         nose_pos = x[:, :, :, self.nose_idx: self.nose_idx + 1]  # (B, 2, T, 1)
         pos_norm = (x - nose_pos) / iod_scale  # (B, 2, T, V)
+        pos_norm = torch.clamp(pos_norm, min=-10.0, max=10.0)
 
         # 3. Tính Vận tốc (dx, dy) và Gia tốc (d2x, d2y) chuẩn hóa theo IOD
-        # (Tính diff trên x trước khi trừ mũi để giữ được vận tốc gật đầu của cả khuôn mặt)
         T = x.size(2)
         if T <= 1:
             vel_norm = torch.zeros_like(pos_norm)
             acc_norm = torch.zeros_like(pos_norm)
         else:
-            vel_raw = torch.diff(x, n=1, dim=2)
+            vel_raw = torch.diff(x, n=1, dim=2)  # (B, 2, T-1, V)
+            pair_valid = None
             if mask is not None:
-                # Triệt tiêu bước nhảy biên giữa frame hợp lệ cuối cùng và frame pad đầu tiên TRƯỚC khi replicate pad
                 pair_valid = mask[:, :, 1:, :] * mask[:, :, :-1, :]
                 vel_raw = vel_raw * pair_valid
-            vel_raw = F.pad(vel_raw, (0, 0, 1, 0), mode='replicate')
 
-            vel_norm = vel_raw / iod_scale  # (B, 2, T, V)
-            if mask is not None:
-                vel_norm = vel_norm * mask
+            vel_raw = F.pad(vel_raw, (0, 0, 1, 0), mode="constant", value=0.0)
+            vel_norm = vel_raw / iod_scale
+            vel_norm = torch.clamp(vel_norm, min=-10.0, max=10.0)
 
             acc_raw = torch.diff(vel_norm, n=1, dim=2)
-            if mask is not None:
-                acc_raw = acc_raw * pair_valid
-            acc_norm = F.pad(acc_raw, (0, 0, 1, 0), mode='replicate')  # (B, 2, T, V)
+            if mask is not None and pair_valid is not None:
+                triplet_valid = pair_valid[:, :, 1:, :] * pair_valid[:, :, :-1, :]
+                acc_mask = F.pad(triplet_valid, (0, 0, 1, 0), mode="constant", value=0.0)
+                acc_raw = acc_raw * acc_mask
 
-        # Ghép thành 6 kênh đặc trưng chuẩn hóa hoàn chỉnh
+            acc_raw = F.pad(acc_raw, (0, 0, 1, 0), mode="constant", value=0.0)
+            acc_norm = torch.clamp(acc_raw, min=-10.0, max=10.0)
+
         out = torch.cat([pos_norm, vel_norm, acc_norm], dim=1)  # (B, 6, T, V)
+        out = torch.nan_to_num(out, nan=0.0, posinf=10.0, neginf=-10.0)
+
+        # Chuẩn hóa cân bằng phân phối giữa các kênh động học
+        out = self.channel_norm(out)
 
         if mask is not None:
             out = out * mask
 
         return out
 
+
 class MobileNetV3ContextEncoder(nn.Module):
     """
-    Trích xuất vector ngữ cảnh d in R^{D} cho mỗi khung hình khuôn mặt
+    Trích xuất vector ngữ cảnh thị giác d in R^{D} cho mỗi khung hình khuôn mặt
     bằng xương sống MobileNetV3-Small.
     """
 
@@ -114,60 +130,63 @@ class MobileNetV3ContextEncoder(nn.Module):
             proj_hidden_dim: int = 192,
             pretrained: bool = True,
             dropout: float = 0.2,
-            freeze_backbone: bool = False
+            freeze_backbone: bool = False,
     ):
         super().__init__()
         weights = MobileNet_V3_Small_Weights.DEFAULT if pretrained else None
         base_model = mobilenet_v3_small(weights=weights)
 
-        # Giữ lại khối trích xuất đặc trưng tích chập (927,008 tham số, đầu ra 576 kênh)
         self.features = base_model.features
         self.avgpool = base_model.avgpool
 
-        # Tầng chiếu gọn nhẹ từ 576 -> proj_hidden_dim -> D
         self.projector = nn.Sequential(
             nn.Linear(576, proj_hidden_dim),
             nn.Hardswish(inplace=True),
             nn.Dropout(p=dropout),
-            nn.Linear(proj_hidden_dim, out_dim)
+            nn.Linear(proj_hidden_dim, out_dim),
         )
 
         if freeze_backbone:
             self.freeze_backbone(freeze=True)
 
     def freeze_backbone(self, freeze: bool = True, freeze_projector: bool = False) -> None:
-        """
-        Bật hoặc tắt đóng băng tham số của xương sống MobileNetV3-Small.
-
-        Args:
-            freeze: True để đóng băng (requires_grad = False), False để mở khóa.
-            freeze_projector: True để đóng băng cả tầng chiếu projector (576 -> out_dim).
-                              Mặc định là False (giữ projector khả học để thích nghi không gian đặc trưng).
-        """
+        """Bật/tắt đóng băng tham số của xương sống MobileNetV3-Small."""
         for param in self.features.parameters():
             param.requires_grad = not freeze
+        for m in self.features.modules():
+            if isinstance(m, (nn.BatchNorm2d, nn.SyncBatchNorm)):
+                m.eval() if freeze else m.train(self.training)
         if freeze_projector:
             for param in self.projector.parameters():
                 param.requires_grad = not freeze
         elif not freeze:
-            # Khi unfreeze hoàn toàn, mở khóa cả projector
             for param in self.projector.parameters():
                 param.requires_grad = True
 
-    def unfreeze_backbone(self) -> None:
-        """Mở khóa đóng băng tất cả tham số của MobileNetV3-Small và projector."""
-        self.freeze_backbone(freeze=False, freeze_projector=False)
+    def unfreeze_backbone(self, unfreeze_last_n_blocks: Optional[int] = None) -> None:
+        """
+        Mở khóa đóng băng MobileNetV3-Small:
+        - unfreeze_last_n_blocks = None: mở khóa toàn bộ features.
+        - unfreeze_last_n_blocks = K: chỉ mở khóa K block tích chập cuối của features.
+        """
+        if unfreeze_last_n_blocks is None:
+            self.freeze_backbone(freeze=False, freeze_projector=False)
+            return
+
+        # Khóa toàn bộ trước
+        self.freeze_backbone(freeze=True, freeze_projector=False)
+        total_blocks = len(self.features)
+        start_idx = max(0, total_blocks - unfreeze_last_n_blocks)
+        for i in range(start_idx, total_blocks):
+            for param in self.features[i].parameters():
+                param.requires_grad = True
 
     @property
     def is_backbone_frozen(self) -> bool:
-        """Kiểm tra xem các tham số của MobileNetV3-Small (self.features) có đang bị đóng băng hay không."""
+        """Kiểm tra xem tất cả các tham số của MobileNetV3 features có đang bị đóng băng hay không."""
         return not any(p.requires_grad for p in self.features.parameters())
 
     def train(self, mode: bool = True):
-        """
-        Ghi đè chế độ train: Nếu backbone đang bị đóng băng, giữ các tầng BatchNorm2d
-        của self.features ở chế độ eval() để ngăn chặn trôi running mean và running variance.
-        """
         super().train(mode)
         if mode and self.is_backbone_frozen:
             for m in self.features.modules():
@@ -176,46 +195,41 @@ class MobileNetV3ContextEncoder(nn.Module):
         return self
 
     def forward(self, frame_tensor: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            frame_tensor: Ảnh khuôn mặt [B * T, 3, H, W] hoặc [B, 3, H, W]
-        Returns:
-            d: Vector ngữ cảnh [B * T, D] hoặc [B, D]
-        """
         feat = self.features(frame_tensor)
         feat = self.avgpool(feat)
         feat = torch.flatten(feat, 1)
         d = self.projector(feat)
         return d
 
+
 class MultimodalFusionModule(nn.Module):
     """
-    Thực hiện phép dung hợp đa phương thức theo Phương trình (1) có tích hợp KinematicFeatureExtractor:
-        X = (C_kinematic * w) * d^T
-    Trong đó:
-        - coords in R^{B x T x N x 2}: Ma trận tọa độ điểm mốc tĩnh (x, y)
-          (Hỗ trợ tự động cắt coords[..., :2] nếu nhận cache 3 kênh cũ).
-        - C_kinematic in R^{B x T x N x 6}: Đặc trưng động học [x_norm, y_norm, dx_norm, dy_norm, d2x_norm, d2y_norm]
-          được chuẩn hóa theo tâm mũi (điểm 30) và tỷ lệ IOD (khoảng cách 2 mắt 36 <-> 45).
-        - w in R^{6 x 1}: Vector trọng số khả học cho 6 kênh đặc trưng động học.
-        - d in R^{B x T x D}: Vector đặc trưng ngữ cảnh từ MobileNetV3-Small.
-        - X in R^{B x D x N x T}: Tensor đặc trưng đồ thị không gian - thời gian cho STGL.
+    Dung hợp Đa phương thức giải quyết triệt để Rank-1 Bottleneck:
+    1. Chiếu 6 kênh động học [x, y, dx, dy, d2x, d2y] lên không gian đặc trưng đa chiều D (Linear + LayerNorm + GELU).
+    2. Cộng Node Positional Embedding [1, 1, 68, D] giúp phân biệt rõ vai trò giải phẫu của từng điểm mốc.
+    3. Điều biến Gated FiLM modulation với vector ngữ cảnh thị giác d in R^{D}:
+       H = H_kin * (1.0 + tanh(W_scale(d))) + W_shift(d)
+    4. Tương thích hoàn hảo cả khi d=None (chế độ Fast Landmark-Only).
     """
 
     def __init__(
             self,
             num_features: int = 6,
+            feature_dim: int = 64,
+            num_nodes: int = 68,
             nose_idx: int = 30,
             left_eye_idx: int = 36,
             right_eye_idx: int = 45,
-            eps: float = 1e-6,
+            eps: float = 1e-2,
     ):
         super().__init__()
         self.left_eye_idx = left_eye_idx
         self.right_eye_idx = right_eye_idx
         self.eps = eps
+        self.feature_dim = feature_dim
+        self.num_nodes = num_nodes
 
-        # Khối trích xuất đặc trưng động học không gian - thời gian
+        # Khối tiền xử lý động học chuẩn hóa theo IOD
         self.kinematic = KinematicFeatureExtractor(
             nose_idx=nose_idx,
             left_eye_idx=left_eye_idx,
@@ -223,104 +237,203 @@ class MultimodalFusionModule(nn.Module):
             eps=eps,
         )
 
-        # Vector trọng số khả học w in R^{6 x 1}
+        # Giữ lại w để tương thích backward compatibility với checkpoint cũ
         self.w = nn.Parameter(torch.ones(num_features, 1) / float(num_features))
 
+        # Phép chiếu động học đa kênh 6D -> D
+        self.kin_proj = nn.Sequential(
+            nn.Linear(num_features, feature_dim),
+            nn.LayerNorm(feature_dim),
+            nn.GELU(),
+        )
+
+        # Vector nhúng vị trí đỉnh giải phẫu khả học cho 68 mốc mặt
+        self.node_embed = nn.Parameter(torch.randn(1, 1, num_nodes, feature_dim) * 0.02)
+
+        # Tầng điều biến FiLM từ vector ngữ cảnh thị giác d
+        self.film_scale = nn.Linear(feature_dim, feature_dim)
+        self.film_shift = nn.Linear(feature_dim, feature_dim)
+
     def detect_missing_mask(self, coords: torch.Tensor) -> torch.Tensor:
-        """
-        Nhận diện các khung hình mất khuôn mặt hoặc padding đệm:
-          - coords shape: [B, T, N, 2]
-          - Trả về boolean mask: [B, T, 1, 1] (True là mất mặt/pad, False là hợp lệ).
-        """
         p_left = coords[:, :, self.left_eye_idx, :]
         p_right = coords[:, :, self.right_eye_idx, :]
-        raw_iod = torch.norm(p_right - p_left, p=2, dim=-1, keepdim=True).unsqueeze(-1)  # [B, T, 1, 1]
+        raw_iod = torch.norm(p_right - p_left, p=2, dim=-1, keepdim=True).unsqueeze(-1)
 
-        all_ones = (coords == 1.0).all(dim=-1, keepdim=True).all(dim=-2, keepdim=True)  # [B, T, 1, 1]
-        all_zeros = (coords == 0.0).all(dim=-1, keepdim=True).all(dim=-2, keepdim=True)  # [B, T, 1, 1]
-        is_missing = (raw_iod < 1e-4) | all_ones | all_zeros
+        all_ones = (coords >= 0.999).all(dim=-1, keepdim=True).all(dim=-2, keepdim=True)
+        all_zeros = (coords <= 0.001).all(dim=-1, keepdim=True).all(dim=-2, keepdim=True)
+        is_missing = (raw_iod < 1e-2) | all_ones | all_zeros
         return is_missing
 
     def forward(
             self,
             coords: torch.Tensor,
-            d: torch.Tensor,
+            d: Optional[torch.Tensor] = None,
             mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
-            coords: Ma trận điểm mốc có kích thước [B, T, N, 2] (hoặc [B, T, N, 3] từ cache cũ)
-            d: Vector ngữ cảnh MobileNetV3 có kích thước [B, T, D]
-            mask: Temporal mask tùy chọn kích thước [B, 1, T, 1]
+            coords: Chuỗi tọa độ mốc [B, T, N, 2] (hoặc [B, T, N, 3] từ cache cũ).
+            d: Vector ngữ cảnh thị giác [B, T, D] hoặc None (Landmark-Only).
+            mask: Temporal float mask [B, 1, T, 1].
         Returns:
-            X: Tensor đặc trưng đồ thị không gian - thời gian [B, D, N, T]
+            X: Tensor đặc trưng đồ thị [B, D, N, T].
         """
-        # Hỗ trợ tương thích ngược: tự động lấy 2 kênh tọa độ (x, y) nếu có 3 kênh
         if coords.dim() == 4:
             if coords.size(-1) >= 2:
                 coords_xy = coords[..., :2]
             elif coords.size(1) >= 2:
-                # Shape dạng [B, C, T, N]
                 coords_xy = coords[:, :2, :, :].permute(0, 2, 3, 1).contiguous()
             else:
                 coords_xy = coords
         else:
             coords_xy = coords
 
-        is_missing = self.detect_missing_mask(coords_xy)  # [B, T, 1, 1]
+        orig_dtype = coords.dtype
+        dev = coords.device
+        dev_type = dev.type if dev.type in ("cuda", "cpu") else "cpu"
 
-        # Tạo temporal mask (1.0 = hợp lệ, 0.0 = mất mặt/pad) cho KinematicFeatureExtractor
-        if mask is None:
-            temporal_mask = (~is_missing).permute(0, 3, 1, 2).float()  # [B, 1, T, 1]
-        else:
-            temporal_mask = mask
+        with torch.autocast(device_type=dev_type, enabled=False):
+            coords_32 = coords_xy.float()
 
-        # Đưa về [B, 2, T, N] để tính các kênh động học
-        x_in = coords_xy.permute(0, 3, 1, 2).contiguous()
-        feat_kin = self.kinematic(x_in, mask=temporal_mask)  # [B, 6, T, N]
+            is_missing = self.detect_missing_mask(coords_32)
+            valid_mask = (~is_missing).permute(0, 3, 1, 2).float()
 
-        # Đưa về [B, T, N, 6]
-        C_kin = feat_kin.permute(0, 2, 3, 1).contiguous()
+            if mask is not None:
+                temporal_mask = mask.float() * valid_mask
+                is_missing = (temporal_mask == 0.0).permute(0, 2, 3, 1)
+            else:
+                temporal_mask = valid_mask
 
-        # Section III-B: Nếu frame mất mặt, gán toàn bộ C về 1.0 (fall back về d^T)
-        C_fused = torch.where(is_missing, torch.ones_like(C_kin), C_kin)
+            x_in = coords_32.permute(0, 3, 1, 2).contiguous()  # [B, 2, T, N]
+            feat_kin = self.kinematic(x_in, mask=temporal_mask)  # [B, 6, T, N]
+            C_kin = feat_kin.permute(0, 2, 3, 1).contiguous()  # [B, T, N, 6]
 
-        # (C_fused * w): [B, T, N, 6] @ [6, 1] -> [B, T, N, 1]
-        node_scalar = torch.matmul(C_fused, self.w)
+            # Chiếu đa kênh 6D -> D và cộng nhúng vị trí giải phẫu
+            H_kin = self.kin_proj(C_kin) + self.node_embed  # [B, T, N, D]
 
-        # d^T: [B, T, 1, D]
-        d_row = d.unsqueeze(2)
+            # Điều biến FiLM nếu có bối cảnh thị giác d
+            if d is not None:
+                d_32 = d.float()
+                scale = torch.tanh(self.film_scale(d_32)).unsqueeze(2)  # [B, T, 1, D]
+                shift = self.film_shift(d_32).unsqueeze(2)  # [B, T, 1, D]
+                H = H_kin * (1.0 + scale) + shift
+            else:
+                H = H_kin
 
-        # Ngoại tích X = (C * w) @ d^T -> [B, T, N, D]
-        X = torch.matmul(node_scalar, d_row)
+            H = torch.nan_to_num(H, nan=0.0)
 
-        # Chuyển trục về chuẩn Graph WaveNet: [B, D, N, T]
-        return X.permute(0, 3, 2, 1).contiguous()
+            # Đưa về chuẩn đồ thị STGL: [B, D, N, T]
+            X = H.permute(0, 3, 2, 1).contiguous()
+
+        return X.to(orig_dtype)
+
 
 class SelfAdaptiveAdjacency(nn.Module):
     """
-    Học ma trận kề tự thích nghi đầu-cuối theo Phương trình (2):
-        A_adp = softmax(ReLU(E1 @ E2^T))
+    Ma trận kề kết hợp Cấu trúc Giải phẫu Khuôn mặt (A_prior) và Tự thích nghi (A_adp):
+        A_total = A_prior + alpha * softmax(ReLU(E1 @ E2^T / sqrt(d)))
     """
 
-    def __init__(self, num_nodes: int = 68, embed_dim: int = 16):
+    def __init__(
+            self,
+            num_nodes: int = 68,
+            embed_dim: int = 16,
+            vertical_pairs: Optional[List[Tuple[int, int]]] = None,
+            cross_region_pairs: Optional[List[Tuple[int, int]]] = None,
+    ):
         super().__init__()
+        self.num_nodes = num_nodes
+        self.embed_dim = embed_dim
+
+        # Xây dựng ma trận kề giải phẫu A_prior chuẩn hóa bậc đối xứng
+        A_prior = self._build_anatomical_prior(num_nodes, vertical_pairs, cross_region_pairs)
+        self.register_buffer("A_prior", A_prior)
+
+        # Tham số học ma trận kề thích nghi
         self.E1 = nn.Parameter(torch.randn(num_nodes, embed_dim) * 0.1)
         self.E2 = nn.Parameter(torch.randn(num_nodes, embed_dim) * 0.1)
+        self.alpha = nn.Parameter(torch.tensor(0.5))
+
+    @staticmethod
+    def _build_anatomical_prior(
+            num_nodes: int,
+            vertical_pairs: Optional[List[Tuple[int, int]]],
+            cross_region_pairs: Optional[List[Tuple[int, int]]],
+    ) -> torch.Tensor:
+        A = np.zeros((num_nodes, num_nodes), dtype=np.float32)
+
+        # 1. Đường viền hàm dưới: 0..16
+        for i in range(16):
+            A[i, i + 1] = A[i + 1, i] = 1.0
+
+        # 2. Lông mày trái (17..21) & phải (22..26)
+        for i in range(17, 21):
+            A[i, i + 1] = A[i + 1, i] = 1.0
+        for i in range(22, 25):
+            A[i, i + 1] = A[i + 1, i] = 1.0
+
+        # 3. Sống mũi (27..30) & Cánh mũi (31..35)
+        for i in range(27, 30):
+            A[i, i + 1] = A[i + 1, i] = 1.0
+        for i in range(31, 35):
+            A[i, i + 1] = A[i + 1, i] = 1.0
+        A[30, 33] = A[33, 30] = 1.0
+
+        # 4. Mắt trái (36..41) & Mắt phải (42..47)
+        for i in range(36, 41):
+            A[i, i + 1] = A[i + 1, i] = 1.0
+        A[41, 36] = A[36, 41] = 1.0
+        for i in range(42, 47):
+            A[i, i + 1] = A[i + 1, i] = 1.0
+        A[47, 42] = A[42, 47] = 1.0
+
+        # 5. Môi ngoài (48..59) & Môi trong (60..67)
+        for i in range(48, 59):
+            A[i, i + 1] = A[i + 1, i] = 1.0
+        A[59, 48] = A[48, 59] = 1.0
+        for i in range(60, 67):
+            A[i, i + 1] = A[i + 1, i] = 1.0
+        A[67, 60] = A[60, 67] = 1.0
+
+        # 6. Các cặp dọc mở/nhắm mắt (EAR) & miệng (MAR)
+        v_pairs = vertical_pairs or [
+            (37, 41), (38, 40), (43, 47), (44, 46),
+            (50, 58), (51, 57), (52, 56), (61, 67), (62, 66), (63, 65)
+        ]
+        for u, v in v_pairs:
+            if u < num_nodes and v < num_nodes:
+                A[u, v] = A[v, u] = 1.0
+
+        # 7. Các cặp liên vùng khuôn mặt
+        cr_pairs = cross_region_pairs or [
+            (19, 37), (24, 44), (30, 39), (30, 42), (57, 8), (51, 33)
+        ]
+        for u, v in cr_pairs:
+            if u < num_nodes and v < num_nodes:
+                A[u, v] = A[v, u] = 1.0
+
+        # Tự liên kết (Self-loops)
+        A = A + np.eye(num_nodes, dtype=np.float32)
+
+        # Chuẩn hóa bậc đối xứng: D^{-1/2} A D^{-1/2}
+        degrees = np.sum(A, axis=1)
+        d_inv_sqrt = np.power(np.maximum(degrees, 1e-8), -0.5)
+        D_inv_sqrt = np.diag(d_inv_sqrt)
+        A_norm = D_inv_sqrt @ A @ D_inv_sqrt
+
+        return torch.from_numpy(A_norm).float()
 
     def forward(self) -> torch.Tensor:
-        """
-        Returns:
-            A_adp: Ma trận kề tự thích nghi đã chuẩn hóa hàng [N, N]
-        """
-        spatial_weights = F.relu(torch.matmul(self.E1, self.E2.transpose(0, 1)))
+        scale = 1.0 / math.sqrt(self.embed_dim)
+        spatial_weights = F.relu(torch.matmul(self.E1, self.E2.transpose(0, 1)) * scale)
         A_adp = F.softmax(spatial_weights, dim=-1)
-        return A_adp
+        return self.A_prior + self.alpha * A_adp
+
 
 class SpatialGCNLayer(nn.Module):
     """
-    Tầng Tích chập Đồ thị (GCN) xấp xỉ bậc nhất 2 lớp theo Phương trình (3):
-        Z = F(X, A_adp) = softmax(A_adp * ReLU(A_adp * X * W^(0)) * W^(1))
+    Tầng Tích chập Đồ thị Không gian (GCN) không làm triệt tiêu gradient:
+    Thay thế F.softmax bằng F.gelu(LayerNorm) kèm kết nối phần dư.
     """
 
     def __init__(
@@ -328,45 +441,34 @@ class SpatialGCNLayer(nn.Module):
             in_dim: int = 64,
             hidden_dim: int = 64,
             out_dim: int = 64,
-            dropout: float = 0.2
+            dropout: float = 0.2,
     ):
         super().__init__()
-        # Trọng số W^(0) in R^{D x H} và W^(1) in R^{H x M}
         self.W0 = nn.Linear(in_dim, hidden_dim, bias=False)
         self.W1 = nn.Linear(hidden_dim, out_dim, bias=False)
+        self.norm = nn.LayerNorm(out_dim)
         self.dropout = nn.Dropout(p=dropout)
+        self.res_proj = nn.Linear(in_dim, out_dim) if in_dim != out_dim else nn.Identity()
 
     def forward(self, x: torch.Tensor, A_adp: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: Tensor đầu vào [B, D, N, T]
-            A_adp: Ma trận kề tự thích nghi [N, N]
-        Returns:
-            z: Tensor đầu ra sau tích chập đồ thị [B, M, N, T]
-        """
-        # Đưa về [B, T, N, D] để nhân ma trận trên chiều nút N và chiều đặc trưng D
         x_perm = x.permute(0, 3, 2, 1).contiguous()  # [B, T, N, D]
 
-        # Lớp GCN thứ nhất: ReLU(A_adp @ X @ W^(0))
         h1 = self.W0(x_perm)  # [B, T, N, H]
-        h1 = torch.einsum("ij,btnf->btif", A_adp, h1)  # Nhân A_adp [N, N]
+        h1 = torch.einsum("ij,btnf->btif", A_adp, h1)
         h1 = F.relu(h1)
         h1 = self.dropout(h1)
 
-        # Lớp GCN thứ hai: softmax(A_adp @ h1 @ W^(1))
         h2 = self.W1(h1)  # [B, T, N, M]
         h2 = torch.einsum("ij,btnf->btif", A_adp, h2)
-        z = F.softmax(h2, dim=-1)
+        z = F.gelu(self.norm(h2)) + self.res_proj(x_perm)
 
-        # Trả lại kích thước [B, M, N, T]
         return z.permute(0, 3, 2, 1).contiguous()
+
 
 class GatedDilatedCausalTCN(nn.Module):
     """
-    Tầng Tích chập Thời gian Nhân quả Giãn nở có Cổng (Gated TCN)
-    theo Phương trình (4) và (5):
-        (x * f)(t) = sum_{s=0}^{k-1} f(s) x(t - d * s)
-        h = tanh(Theta_1 * X + b) (x) sigmoid(Theta_2 * X + c)
+    Tầng Tích chập Thời gian Nhân quả Giãn nở có Cổng (Gated Dilated Causal TCN):
+    h = tanh(Theta_1 * X) (x) sigmoid(Theta_2 * X).
     """
 
     def __init__(
@@ -374,50 +476,36 @@ class GatedDilatedCausalTCN(nn.Module):
             in_channels: int = 64,
             dilation_channels: int = 64,
             kernel_size: int = 2,
-            dilation: int = 1
+            dilation: int = 1,
     ):
         super().__init__()
-        # Đệm nhân quả (Causal Padding) ở phía bên trái trục thời gian T
-        # để đảm bảo khung hình t chỉ phụ thuộc vào các khung hình <= t
         self.causal_padding = (kernel_size - 1) * dilation
-
-        # Hai nhánh tích chập 1D dọc theo trục thời gian (TCN-a và TCN-b)
         self.theta_1 = nn.Conv2d(
             in_channels,
             dilation_channels,
             kernel_size=(1, kernel_size),
             dilation=(1, dilation),
-            bias=True
+            bias=True,
         )
         self.theta_2 = nn.Conv2d(
             in_channels,
             dilation_channels,
             kernel_size=(1, kernel_size),
             dilation=(1, dilation),
-            bias=True
+            bias=True,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: Tensor [B, D, N, T]
-        Returns:
-            h: Tensor [B, dilation_channels, N, T]
-        """
-        # Đệm bên trái trên chiều cuối cùng (chiều thời gian T)
         x_pad = F.pad(x, (self.causal_padding, 0, 0, 0))
-
-        # Phương trình (5): h = tanh(Theta_1 * X + b) * sigmoid(Theta_2 * X + c)
         tcn_a = torch.tanh(self.theta_1(x_pad))
         tcn_b = torch.sigmoid(self.theta_2(x_pad))
-        h = tcn_a * tcn_b
-        return h
+        return tcn_a * tcn_b
+
 
 class STGLBlock(nn.Module):
     """
-    Một tầng Không gian - Thời gian trong STGL (Section III-D3):
-    Kết hợp Gated Dilated TCN (Eq. 5) + Spatial GCN 2 lớp (Eq. 3) +
-    Kết nối tắt (Skip Connection) và Kết nối phần dư (Residual Connection).
+    Khối Không gian - Thời gian STGL Block kết hợp Gated TCN và Spatial GCN:
+    Đường tắt skip_conv được tính SAU spatial_gcn để dòng gradient chảy xuyên suốt qua tầng đồ thị.
     """
 
     def __init__(
@@ -427,58 +515,44 @@ class STGLBlock(nn.Module):
             skip_channels: int = 128,
             kernel_size: int = 2,
             dilation: int = 1,
-            dropout: float = 0.2
+            dropout: float = 0.2,
     ):
         super().__init__()
         self.gated_tcn = GatedDilatedCausalTCN(
             in_channels=residual_channels,
             dilation_channels=dilation_channels,
             kernel_size=kernel_size,
-            dilation=dilation
+            dilation=dilation,
         )
         self.spatial_gcn = SpatialGCNLayer(
             in_dim=dilation_channels,
             hidden_dim=residual_channels,
             out_dim=residual_channels,
-            dropout=dropout
+            dropout=dropout,
         )
-        self.skip_conv = nn.Conv2d(dilation_channels, skip_channels, kernel_size=(1, 1))
+        # Skip connection lấy từ h_gcn để truyền gradient trực tiếp qua GCN
+        self.skip_conv = nn.Conv2d(residual_channels, skip_channels, kernel_size=(1, 1))
         self.bn = nn.BatchNorm2d(residual_channels)
 
     def forward(
             self,
             x: torch.Tensor,
-            A_adp: torch.Tensor
+            A_adp: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            x: [B, residual_channels, N, T]
-            A_adp: [N, N]
-        Returns:
-            x_res: Đầu ra có cộng phần dư [B, residual_channels, N, T]
-            skip: Đầu ra nhánh skip [B, skip_channels, N, T]
-        """
         residual = x
-
-        # 1. Mô hình hóa thời gian qua Gated TCN
         h_tcn = self.gated_tcn(x)
-
-        # 2. Trích xuất kết nối skip cho tầng phân loại cuối
-        skip = self.skip_conv(h_tcn)
-
-        # 3. Mô hình hóa không gian qua Self-Adaptive Spatial GCN
         h_gcn = self.spatial_gcn(h_tcn, A_adp)
-
-        # 4. Kết nối phần dư + Chuẩn hóa Batch
+        skip = self.skip_conv(h_gcn)
         x_res = self.bn(h_gcn + residual)
         return x_res, skip
 
+
 class LiteFat(nn.Module):
     """
-    Mô hình LiteFat hoàn chỉnh (IEEE/RSJ IROS 2025):
-      - N = 68 điểm mốc khuôn mặt
-      - T = 16 khung hình mỗi mẫu video
-      - Tổng tham số mặc định: ~1.32M tham số (khớp Bảng II bài báo)
+    Mô hình LiteFat v2 Hoàn chỉnh:
+      - Hỗ trợ linh hoạt cả 2 chế độ: Đa phương thức (Multimodal) và Chỉ dùng Landmark (Landmark-Only).
+      - Học ma trận kề thích nghi kết hợp với kề giải phẫu A_prior.
+      - Attentive Node Pooling tập trung vào mắt và miệng thay vì trung bình đều.
     """
 
     def __init__(
@@ -492,41 +566,48 @@ class LiteFat(nn.Module):
             skip_channels: int = 128,
             end_channels: int = 256,
             num_classes: int = 2,
-            num_blocks: int = 4,
+            num_blocks: int = 3,
             layers_per_block: int = 2,
             kernel_size: int = 2,
             pretrained_backbone: bool = True,
-            dropout: float = 0.2,
-            freeze_backbone: bool = False
+            dropout: float = 0.3,
+            freeze_backbone: bool = False,
+            vertical_pairs: Optional[List[Tuple[int, int]]] = None,
+            cross_region_pairs: Optional[List[Tuple[int, int]]] = None,
     ):
         super().__init__()
         self.num_nodes = num_nodes
         self.feature_dim = feature_dim
         self.num_classes = num_classes
 
-        # Thành phần 1: MobileNetV3-Small trích xuất ngữ cảnh
+        # 1. MobileNetV3-Small trích xuất ngữ cảnh thị giác từ ảnh mặt
         self.context_encoder = MobileNetV3ContextEncoder(
             out_dim=feature_dim,
             proj_hidden_dim=mobilenet_proj_hidden,
             pretrained=pretrained_backbone,
             dropout=dropout,
-            freeze_backbone=freeze_backbone
+            freeze_backbone=freeze_backbone,
         )
 
-        # Thành phần 2: Dung hợp đa phương thức X = (C * w) * d^T
-        self.fusion = MultimodalFusionModule()
+        # 2. Dung hợp đa phương thức FiLM chống Rank-1 Bottleneck
+        self.fusion = MultimodalFusionModule(
+            num_features=6,
+            feature_dim=feature_dim,
+            num_nodes=num_nodes,
+        )
 
-        # Thành phần 3: Ma trận kề tự thích nghi A_adp
+        # 3. Ma trận kề giải phẫu + tự thích nghi
         self.adaptive_adj = SelfAdaptiveAdjacency(
             num_nodes=num_nodes,
-            embed_dim=node_embed_dim
+            embed_dim=node_embed_dim,
+            vertical_pairs=vertical_pairs,
+            cross_region_pairs=cross_region_pairs,
         )
 
         # Tầng chiếu đầu vào đồ thị
         self.start_conv = nn.Conv2d(feature_dim, residual_channels, kernel_size=(1, 1))
 
-        # Thành phần 4: Các khối Không gian - Thời gian (STGL Blocks)
-        # Hệ số giãn nở (dilation) tăng theo cấp số nhân (1, 2) lặp qua các khối
+        # 4. Các khối Không gian - Thời gian (STGL Blocks)
         self.stgl_blocks = nn.ModuleList()
         for _ in range(num_blocks):
             dilation = 1
@@ -538,19 +619,24 @@ class LiteFat(nn.Module):
                         skip_channels=skip_channels,
                         kernel_size=kernel_size,
                         dilation=dilation,
-                        dropout=dropout
+                        dropout=dropout,
                     )
                 )
                 dilation *= 2
 
-        # Đầu phân loại (Output Layer) dự đoán nhãn cho từng khung hình t in [1..T]
+        # Đầu phân loại dự đoán cấp khung hình
         self.end_conv_1 = nn.Conv2d(skip_channels, end_channels, kernel_size=(1, 1))
         self.end_conv_2 = nn.Conv2d(end_channels, num_classes, kernel_size=(1, 1))
 
-    def forward_stgl_from_fused(self, X: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Chạy riêng phần đồ thị STGL khi đã có tensor đặc trưng X [B, D, N, T].
-        """
+        # Attentive Node Pooling: Tự học trọng số chú ý trên 68 đỉnh khuôn mặt
+        self.node_gate = nn.Conv2d(num_classes, 1, kernel_size=(1, 1))
+
+    def forward_stgl_from_fused(
+            self,
+            X: torch.Tensor,
+            lengths: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Chạy phần đồ thị STGL từ tensor đặc trưng X [B, D, N, T]."""
         A_adp = self.adaptive_adj()
         h = self.start_conv(X)
 
@@ -563,89 +649,110 @@ class LiteFat(nn.Module):
         out = F.relu(self.end_conv_1(out))
         out = self.end_conv_2(out)  # [B, num_classes, N, T]
 
-        # Gộp trung bình trên toàn bộ N=68 nút để ra dự đoán cấp khung hình
-        frame_logits = out.mean(dim=2).permute(0, 2, 1).contiguous()  # [B, T, num_classes]
-        clip_logits = frame_logits.mean(dim=1)  # [B, num_classes]
+        # Attentive Spatial Pooling trên N=68 đỉnh
+        gate = F.softmax(self.node_gate(out), dim=2)  # [B, 1, N, T]
+        frame_logits = (out * gate).sum(dim=2).permute(0, 2, 1).contiguous()  # [B, T, num_classes]
+
+        # Tính toán dự đoán cấp đoạn video (Clip Logits)
+        if lengths is not None:
+            B, T, _ = frame_logits.shape
+            valid_mask = (torch.arange(T, device=frame_logits.device).unsqueeze(0) < lengths.to(frame_logits.device).unsqueeze(1)).unsqueeze(-1).type_as(frame_logits)
+            denom = valid_mask.sum(dim=1).clamp(min=1.0)
+            clip_logits = (frame_logits * valid_mask).sum(dim=1) / denom
+        else:
+            clip_logits = frame_logits.mean(dim=1)  # [B, num_classes]
+
         return frame_logits, clip_logits
 
     def forward(
             self,
-            video_frames: torch.Tensor,
-            landmarks: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+            input1: torch.Tensor,
+            input2: Optional[torch.Tensor] = None,
+            lengths: Optional[torch.Tensor] = None,
+            mask: Optional[torch.Tensor] = None,
+            return_clip_logits: bool = True,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
-        Chế độ chuẩn (Huấn luyện & Đánh giá đồng bộ):
-        Args:
-            video_frames: Chuỗi khung hình [B, T, 3, H, W] (ví dụ H=W=224)
-            landmarks: Chuỗi điểm mốc khuôn mặt [B, T, N, 2] (N=68, tọa độ x, y)
-        Returns:
-            frame_logits: Điểm dự đoán cho từng khung hình [B, T, num_classes]
-            clip_logits: Điểm dự đoán cho cả đoạn video [B, num_classes]
+        Hỗ trợ gọi linh hoạt theo 2 cú pháp:
+          1. model(video_frames, landmarks, lengths=...) (Đa phương thức chuẩn)
+          2. model(landmarks, video_frames, lengths=...) (Tự nhận diện thứ tự tham số)
+          3. model(landmarks, lengths=...)              (Chỉ dùng Landmark)
         """
-        B, T, C_img, H, W = video_frames.shape
+        video_frames = None
+        landmarks = None
 
-        # 1. Trích xuất vector ngữ cảnh d cho toàn bộ B * T khung hình
-        frames_flat = video_frames.view(B * T, C_img, H, W)
-        d_flat = self.context_encoder(frames_flat)  # [B * T, D]
-        d = d_flat.view(B, T, self.feature_dim)  # [B, T, D]
+        if input2 is None:
+            # Chỉ truyền 1 tensor: phải là landmarks [B, T, N, 2/3]
+            landmarks = input1
+            video_frames = None
+        else:
+            # Nhận 2 tensor: nhận diện dựa vào số chiều
+            if input1.dim() == 5:
+                video_frames = input1
+                landmarks = input2
+            elif input2.dim() == 5:
+                video_frames = input2
+                landmarks = input1
+            else:
+                video_frames = input1
+                landmarks = input2
 
-        # 2. Dung hợp đa phương thức qua KinematicFeatureExtractor: X = (C * w) * d^T -> [B, D, N, T]
-        X = self.fusion(landmarks, d)
+        d = None
+        if video_frames is not None and video_frames.numel() > 0:
+            B, T, C_img, H, W = video_frames.shape
+            frames_flat = video_frames.view(B * T, C_img, H, W)
+            d_flat = self.context_encoder(frames_flat)
+            d = d_flat.view(B, T, self.feature_dim)
 
-        # 3. Đưa qua mạng đồ thị không gian - thời gian STGL
-        return self.forward_stgl_from_fused(X)
+        if mask is None and lengths is not None:
+            mask = KinematicFeatureExtractor.build_temporal_mask(
+                landmarks.permute(0, 3, 1, 2) if landmarks.dim() == 4 and landmarks.size(-1) == 2 else landmarks,
+                lengths=lengths,
+            )
+
+        X = self.fusion(landmarks, d=d, mask=mask)
+        frame_logits, clip_logits = self.forward_stgl_from_fused(X, lengths=lengths)
+
+        if return_clip_logits:
+            return frame_logits, clip_logits
+        return frame_logits
 
     @torch.no_grad()
     def forward_asymmetric_step(
             self,
             landmark_window: torch.Tensor,
             d_history: torch.Tensor,
-            current_frame: Optional[torch.Tensor] = None
+            current_frame: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Chế độ Bất đối xứng (Asymmetric Inference) tối ưu cho Snapdragon 680:
-          - Ở khung hình cần cập nhật ngữ cảnh (mỗi 3 frame): truyền `current_frame` [1, 3, H, W]
-            để chạy MobileNetV3-Small và đẩy vector d_t mới vào `d_history`.
-          - Ở các khung hình xen kẽ: đặt `current_frame=None`, tái sử dụng vector d gần nhất
-            nhưng vẫn cập nhật `landmark_window` [1, T, 68, 2] ở tốc độ 30 FPS.
-        """
         if current_frame is not None:
-            d_new = self.context_encoder(current_frame).unsqueeze(1)  # [1, 1, D]
+            d_new = self.context_encoder(current_frame).unsqueeze(1)
         else:
-            d_new = d_history[:, -1:, :]  # Tái sử dụng d_{t-1}
+            d_new = d_history[:, -1:, :]
 
-        # Trượt cửa sổ lịch sử vector ngữ cảnh d_history [1, T, D]
         d_updated = torch.cat([d_history[:, 1:, :], d_new], dim=1)
-
-        # Dung hợp với cửa sổ điểm mốc 30 FPS và chạy đồ thị STGL
-        X = self.fusion(landmark_window, d_updated)
+        X = self.fusion(landmark_window, d=d_updated)
         _, clip_logits = self.forward_stgl_from_fused(X)
         probs = F.softmax(clip_logits, dim=-1)
         return probs, d_updated
 
     def freeze_backbone(self, freeze: bool = True, freeze_projector: bool = False) -> None:
-        """
-        Ủy quyền bật/tắt đóng băng tham số của xương sống MobileNetV3-Small.
-
-        Args:
-            freeze: True để đóng băng (requires_grad = False), False để mở khóa.
-            freeze_projector: True để đóng băng cả tầng chiếu projector. Mặc định là False.
-        """
         self.context_encoder.freeze_backbone(freeze=freeze, freeze_projector=freeze_projector)
 
-    def unfreeze_backbone(self) -> None:
-        """Mở khóa đóng băng tất cả tham số của MobileNetV3-Small và projector."""
-        self.context_encoder.unfreeze_backbone()
+    def unfreeze_backbone(self, unfreeze_last_n_blocks: Optional[int] = None) -> None:
+        self.context_encoder.unfreeze_backbone(unfreeze_last_n_blocks=unfreeze_last_n_blocks)
+
+    def set_backbone_trainable(self, trainable: bool, unfreeze_last_n_blocks: Optional[int] = 3) -> None:
+        """Đóng/mở khóa backbone MobileNetV3 theo epoch huấn luyện."""
+        if not trainable:
+            self.freeze_backbone(freeze=True, freeze_projector=False)
+        else:
+            self.unfreeze_backbone(unfreeze_last_n_blocks=unfreeze_last_n_blocks)
 
     @property
     def is_backbone_frozen(self) -> bool:
-        """Kiểm tra trạng thái đóng băng của backbone MobileNetV3-Small."""
         return self.context_encoder.is_backbone_frozen
 
-    def get_trainable_params_count(self) -> dict:
-        """
-        Thống kê chi tiết số lượng tham số khả học (trainable) và tổng tham số của mô hình.
-        """
+    def get_trainable_params_count(self) -> Dict[str, Any]:
         total = sum(p.numel() for p in self.parameters())
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         backbone_total = sum(p.numel() for p in self.context_encoder.features.parameters())
@@ -656,89 +763,5 @@ class LiteFat(nn.Module):
             "frozen_params": total - trainable,
             "backbone_total": backbone_total,
             "backbone_trainable": backbone_trainable,
-            "is_backbone_frozen": self.is_backbone_frozen
+            "is_backbone_frozen": self.is_backbone_frozen,
         }
-
-if __name__ == "__main__":
-    from loss import LiteFatLoss
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # Khởi tạo mô hình cho bài toán nhị phân trên YawDD (2 lớp: Bình thường vs. Ngáp)
-    # Hoặc đặt num_classes=3 cho bài toán 3 lớp (Bình thường, Ngáp, Nói chuyện)
-    model = LiteFat(
-        num_nodes=68,
-        feature_dim=64,
-        mobilenet_proj_hidden=192,
-        node_embed_dim=16,
-        num_classes=2,
-        pretrained_backbone=False
-    ).to(device)
-
-    # 1. Kiem tra ban dau khi chua freeze
-    stats_init = model.get_trainable_params_count()
-    print("=== 1. TRANG THAI BAN DAU (CHUA DONG BANG) ===")
-    print(f"Tong tham so: {stats_init['total_params']:,}")
-    print(f"Tham so Trainable: {stats_init['trainable_params']:,} | Frozen: {stats_init['frozen_params']:,}")
-    print(f"MobileNetV3 backbone trainable: {stats_init['backbone_trainable']:,} / {stats_init['backbone_total']:,}")
-    print(f"Trang thai is_backbone_frozen: {model.is_backbone_frozen}")
-    assert not model.is_backbone_frozen, "Backbone phai o trang thai unfrozen ban dau!"
-
-    # 2. Bat dong bang backbone (freeze_backbone=True)
-    print("\n=== 2. KICH HOAT DONG BANG (FREEZE BACKBONE) ===")
-    model.freeze_backbone(freeze=True, freeze_projector=False)
-    stats_frozen = model.get_trainable_params_count()
-    print(f"Tham so Trainable: {stats_frozen['trainable_params']:,} | Frozen: {stats_frozen['frozen_params']:,}")
-    print(f"MobileNetV3 backbone trainable: {stats_frozen['backbone_trainable']:,} / {stats_frozen['backbone_total']:,}")
-    print(f"Trang thai is_backbone_frozen: {model.is_backbone_frozen}")
-    assert model.is_backbone_frozen, "Backbone phai o trang thai frozen sau khi freeze_backbone(True)!"
-    assert stats_frozen['backbone_trainable'] == 0, "Backbone trainable params phai bang 0!"
-
-    # Gia lap 1 batch gom B=2 doan video, moi doan T=16 khung hinh (Section IV-A)
-    B, T, N = 2, 16, 68
-    dummy_frames = torch.randn(B, T, 3, 224, 224, device=device)
-    dummy_landmarks = torch.rand(B, T, N, 2, device=device)
-    dummy_labels = torch.tensor([0, 1], dtype=torch.long, device=device)
-
-    # Thiet lap bo toi uu hoa chi nhan cac tham so requires_grad
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.Adam(trainable_params, lr=1e-4)
-    criterion = LiteFatLoss()
-
-    # 1 buoc huan luyen khi backbone bi dong bang
-    model.train()
-    optimizer.zero_grad()
-    frame_logits, clip_logits = model(dummy_frames, dummy_landmarks)
-    loss = criterion(frame_logits, dummy_labels)
-    loss.backward()
-    optimizer.step()
-
-    # Xac nhan khong co gradient nao tich luy tren backbone
-    no_grad_on_backbone = all(p.grad is None for p in model.context_encoder.features.parameters())
-    print(f"Gia tri Loss khi freeze: {loss.item():.4f}")
-    print(f"Xac nhan khong co gradient tren MobileNetV3 features: {no_grad_on_backbone}")
-    assert no_grad_on_backbone, "Cac tham so cua backbone khong duoc phep co gradient khi dang bi dong bang!"
-
-    # 3. Mo khoa dong bang (Unfreeze)
-    print("\n=== 3. MO KHOA DONG BANG (UNFREEZE BACKBONE) ===")
-    model.unfreeze_backbone()
-    stats_unfrozen = model.get_trainable_params_count()
-    print(f"Tham so Trainable: {stats_unfrozen['trainable_params']:,} | Frozen: {stats_unfrozen['frozen_params']:,}")
-    print(f"MobileNetV3 backbone trainable: {stats_unfrozen['backbone_trainable']:,} / {stats_unfrozen['backbone_total']:,}")
-    print(f"Trang thai is_backbone_frozen: {model.is_backbone_frozen}")
-    assert not model.is_backbone_frozen, "Backbone phai o trang thai unfrozen sau khi unfreeze_backbone()!"
-    assert stats_unfrozen['trainable_params'] == stats_init['total_params'], "So tham so trainable phai phuc hoi 100%!"
-
-    # 4. Kiem thu che do Bat doi xung (Asymmetric Step) cho Snapdragon 680
-    print("\n=== 4. KIEM THU ASYMMETRIC INFERENCE ===")
-    model.eval()
-    d_cache = torch.zeros(1, T, 64, device=device)
-    lm_window = torch.rand(1, T, N, 2, device=device)
-    single_frame = torch.randn(1, 3, 224, 224, device=device)
-
-    # Frame 0: Cap nhat ca MobileNetV3 va Do thi STGL
-    probs_f0, d_cache = model.forward_asymmetric_step(lm_window, d_cache, current_frame=single_frame)
-    # Frame 1: Bo qua MobileNetV3 (current_frame=None), chi chay Do thi STGL
-    probs_f1, d_cache = model.forward_asymmetric_step(lm_window, d_cache, current_frame=None)
-    print(f"Xac suat du doan thoi gian thuc (Frame 1 - Fast Path): {probs_f1.cpu().numpy()}")
-    print("\n>>> TAT CA CAC BUOC KIEM TRA THANH CONG VUOT QUA! <<<")

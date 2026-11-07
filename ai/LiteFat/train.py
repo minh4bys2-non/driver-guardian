@@ -150,6 +150,8 @@ class LiteFatTrainer:
         # Tự động khôi phục nếu cfg.resume được cấu hình
         if self.cfg.resume:
             self.load_checkpoint(self.cfg.resume)
+        elif getattr(self.cfg, "pretrained_from", None):
+            self.load_pretrained_weights(self.cfg.pretrained_from)
 
     def _build_optimizer(self) -> torch.optim.Optimizer:
         """Thiết lập tốc độ học riêng biệt (Differential LR) cho Backbone và Graph/Head."""
@@ -271,6 +273,50 @@ class LiteFatTrainer:
         )
         self.logger.info("=" * 70)
 
+    def load_pretrained_weights(self, pretrained_path: str | Path) -> None:
+        """Nạp trọng số từng phần (Warm-start) từ checkpoint trước đó cho các tầng khớp kích thước."""
+        p = Path(pretrained_path)
+        if not p.is_file():
+            self.logger.warning(f"Không tìm thấy file pretrained_from tại '{pretrained_path}'. Bỏ qua nạp warm-start.")
+            return
+
+        self.logger.info(f"Đang nạp trọng số tiền huấn luyện (Warm-start) từ: {p}")
+        checkpoint = torch.load(p, map_location=self.device, weights_only=False)
+        saved_dict = checkpoint.get("model_state_dict", checkpoint)
+        curr_dict = self.model.state_dict()
+
+        matched_keys = []
+        adapted_keys = []
+        skipped_keys = []
+
+        for name, curr_param in curr_dict.items():
+            if name in saved_dict:
+                saved_param = saved_dict[name]
+                if curr_param.shape == saved_param.shape:
+                    curr_param.copy_(saved_param)
+                    matched_keys.append(name)
+                elif (
+                    curr_param.ndim == 4
+                    and saved_param.ndim == 4
+                    and curr_param.shape[:3] == saved_param.shape[:3]
+                ):
+                    # TCN Conv2d: shape [C_out, C_in, 1, kernel_size]
+                    # Kernel size tăng từ 2 lên 3: sao chép 2 trọng số nhân quả gần nhất vào cuối
+                    k_saved = saved_param.shape[-1]
+                    curr_param[..., -k_saved:].copy_(saved_param)
+                    adapted_keys.append(name)
+                else:
+                    skipped_keys.append(f"{name} (shape lệch: {saved_param.shape} vs {curr_param.shape})")
+            else:
+                skipped_keys.append(f"{name} (mới)")
+
+        self.logger.info("=" * 70)
+        self.logger.info(f"===> KẾT QUẢ WARM-START TỪ {p.name}:")
+        self.logger.info(f"===> Khớp hoàn toàn: {len(matched_keys)} tensors")
+        self.logger.info(f"===> Tương thích thích nghi (TCN kernel adaptation): {len(adapted_keys)} tensors")
+        self.logger.info(f"===> Khởi tạo mới: {len(skipped_keys)} tensors")
+        self.logger.info("=" * 70)
+
     def _build_scheduler(self) -> Any:
         """Thiết lập lịch trình học Cosine Annealing kèm Linear Warmup."""
         warmup_epochs = max(0, self.cfg.warmup_epochs)
@@ -378,12 +424,14 @@ class LiteFatTrainer:
             dataloader: Any,
             split_name: str = "val",
             epoch: Optional[int] = None,
-    ) -> Dict[str, float]:
+            return_raw: bool = False,
+    ) -> Any:
         """Đánh giá mô hình trên tập validation hoặc test."""
         self.model.eval()
         total_loss = 0.0
         all_targets: List[int] = []
         all_preds: List[int] = []
+        all_probs: List[float] = []
         num_batches = len(dataloader)
 
         start_time = time.time()
@@ -430,10 +478,12 @@ class LiteFatTrainer:
                 )
 
             total_loss += loss.item()
+            probs = torch.softmax(clip_logits, dim=-1)[:, 1].cpu().numpy()
             preds = torch.argmax(clip_logits, dim=-1).cpu().numpy()
             targets = batch_labels.cpu().numpy()
             all_preds.extend(preds.tolist())
             all_targets.extend(targets.tolist())
+            all_probs.extend(probs.tolist())
 
             pbar.set_postfix({
                 "loss": f"{loss.item():.4f}",
@@ -445,6 +495,8 @@ class LiteFatTrainer:
         metrics["loss"] = total_loss / max(1, num_batches)
         metrics["time"] = elapsed
 
+        if return_raw:
+            return metrics, np.array(all_targets), np.array(all_probs)
         return metrics
 
     def train(self) -> None:
@@ -473,8 +525,8 @@ class LiteFatTrainer:
             # Log chỉ số ra Console
             self.logger.info(
                 f"Epoch [{epoch:02d}/{self.cfg.epochs:02d}] \n"
-                f"\t Train Loss: {train_metrics['loss']:.4f} | Train Acc: {train_metrics['accuracy']*100:.2f}% | Train F1: {train_metrics['f1']:.4f} |\n "
-                f"\t Val Loss: {val_metrics['loss']:.4f} | Val Acc: {val_metrics['accuracy']*100:.2f}% | Val F1: {val_metrics['f1']:.4f} (Rec: {val_metrics['recall']*100:.1f}%) | \n"
+                f"\t Train: Loss={train_metrics['loss']:.4f} | Acc={train_metrics['accuracy']*100:.2f}% | F1={train_metrics['f1']:.4f} (Prec={train_metrics['precision']*100:.1f}%, Rec={train_metrics['recall']*100:.1f}%) |\n"
+                f"\t Val  : Loss={val_metrics['loss']:.4f} | Acc={val_metrics['accuracy']*100:.2f}% | F1={val_metrics['f1']:.4f} (Prec={val_metrics['precision']*100:.1f}%, Rec={val_metrics['recall']*100:.1f}%, F2={val_metrics['f2']:.4f}) |\n"
                 f"\t LR: {current_lr:.2e} | Time: {train_metrics['time']:.1f}s"
             )
 
@@ -496,7 +548,13 @@ class LiteFatTrainer:
             }
             self.history.append(record)
 
-            # Lưu checkpoint cuối cùng (last.pt)
+            # 1. Cập nhật kỷ lục best.pt TRƯỚC khi đóng gói và lưu last.pt / epoch_XX.pt
+            is_new_best = val_metrics["f1"] > self.best_val_f1
+            if is_new_best:
+                self.best_val_f1 = val_metrics["f1"]
+                self.best_epoch = epoch
+
+            # 2. Lưu checkpoint cuối cùng (last.pt)
             checkpoint_payload = {
                 "epoch": epoch,
                 "model_state_dict": self.model.state_dict(),
@@ -511,16 +569,12 @@ class LiteFatTrainer:
             }
             atomic_save(checkpoint_payload, self.save_dir / "last.pt")
 
-            # Lưu checkpoint định kỳ theo save_freq
+            # 3. Lưu checkpoint định kỳ theo save_freq
             if epoch % self.cfg.save_freq == 0:
                 atomic_save(checkpoint_payload, self.save_dir / f"epoch_{epoch:02d}.pt")
 
-            # Lưu checkpoint tốt nhất (best.pt) theo Val F1
-            if val_metrics["f1"] > self.best_val_f1:
-                self.best_val_f1 = val_metrics["f1"]
-                self.best_epoch = epoch
-                checkpoint_payload["best_epoch"] = self.best_epoch
-                checkpoint_payload["best_val_f1"] = self.best_val_f1
+            # 4. Lưu checkpoint tốt nhất (best.pt)
+            if is_new_best:
                 atomic_save(checkpoint_payload, self.save_dir / "best.pt")
                 with open(self.save_dir / "best_metrics.json", "w", encoding="utf-8") as f:
                     json.dump({"best_epoch": epoch, "metrics": val_metrics}, f, indent=2)
@@ -534,7 +588,7 @@ class LiteFatTrainer:
         self.writer.close()
 
     def evaluate_test(self) -> Dict[str, float]:
-        """Tải checkpoint best.pt và đánh giá trên tập Test độc lập."""
+        """Tải checkpoint best.pt và đánh giá trên tập Test độc lập kèm Calibration ngưỡng."""
         best_pt_path = self.save_dir / "best.pt"
         if not best_pt_path.is_file():
             self.logger.warning(f"Không tìm thấy checkpoint {best_pt_path} để đánh giá test.")
@@ -544,9 +598,25 @@ class LiteFatTrainer:
         checkpoint = torch.load(best_pt_path, map_location=self.device, weights_only=False)
         self.model.load_state_dict(checkpoint["model_state_dict"])
 
-        test_metrics = self._evaluate_epoch(self.test_loader, split_name="test")
+        # 1. Tìm ngưỡng tối ưu trên tập Validation
+        val_metrics, val_targets, val_probs = self._evaluate_epoch(self.val_loader, split_name="val", return_raw=True)
+        best_th = 0.5
+        best_val_f1 = val_metrics["f1"]
+        for th in np.linspace(0.30, 0.70, 41):
+            m_th = compute_metrics(val_targets, (val_probs >= th).astype(int))
+            if m_th["f1"] > best_val_f1:
+                best_val_f1 = m_th["f1"]
+                best_th = float(th)
+
         self.logger.info(
-            f"Test Loss: {test_metrics['loss']:.4f} | "
+            f"Ngưỡng tối ưu trên Validation: {best_th:.2f} "
+            f"(Val F1: {best_val_f1:.4f} vs thr 0.50: {val_metrics['f1']:.4f})"
+        )
+
+        # 2. Đánh giá trên tập Test với cả ngưỡng mặc định và ngưỡng tối ưu
+        test_metrics, test_targets, test_probs = self._evaluate_epoch(self.test_loader, split_name="test", return_raw=True)
+        self.logger.info(
+            f"[Ngưỡng mặc định 0.50] Test Loss: {test_metrics['loss']:.4f} | "
             f"Test Acc: {test_metrics['accuracy']*100:.2f}% | "
             f"Test Precision: {test_metrics['precision']*100:.2f}% | "
             f"Test Recall: {test_metrics['recall']*100:.2f}% | "
@@ -554,8 +624,26 @@ class LiteFatTrainer:
             f"Test F2: {test_metrics['f2']:.4f}"
         )
 
+        calibrated_test_metrics = compute_metrics(test_targets, (test_probs >= best_th).astype(int))
+        calibrated_test_metrics["loss"] = test_metrics["loss"]
+        calibrated_test_metrics["optimal_threshold"] = best_th
+
+        self.logger.info(
+            f"[Ngưỡng tối ưu {best_th:.2f}] Test Acc: {calibrated_test_metrics['accuracy']*100:.2f}% | "
+            f"Test Precision: {calibrated_test_metrics['precision']*100:.2f}% | "
+            f"Test Recall: {calibrated_test_metrics['recall']*100:.2f}% | "
+            f"Test F1: {calibrated_test_metrics['f1']:.4f} | "
+            f"Test F2: {calibrated_test_metrics['f2']:.4f}"
+        )
+
+        output_payload = {
+            "default_metrics": test_metrics,
+            "calibrated_metrics": calibrated_test_metrics,
+            "optimal_threshold": best_th,
+            "best_epoch": self.best_epoch,
+        }
         with open(self.save_dir / "test_metrics.json", "w", encoding="utf-8") as f:
-            json.dump(test_metrics, f, indent=2)
+            json.dump(output_payload, f, indent=2)
 
         return test_metrics
 

@@ -56,10 +56,10 @@ class TrainConfig:
     manifest_filename: str = "dataset_merged_split.csv"
 
     # Thư mục lưu kết quả huấn luyện (checkpoints, metrics json, cấu hình)
-    checkpoint_dir: str = "checkpoints/LiteFat"
+    checkpoint_dir: str = "checkpoints/LiteFat_v2_pretrain"
 
     # Thư mục lưu log TensorBoard
-    log_dir: str = "checkpoints/LiteFat/logs"
+    log_dir: str = "checkpoints/LiteFat_v2_pretrain/logs"
 
     # =================================================================
     # 2. CHẾ ĐỘ ĐA PHƯƠNG THỨC & NGỮ CẢNH THỊ GIÁC (VISUAL CONTEXT)
@@ -125,8 +125,8 @@ class TrainConfig:
     end_channels: int = 256
     num_classes: int = 2
     num_blocks: int = 3
-    layers_per_block: int = 2
-    kernel_size: int = 2
+    layers_per_block: int = 3
+    kernel_size: int = 3
     dropout: float = 0.4
     pretrained_backbone: bool = True
 
@@ -146,7 +146,7 @@ class TrainConfig:
     # =================================================================
     # 6. THAM SỐ HUẤN LUYỆN & TỐI ƯU HÓA (OPTIMIZATION)
     # =================================================================
-    epochs: int = 20
+    epochs: int = 10
     batch_size: int = 8
     num_workers: int = 0
     pin_memory: bool = True
@@ -165,7 +165,7 @@ class TrainConfig:
     freeze_backbone_epochs: int = 5
 
     # Số epoch làm nóng tốc độ học (Linear Warmup)
-    warmup_epochs: int = 0
+    warmup_epochs: int = 2
 
     # Giới hạn chuẩn đạo hàm để chống nổ gradient (Gradient Clipping)
     grad_clip: float = 1.0
@@ -177,7 +177,10 @@ class TrainConfig:
     save_freq: int = 1
 
     # Đường dẫn tới tệp checkpoint để tiếp tục huấn luyện (ví dụ: "checkpoints/LiteFat/epoch_03.pt" hoặc "checkpoints/LiteFat/last.pt").
-    resume: Optional[str] = r"checkpoints/LiteFat/last.pt"
+    resume: Optional[str] = None
+
+    # Đường dẫn checkpoint tiền huấn luyện để khởi tạo ấm (Warm-start) các tầng khớp kích thước từ Epoch 1
+    pretrained_from: Optional[str] = r"checkpoints/LiteFat/best.pt"
     # =================================================================
     # 7. HÀM MẤT MÁT (LOSS CONFIGURATION)
     # =================================================================
@@ -189,7 +192,6 @@ class TrainConfig:
 
     # Hệ số làm mượt nhãn (Label Smoothing) chống overfitting
     label_smoothing: float = 0.1
-
 
     def to_dict(self) -> Dict[str, Any]:
         """Chuyển cấu hình thành từ điển (Dict)."""

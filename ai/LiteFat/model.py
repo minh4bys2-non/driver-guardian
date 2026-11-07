@@ -590,7 +590,7 @@ class LiteFat(nn.Module):
         )
 
         # 2. Dung hợp đa phương thức FiLM chống Rank-1 Bottleneck
-        self.fusion = MultimodalFusionModule(
+        self.fusioSelfAdaptiveAdjacencyn = MultimodalFusionModule(
             num_features=6,
             feature_dim=feature_dim,
             num_nodes=num_nodes,
@@ -631,6 +631,13 @@ class LiteFat(nn.Module):
         # Attentive Node Pooling: Tự học trọng số chú ý trên 68 đỉnh khuôn mặt
         self.node_gate = nn.Conv2d(num_classes, 1, kernel_size=(1, 1))
 
+        # Attentive Temporal Pooling: Tự học trọng số chú ý cho các thời điểm quan trọng trong cửa sổ T
+        self.temporal_gate = nn.Sequential(
+            nn.Linear(num_classes, 16),
+            nn.GELU(),
+            nn.Linear(16, 1),
+        )
+
     def forward_stgl_from_fused(
             self,
             X: torch.Tensor,
@@ -653,14 +660,25 @@ class LiteFat(nn.Module):
         gate = F.softmax(self.node_gate(out), dim=2)  # [B, 1, N, T]
         frame_logits = (out * gate).sum(dim=2).permute(0, 2, 1).contiguous()  # [B, T, num_classes]
 
-        # Tính toán dự đoán cấp đoạn video (Clip Logits)
+        # Tính toán dự đoán cấp đoạn video (Clip Logits): Kết hợp Mean Pooling + Attentive Temporal Pooling
+        temp_scores = self.temporal_gate(frame_logits)  # [B, T, 1]
         if lengths is not None:
             B, T, _ = frame_logits.shape
-            valid_mask = (torch.arange(T, device=frame_logits.device).unsqueeze(0) < lengths.to(frame_logits.device).unsqueeze(1)).unsqueeze(-1).type_as(frame_logits)
+            valid_bool = (torch.arange(T, device=frame_logits.device).unsqueeze(0) < lengths.to(frame_logits.device).unsqueeze(1)).unsqueeze(-1)
+            valid_mask = valid_bool.type_as(frame_logits)
             denom = valid_mask.sum(dim=1).clamp(min=1.0)
-            clip_logits = (frame_logits * valid_mask).sum(dim=1) / denom
+            mean_logits = (frame_logits * valid_mask).sum(dim=1) / denom
+
+            masked_scores = temp_scores.masked_fill(~valid_bool, -1e4)
+            temp_weights = F.softmax(masked_scores, dim=1) * valid_mask
+            temp_weights = temp_weights / temp_weights.sum(dim=1, keepdim=True).clamp(min=1e-6)
+            attn_logits = (frame_logits * temp_weights).sum(dim=1)
         else:
-            clip_logits = frame_logits.mean(dim=1)  # [B, num_classes]
+            mean_logits = frame_logits.mean(dim=1)
+            temp_weights = F.softmax(temp_scores, dim=1)
+            attn_logits = (frame_logits * temp_weights).sum(dim=1)
+
+        clip_logits = 0.5 * mean_logits + 0.5 * attn_logits
 
         return frame_logits, clip_logits
 

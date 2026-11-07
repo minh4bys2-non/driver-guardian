@@ -67,7 +67,7 @@ class TrainConfig:
     # Bật/tắt nhánh MobileNetV3-Small trích xuất ngữ cảnh thị giác từ ảnh khuôn mặt.
     # True: Huấn luyện đa phương thức (Landmark + Face Crops).
     # False: Chỉ huấn luyện đồ thị từ Landmark (không cần giải mã video, siêu nhanh).
-    use_visual_context: bool = True
+    use_visual_context: bool = False
 
     # Kích thước ảnh khung hình đưa vào trích xuất điểm mốc letterbox (w, h)
     letterbox_size: Tuple[int, int] = (640, 480)
@@ -146,7 +146,7 @@ class TrainConfig:
     # =================================================================
     # 6. THAM SỐ HUẤN LUYỆN & TỐI ƯU HÓA (OPTIMIZATION)
     # =================================================================
-    epochs: int = 10
+    epochs: int = 20
     batch_size: int = 8
     num_workers: int = 0
     pin_memory: bool = True
@@ -177,7 +177,7 @@ class TrainConfig:
     save_freq: int = 1
 
     # Đường dẫn tới tệp checkpoint để tiếp tục huấn luyện (ví dụ: "checkpoints/LiteFat/epoch_03.pt" hoặc "checkpoints/LiteFat/last.pt").
-    resume: Optional[str] = r"checkpoints/LiteFat/best.pt"
+    resume: Optional[str] = r"checkpoints/LiteFat/last.pt"
     # =================================================================
     # 7. HÀM MẤT MÁT (LOSS CONFIGURATION)
     # =================================================================

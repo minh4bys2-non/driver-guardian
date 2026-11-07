@@ -473,7 +473,7 @@ class LiteFatTrainer:
             # Log chỉ số ra Console
             self.logger.info(
                 f"Epoch [{epoch:02d}/{self.cfg.epochs:02d}] \n"
-                f"\t Train Loss: {train_metrics['loss']:.4f} | Train Acc: {train_metrics['accuracy']*100:.2f}% | Train F1: {train_metrics['f1']:.4f} |\n| "
+                f"\t Train Loss: {train_metrics['loss']:.4f} | Train Acc: {train_metrics['accuracy']*100:.2f}% | Train F1: {train_metrics['f1']:.4f} |\n "
                 f"\t Val Loss: {val_metrics['loss']:.4f} | Val Acc: {val_metrics['accuracy']*100:.2f}% | Val F1: {val_metrics['f1']:.4f} (Rec: {val_metrics['recall']*100:.1f}%) | \n"
                 f"\t LR: {current_lr:.2e} | Time: {train_metrics['time']:.1f}s"
             )

@@ -87,9 +87,12 @@ class LiteFatTrainer:
             flip_prob=self.cfg.flip_prob,
             scale_jitter=self.cfg.scale_jitter,
             shift_jitter=self.cfg.shift_jitter,
+            roll_deg=getattr(self.cfg, "roll_deg", 12.0),
+            temporal_dropout=getattr(self.cfg, "temporal_dropout", 0.05),
             landmark_noise_std=self.cfg.landmark_noise_std,
             color_jitter=self.cfg.color_jitter,
             spatial_dropout=self.cfg.spatial_dropout,
+            subject_balanced_sampling=getattr(self.cfg, "subject_balanced_sampling", True),
         )
         self.logger.info(
             f"Kích thước tập dữ liệu: Train={len(self.train_loader.dataset)} | "
@@ -131,6 +134,18 @@ class LiteFatTrainer:
             label_smoothing=self.cfg.label_smoothing,
         ).to(self.device)
 
+        # Các biến theo dõi thực nghiệm
+        self.start_epoch = 1
+        self.best_val_f1 = -1.0
+        self.best_val_score = -1.0
+        self.best_epoch = -1
+        self.history: List[Dict[str, Any]] = []
+        self.pretrained_param_names: set[str] = set()
+
+        # Nạp trọng số tiền huấn luyện (Warm-start) nếu được yêu cầu trước khi tạo Optimizer
+        if getattr(self.cfg, "pretrained_from", None) and not self.cfg.resume:
+            self.load_pretrained_weights(self.cfg.pretrained_from)
+
         # 7. Thiết lập Bộ tối ưu hóa Differential Learning Rate (AdamW)
         self.optimizer = self._build_optimizer()
 
@@ -141,36 +156,51 @@ class LiteFatTrainer:
         amp_enabled = self.cfg.use_amp and self.device.type == "cuda"
         self.scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
 
-        # Các biến theo dõi thực nghiệm
-        self.start_epoch = 1
-        self.best_val_f1 = -1.0
-        self.best_epoch = -1
-        self.history: List[Dict[str, Any]] = []
-
         # Tự động khôi phục nếu cfg.resume được cấu hình
         if self.cfg.resume:
             self.load_checkpoint(self.cfg.resume)
-        elif getattr(self.cfg, "pretrained_from", None):
-            self.load_pretrained_weights(self.cfg.pretrained_from)
 
     def _build_optimizer(self) -> torch.optim.Optimizer:
-        """Thiết lập tốc độ học riêng biệt (Differential LR) cho Backbone và Graph/Head."""
+        """Thiết lập tốc độ học riêng biệt (Differential LR) cho Backbone, Pretrained STGL và New STGL."""
         backbone_params = []
-        graph_params = []
+        matched_graph_params = []
+        new_graph_params = []
+
+        pretrained_scale = float(getattr(self.cfg, "pretrained_lr_scale", 1.0))
+        has_pretrained = bool(self.pretrained_param_names) and (pretrained_scale < 1.0)
 
         for name, param in self.model.named_parameters():
+            if not param.requires_grad:
+                continue
             if "context_encoder.features" in name:
                 backbone_params.append(param)
+            elif has_pretrained and name in self.pretrained_param_names:
+                matched_graph_params.append(param)
             else:
-                graph_params.append(param)
+                new_graph_params.append(param)
 
-        param_groups = [
-            {"params": graph_params, "lr": self.cfg.lr, "weight_decay": self.cfg.weight_decay},
-        ]
-        if backbone_params and self.cfg.use_visual_context:
-            param_groups.append(
-                {"params": backbone_params, "lr": self.cfg.backbone_lr, "weight_decay": self.cfg.weight_decay}
+        param_groups = []
+        if matched_graph_params:
+            param_groups.append({
+                "params": matched_graph_params,
+                "lr": self.cfg.lr * pretrained_scale,
+                "weight_decay": self.cfg.weight_decay,
+            })
+            self.logger.info(
+                f"Đã gán Warm-start LR={self.cfg.lr * pretrained_scale:.2e} (scale={pretrained_scale}) cho {len(matched_graph_params)} tham số pretrained."
             )
+        if new_graph_params:
+            param_groups.append({
+                "params": new_graph_params,
+                "lr": self.cfg.lr,
+                "weight_decay": self.cfg.weight_decay,
+            })
+        if backbone_params and self.cfg.use_visual_context:
+            param_groups.append({
+                "params": backbone_params,
+                "lr": self.cfg.backbone_lr,
+                "weight_decay": self.cfg.weight_decay,
+            })
 
         optimizer = torch.optim.AdamW(param_groups)
         return optimizer
@@ -229,7 +259,19 @@ class LiteFatTrainer:
         if "optimizer_state_dict" in checkpoint:
             self._safe_load_optimizer(checkpoint["optimizer_state_dict"])
         if "scheduler_state_dict" in checkpoint:
-            self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+            saved_cfg_epochs = checkpoint.get("config", {}).get("epochs", None)
+            if saved_cfg_epochs is not None and saved_cfg_epochs != self.cfg.epochs:
+                self.logger.warning(
+                    f"Phát hiện thay đổi tổng số epochs ({saved_cfg_epochs} -> {self.cfg.epochs}). "
+                    f"Tự động tái lập lịch trình Cosine mượt từ Epoch {self.start_epoch} đến Epoch {self.cfg.epochs}."
+                )
+                remaining_epochs = max(1, self.cfg.epochs - self.start_epoch + 1)
+                def resume_lr_lambda(ep_offset: int) -> float:
+                    progress = float(ep_offset) / float(max(1, remaining_epochs))
+                    return 0.5 * (1.0 + math.cos(math.pi * progress))
+                self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=resume_lr_lambda)
+            else:
+                self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         if "scaler_state_dict" in checkpoint and self.scaler.is_enabled():
             self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
 
@@ -237,9 +279,10 @@ class LiteFatTrainer:
         ckpt_epoch = checkpoint.get("epoch", 0)
         self.start_epoch = ckpt_epoch + 1
 
-        if "best_epoch" in checkpoint and "best_val_f1" in checkpoint:
-            self.best_epoch = checkpoint["best_epoch"]
-            self.best_val_f1 = checkpoint["best_val_f1"]
+        if "best_epoch" in checkpoint:
+            self.best_epoch = checkpoint.get("best_epoch", -1)
+            self.best_val_f1 = checkpoint.get("best_val_f1", -1.0)
+            self.best_val_score = checkpoint.get("best_val_score", self.best_val_f1)
         else:
             # Dự phòng từ best_metrics.json hoặc metrics của checkpoint
             best_json_path = self.save_dir / "best_metrics.json"
@@ -250,10 +293,12 @@ class LiteFatTrainer:
                     if data.get("best_epoch", 0) <= ckpt_epoch:
                         self.best_epoch = data["best_epoch"]
                         self.best_val_f1 = data.get("metrics", {}).get("f1", -1.0)
+                        self.best_val_score = data.get("metrics", {}).get("val_score", self.best_val_f1)
                 except Exception:
                     pass
             if self.best_val_f1 < 0 and "val_metrics" in checkpoint:
                 self.best_val_f1 = checkpoint["val_metrics"].get("f1", -1.0)
+                self.best_val_score = checkpoint["val_metrics"].get("val_score", self.best_val_f1)
                 self.best_epoch = ckpt_epoch
 
         # 4. Đồng bộ trạng thái đóng/mở băng backbone theo start_epoch
@@ -274,7 +319,7 @@ class LiteFatTrainer:
         self.logger.info("=" * 70)
 
     def load_pretrained_weights(self, pretrained_path: str | Path) -> None:
-        """Nạp trọng số từng phần (Warm-start) từ checkpoint trước đó cho các tầng khớp kích thước."""
+        """Nạp trọng số từng phần (Warm-start) từ checkpoint trước đó cho các tầng khớp kích thước, hỗ trợ ánh xạ theo block."""
         p = Path(pretrained_path)
         if not p.is_file():
             self.logger.warning(f"Không tìm thấy file pretrained_from tại '{pretrained_path}'. Bỏ qua nạp warm-start.")
@@ -285,36 +330,73 @@ class LiteFatTrainer:
         saved_dict = checkpoint.get("model_state_dict", checkpoint)
         curr_dict = self.model.state_dict()
 
+        # Xác định cấu trúc số tầng STGL của checkpoint cũ vs mô hình hiện tại
+        saved_stgl_indices = sorted(list(set(int(k.split(".")[1]) for k in saved_dict if k.startswith("stgl_blocks."))))
+        curr_stgl_indices = sorted(list(set(int(k.split(".")[1]) for k in curr_dict if k.startswith("stgl_blocks."))))
+
+        num_blocks = getattr(self.model, "num_blocks", 3)
+        saved_lpb = len(saved_stgl_indices) // num_blocks if saved_stgl_indices else 0
+        curr_lpb = len(curr_stgl_indices) // num_blocks if curr_stgl_indices else 0
+
+        # Ánh xạ theo từng Block logic: (block b, layer l) -> (block b, layer l)
+        block_mapping = {}
+        if saved_lpb > 0 and curr_lpb > 0:
+            for b in range(num_blocks):
+                for l in range(min(saved_lpb, curr_lpb)):
+                    s_idx = b * saved_lpb + l
+                    c_idx = b * curr_lpb + l
+                    block_mapping[c_idx] = s_idx
+
         matched_keys = []
         adapted_keys = []
         skipped_keys = []
+        self.pretrained_param_names = set()
 
         for name, curr_param in curr_dict.items():
-            if name in saved_dict:
-                saved_param = saved_dict[name]
+            if name.startswith("stgl_blocks."):
+                parts = name.split(".")
+                c_idx = int(parts[1])
+                suffix = ".".join(parts[2:])
+                if c_idx in block_mapping:
+                    saved_name = f"stgl_blocks.{block_mapping[c_idx]}.{suffix}"
+                else:
+                    saved_name = None
+            else:
+                saved_name = name
+
+            if saved_name is not None and saved_name in saved_dict:
+                saved_param = saved_dict[saved_name]
                 if curr_param.shape == saved_param.shape:
                     curr_param.copy_(saved_param)
-                    matched_keys.append(name)
+                    matched_keys.append(f"{name} <- {saved_name}")
+                    self.pretrained_param_names.add(name)
                 elif (
                     curr_param.ndim == 4
                     and saved_param.ndim == 4
                     and curr_param.shape[:3] == saved_param.shape[:3]
                 ):
                     # TCN Conv2d: shape [C_out, C_in, 1, kernel_size]
-                    # Kernel size tăng từ 2 lên 3: sao chép 2 trọng số nhân quả gần nhất vào cuối
+                    # Khởi tạo 0 toàn bộ kernel mới, sao chép kernel cũ vào các vị trí nhân quả cuối
+                    curr_param.zero_()
                     k_saved = saved_param.shape[-1]
                     curr_param[..., -k_saved:].copy_(saved_param)
-                    adapted_keys.append(name)
+                    adapted_keys.append(f"{name} (kernel {k_saved} -> {curr_param.shape[-1]})")
+                    self.pretrained_param_names.add(name)
                 else:
                     skipped_keys.append(f"{name} (shape lệch: {saved_param.shape} vs {curr_param.shape})")
             else:
-                skipped_keys.append(f"{name} (mới)")
+                # Tầng mới: Zero-init skip_conv và res_scale để tầng mới bắt đầu như identity pass-through
+                if name.startswith("stgl_blocks.") and ("skip_conv" in name or "res_scale" in name):
+                    curr_param.zero_()
+                    skipped_keys.append(f"{name} (tầng mới - zero-init)")
+                else:
+                    skipped_keys.append(f"{name} (mới)")
 
         self.logger.info("=" * 70)
         self.logger.info(f"===> KẾT QUẢ WARM-START TỪ {p.name}:")
         self.logger.info(f"===> Khớp hoàn toàn: {len(matched_keys)} tensors")
         self.logger.info(f"===> Tương thích thích nghi (TCN kernel adaptation): {len(adapted_keys)} tensors")
-        self.logger.info(f"===> Khởi tạo mới: {len(skipped_keys)} tensors")
+        self.logger.info(f"===> Khởi tạo mới / Zero-init: {len(skipped_keys)} tensors")
         self.logger.info("=" * 70)
 
     def _build_scheduler(self) -> Any:
@@ -388,7 +470,15 @@ class LiteFatTrainer:
                     lengths=batch_lengths,
                 )
 
-            # Backward Pass với GradScaler
+            # Backward Pass với GradScaler (kèm kiểm tra an toàn số học)
+            if not torch.isfinite(loss):
+                self.logger.warning(
+                    f"Epoch {epoch:02d} | Batch {batch_idx + 1}/{num_batches}: Loss không hữu hạn ({loss.item()})! "
+                    "Bỏ qua cập nhật gradient để bảo vệ trọng số mô hình."
+                )
+                self.optimizer.zero_grad(set_to_none=True)
+                continue
+
             self.scaler.scale(loss).backward()
 
             if self.cfg.grad_clip > 0:
@@ -491,12 +581,40 @@ class LiteFatTrainer:
             })
 
         elapsed = time.time() - start_time
-        metrics = compute_metrics(np.array(all_targets), np.array(all_preds))
+        targets_np = np.array(all_targets)
+        preds_np = np.array(all_preds)
+        probs_np = np.array(all_probs)
+
+        metrics = compute_metrics(targets_np, preds_np, probs_np)
         metrics["loss"] = total_loss / max(1, num_batches)
         metrics["time"] = elapsed
 
+        # Quét ngưỡng tối ưu (Threshold Calibration) cân bằng Recall & Specificity
+        best_th = 0.50
+        candidates = []
+        for th in np.linspace(0.35, 0.65, 31):
+            m_th = compute_metrics(targets_np, (probs_np >= th).astype(int), probs_np)
+            candidates.append((float(th), m_th))
+
+        valid_candidates = [c for c in candidates if c[1]["specificity"] >= 0.50 and c[1]["recall"] >= 0.50]
+        if valid_candidates:
+            best_th, best_m = max(valid_candidates, key=lambda c: c[1]["f1"])
+        else:
+            best_th, best_m = max(candidates, key=lambda c: c[1]["f1"])
+
+        metrics["optimal_threshold"] = best_th
+        metrics["calibrated_f1"] = best_m["f1"]
+        metrics["calibrated_accuracy"] = best_m["accuracy"]
+        metrics["calibrated_recall"] = best_m["recall"]
+        metrics["calibrated_precision"] = best_m["precision"]
+        metrics["calibrated_specificity"] = best_m["specificity"]
+
+        auc = metrics.get("auc", 0.5)
+        # Composite validation score kết hợp hài hòa F1, AUC và Accuracy
+        metrics["val_score"] = 0.50 * metrics["calibrated_f1"] + 0.30 * auc + 0.20 * metrics["accuracy"]
+
         if return_raw:
-            return metrics, np.array(all_targets), np.array(all_probs)
+            return metrics, targets_np, probs_np
         return metrics
 
     def train(self) -> None:
@@ -525,8 +643,10 @@ class LiteFatTrainer:
             # Log chỉ số ra Console
             self.logger.info(
                 f"Epoch [{epoch:02d}/{self.cfg.epochs:02d}] \n"
-                f"\t Train: Loss={train_metrics['loss']:.4f} | Acc={train_metrics['accuracy']*100:.2f}% | F1={train_metrics['f1']:.4f} (Prec={train_metrics['precision']*100:.1f}%, Rec={train_metrics['recall']*100:.1f}%) |\n"
-                f"\t Val  : Loss={val_metrics['loss']:.4f} | Acc={val_metrics['accuracy']*100:.2f}% | F1={val_metrics['f1']:.4f} (Prec={val_metrics['precision']*100:.1f}%, Rec={val_metrics['recall']*100:.1f}%, F2={val_metrics['f2']:.4f}) |\n"
+                f"\t Train: Loss={train_metrics['loss']:.4f} | Acc={train_metrics['accuracy']*100:.2f}% | F1={train_metrics['f1']:.4f} |\n"
+                f"\t Val  : Loss={val_metrics['loss']:.4f} | Acc={val_metrics['accuracy']*100:.2f}% | AUC={val_metrics.get('auc', 0.5):.4f} | Score={val_metrics.get('val_score', 0.0):.4f} |\n"
+                f"\t Val @0.50: F1={val_metrics['f1']:.4f} (Prec={val_metrics['precision']*100:.1f}%, Rec={val_metrics['recall']*100:.1f}%) |\n"
+                f"\t Val @{val_metrics.get('optimal_threshold', 0.50):.2f}: F1={val_metrics.get('calibrated_f1', 0.0):.4f} (Prec={val_metrics.get('calibrated_precision', 0.0)*100:.1f}%, Rec={val_metrics.get('calibrated_recall', 0.0)*100:.1f}%, Spec={val_metrics.get('calibrated_specificity', 0.0)*100:.1f}%) |\n"
                 f"\t LR: {current_lr:.2e} | Time: {train_metrics['time']:.1f}s"
             )
 
@@ -537,6 +657,10 @@ class LiteFatTrainer:
             self.writer.add_scalar("Accuracy/Val", val_metrics["accuracy"], epoch)
             self.writer.add_scalar("F1/Train", train_metrics["f1"], epoch)
             self.writer.add_scalar("F1/Val", val_metrics["f1"], epoch)
+            self.writer.add_scalar("AUC/Val", val_metrics.get("auc", 0.5), epoch)
+            self.writer.add_scalar("Score/Val", val_metrics.get("val_score", 0.0), epoch)
+            self.writer.add_scalar("Calibrated_F1/Val", val_metrics.get("calibrated_f1", 0.0), epoch)
+            self.writer.add_scalar("Optimal_Threshold/Val", val_metrics.get("optimal_threshold", 0.50), epoch)
             self.writer.add_scalar("Recall/Val", val_metrics["recall"], epoch)
             self.writer.add_scalar("LR", current_lr, epoch)
 
@@ -548,10 +672,12 @@ class LiteFatTrainer:
             }
             self.history.append(record)
 
-            # 1. Cập nhật kỷ lục best.pt TRƯỚC khi đóng gói và lưu last.pt / epoch_XX.pt
-            is_new_best = val_metrics["f1"] > self.best_val_f1
+            # 1. Cập nhật kỷ lục best.pt theo composite val_score (tránh chọn các epoch FP ảo)
+            cur_val_score = val_metrics.get("val_score", val_metrics["f1"])
+            is_new_best = cur_val_score > self.best_val_score
             if is_new_best:
-                self.best_val_f1 = val_metrics["f1"]
+                self.best_val_score = cur_val_score
+                self.best_val_f1 = val_metrics.get("calibrated_f1", val_metrics["f1"])
                 self.best_epoch = epoch
 
             # 2. Lưu checkpoint cuối cùng (last.pt)
@@ -562,6 +688,7 @@ class LiteFatTrainer:
                 "scheduler_state_dict": self.scheduler.state_dict(),
                 "scaler_state_dict": self.scaler.state_dict(),
                 "best_epoch": self.best_epoch,
+                "best_val_score": self.best_val_score,
                 "best_val_f1": self.best_val_f1,
                 "val_metrics": val_metrics,
                 "train_metrics": train_metrics,
@@ -578,7 +705,10 @@ class LiteFatTrainer:
                 atomic_save(checkpoint_payload, self.save_dir / "best.pt")
                 with open(self.save_dir / "best_metrics.json", "w", encoding="utf-8") as f:
                     json.dump({"best_epoch": epoch, "metrics": val_metrics}, f, indent=2)
-                self.logger.info(f"===> ĐÃ LƯU CHECKPOINT TỐT NHẤT TẠI EPOCH {epoch} (Val F1: {self.best_val_f1:.4f})")
+                self.logger.info(
+                    f"===> ĐÃ LƯU CHECKPOINT TỐT NHẤT TẠI EPOCH {epoch} "
+                    f"(Score: {self.best_val_score:.4f} | Calib F1: {self.best_val_f1:.4f} | AUC: {val_metrics.get('auc', 0.5):.4f})"
+                )
 
         self.logger.info("\n>>> HOÀN THÀNH HUẤN LUYỆN! <<<")
         self.logger.info(f"Checkpoint tốt nhất: Epoch {self.best_epoch} (Val F1: {self.best_val_f1:.4f})")
@@ -600,17 +730,12 @@ class LiteFatTrainer:
 
         # 1. Tìm ngưỡng tối ưu trên tập Validation
         val_metrics, val_targets, val_probs = self._evaluate_epoch(self.val_loader, split_name="val", return_raw=True)
-        best_th = 0.5
-        best_val_f1 = val_metrics["f1"]
-        for th in np.linspace(0.30, 0.70, 41):
-            m_th = compute_metrics(val_targets, (val_probs >= th).astype(int))
-            if m_th["f1"] > best_val_f1:
-                best_val_f1 = m_th["f1"]
-                best_th = float(th)
+        best_th = float(val_metrics.get("optimal_threshold", 0.50))
+        best_val_f1 = float(val_metrics.get("calibrated_f1", val_metrics["f1"]))
 
         self.logger.info(
             f"Ngưỡng tối ưu trên Validation: {best_th:.2f} "
-            f"(Val F1: {best_val_f1:.4f} vs thr 0.50: {val_metrics['f1']:.4f})"
+            f"(Val Calib F1: {best_val_f1:.4f} vs thr 0.50: {val_metrics['f1']:.4f} | AUC: {val_metrics.get('auc', 0.5):.4f})"
         )
 
         # 2. Đánh giá trên tập Test với cả ngưỡng mặc định và ngưỡng tối ưu
@@ -618,20 +743,24 @@ class LiteFatTrainer:
         self.logger.info(
             f"[Ngưỡng mặc định 0.50] Test Loss: {test_metrics['loss']:.4f} | "
             f"Test Acc: {test_metrics['accuracy']*100:.2f}% | "
+            f"Test AUC: {test_metrics.get('auc', 0.5):.4f} | "
             f"Test Precision: {test_metrics['precision']*100:.2f}% | "
             f"Test Recall: {test_metrics['recall']*100:.2f}% | "
+            f"Test Specificity: {test_metrics.get('specificity', 0.0)*100:.2f}% | "
             f"Test F1: {test_metrics['f1']:.4f} | "
             f"Test F2: {test_metrics['f2']:.4f}"
         )
 
-        calibrated_test_metrics = compute_metrics(test_targets, (test_probs >= best_th).astype(int))
+        calibrated_test_metrics = compute_metrics(test_targets, (test_probs >= best_th).astype(int), test_probs)
         calibrated_test_metrics["loss"] = test_metrics["loss"]
         calibrated_test_metrics["optimal_threshold"] = best_th
 
         self.logger.info(
             f"[Ngưỡng tối ưu {best_th:.2f}] Test Acc: {calibrated_test_metrics['accuracy']*100:.2f}% | "
+            f"Test AUC: {calibrated_test_metrics.get('auc', 0.5):.4f} | "
             f"Test Precision: {calibrated_test_metrics['precision']*100:.2f}% | "
             f"Test Recall: {calibrated_test_metrics['recall']*100:.2f}% | "
+            f"Test Specificity: {calibrated_test_metrics.get('specificity', 0.0)*100:.2f}% | "
             f"Test F1: {calibrated_test_metrics['f1']:.4f} | "
             f"Test F2: {calibrated_test_metrics['f2']:.4f}"
         )

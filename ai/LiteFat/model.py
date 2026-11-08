@@ -76,10 +76,20 @@ class KinematicFeatureExtractor(nn.Module):
         raw_iod = torch.norm(p_right_eye - p_left_eye, p=2, dim=1, keepdim=True)
         iod_scale = raw_iod.clamp(min=self.eps)
 
-        # 2. Chuẩn hóa tọa độ hình thái tĩnh theo Tâm mũi (điểm 30) và tỷ lệ IOD
+        # 2. Chuẩn hóa tọa độ hình thái theo Tâm mũi (điểm 30) và tỷ lệ IOD
         nose_pos = x[:, :, :, self.nose_idx: self.nose_idx + 1]  # (B, 2, T, 1)
         pos_norm = (x - nose_pos) / iod_scale  # (B, 2, T, V)
         pos_norm = torch.clamp(pos_norm, min=-10.0, max=10.0)
+
+        # Khử hiện tượng ghi nhớ cấu trúc mặt tĩnh của chủ thể (Subject-Identity Shortcut):
+        # Tách tọa độ thành độ dịch chuyển động (Dynamic Displacement) và tư thế tĩnh suy giảm
+        if mask is not None:
+            denom = mask.sum(dim=2, keepdim=True).clamp(min=1.0)  # (B, 1, 1, 1)
+            pos_mean = (pos_norm * mask).sum(dim=2, keepdim=True) / denom  # (B, 2, 1, V)
+        else:
+            pos_mean = pos_norm.mean(dim=2, keepdim=True)
+        pos_dyn = pos_norm - pos_mean
+        pos_feat = pos_dyn + 0.20 * pos_norm  # Hệ số 0.20 giữ tỷ lệ mắt/miệng cần thiết nhưng triệt tiêu ghi nhớ tĩnh
 
         # 3. Tính Vận tốc (dx, dy) và Gia tốc (d2x, d2y) chuẩn hóa theo IOD
         T = x.size(2)
@@ -87,15 +97,21 @@ class KinematicFeatureExtractor(nn.Module):
             vel_norm = torch.zeros_like(pos_norm)
             acc_norm = torch.zeros_like(pos_norm)
         else:
-            vel_raw = torch.diff(x, n=1, dim=2)  # (B, 2, T-1, V)
+            # Vận tốc biến dạng cục bộ trên khuôn mặt (tránh bị dịch chuyển toàn đầu lấn át)
+            vel_local = torch.diff(pos_norm, n=1, dim=2)  # (B, 2, T-1, V)
+            # Vận tốc tịnh tiến toàn đầu được bảo toàn trên đỉnh tâm mũi (node 30)
+            nose_pos_norm = nose_pos / iod_scale
+            nose_vel = torch.diff(nose_pos_norm, n=1, dim=2)  # (B, 2, T-1, 1)
+            vel_local = vel_local.clone()
+            vel_local[:, :, :, self.nose_idx: self.nose_idx + 1] = nose_vel
+
             pair_valid = None
             if mask is not None:
                 pair_valid = mask[:, :, 1:, :] * mask[:, :, :-1, :]
-                vel_raw = vel_raw * pair_valid
+                vel_local = vel_local * pair_valid
 
-            vel_raw = F.pad(vel_raw, (0, 0, 1, 0), mode="constant", value=0.0)
-            vel_norm = vel_raw / iod_scale
-            vel_norm = torch.clamp(vel_norm, min=-10.0, max=10.0)
+            vel_local = F.pad(vel_local, (0, 0, 1, 0), mode="constant", value=0.0)
+            vel_norm = torch.clamp(vel_local, min=-10.0, max=10.0)
 
             acc_raw = torch.diff(vel_norm, n=1, dim=2)
             if mask is not None and pair_valid is not None:
@@ -106,12 +122,13 @@ class KinematicFeatureExtractor(nn.Module):
             acc_raw = F.pad(acc_raw, (0, 0, 1, 0), mode="constant", value=0.0)
             acc_norm = torch.clamp(acc_raw, min=-10.0, max=10.0)
 
-        out = torch.cat([pos_norm, vel_norm, acc_norm], dim=1)  # (B, 6, T, V)
+        out = torch.cat([pos_feat, vel_norm, acc_norm], dim=1)  # (B, 6, T, V)
         out = torch.nan_to_num(out, nan=0.0, posinf=10.0, neginf=-10.0)
 
-        # Chuẩn hóa cân bằng phân phối giữa các kênh động học
+        # Chuẩn hóa cân bằng phân phối giữa các kênh động học (áp dụng mask trước và sau BN)
+        if mask is not None:
+            out = out * mask
         out = self.channel_norm(out)
-
         if mask is not None:
             out = out * mask
 
@@ -321,6 +338,8 @@ class MultimodalFusionModule(nn.Module):
                 H = H_kin
 
             H = torch.nan_to_num(H, nan=0.0)
+            # Giữ các khung hình đệm (padding) bằng 0 tuyệt đối trước khi vào STGL
+            H = H * temporal_mask.permute(0, 2, 3, 1)
 
             # Đưa về chuẩn đồ thị STGL: [B, D, N, T]
             X = H.permute(0, 3, 2, 1).contiguous()
@@ -424,10 +443,16 @@ class SelfAdaptiveAdjacency(nn.Module):
         return torch.from_numpy(A_norm).float()
 
     def forward(self) -> torch.Tensor:
+        orig_dtype = self.E1.dtype
         scale = 1.0 / math.sqrt(self.embed_dim)
-        spatial_weights = F.relu(torch.matmul(self.E1, self.E2.transpose(0, 1)) * scale)
+        E1_f32 = self.E1.float()
+        E2_f32 = self.E2.float()
+        spatial_weights = F.relu(torch.matmul(E1_f32, E2_f32.transpose(0, 1)) * scale)
         A_adp = F.softmax(spatial_weights, dim=-1)
-        return self.A_prior + self.alpha * A_adp
+        # Giới hạn alpha qua tanh để ma trận kề thích nghi không tăng trưởng vô hạn
+        alpha_bounded = torch.tanh(self.alpha.float())
+        A_total = self.A_prior.float() + alpha_bounded * A_adp
+        return A_total.to(orig_dtype)
 
 
 class SpatialGCNLayer(nn.Module):
@@ -451,18 +476,24 @@ class SpatialGCNLayer(nn.Module):
         self.res_proj = nn.Linear(in_dim, out_dim) if in_dim != out_dim else nn.Identity()
 
     def forward(self, x: torch.Tensor, A_adp: torch.Tensor) -> torch.Tensor:
-        x_perm = x.permute(0, 3, 2, 1).contiguous()  # [B, T, N, D]
+        orig_dtype = x.dtype
+        device_type = x.device.type
+        # Bảo vệ số học: chạy phép nhân đồ thị và LayerNorm dưới float32 để chống tràn số float16 (max 65,504)
+        with torch.amp.autocast(device_type, enabled=False):
+            x_perm = x.float().permute(0, 3, 2, 1).contiguous()  # [B, T, N, D]
+            A_f32 = A_adp.float()
 
-        h1 = self.W0(x_perm)  # [B, T, N, H]
-        h1 = torch.einsum("ij,btnf->btif", A_adp, h1)
-        h1 = F.relu(h1)
-        h1 = self.dropout(h1)
+            h1 = self.W0(x_perm)  # [B, T, N, H]
+            # Nhân đồ thị chuẩn xác: đỉnh i tổng hợp đặc trưng từ các đỉnh láng giềng j theo A_adp[i, j]
+            h1 = torch.einsum("ij,btjf->btif", A_f32, h1)
+            h1 = F.relu(h1)
+            h1 = self.dropout(h1)
 
-        h2 = self.W1(h1)  # [B, T, N, M]
-        h2 = torch.einsum("ij,btnf->btif", A_adp, h2)
-        z = F.gelu(self.norm(h2)) + self.res_proj(x_perm)
+            h2 = self.W1(h1)  # [B, T, N, M]
+            h2 = torch.einsum("ij,btjf->btif", A_f32, h2)
+            z = F.gelu(self.norm(h2)) + self.res_proj(x_perm)
 
-        return z.permute(0, 3, 2, 1).contiguous()
+        return z.to(orig_dtype).permute(0, 3, 2, 1).contiguous()
 
 
 class GatedDilatedCausalTCN(nn.Module):
@@ -533,6 +564,7 @@ class STGLBlock(nn.Module):
         # Skip connection lấy từ h_gcn để truyền gradient trực tiếp qua GCN
         self.skip_conv = nn.Conv2d(residual_channels, skip_channels, kernel_size=(1, 1))
         self.bn = nn.BatchNorm2d(residual_channels)
+        self.res_scale = nn.Parameter(torch.ones(1))
 
     def forward(
             self,
@@ -543,7 +575,7 @@ class STGLBlock(nn.Module):
         h_tcn = self.gated_tcn(x)
         h_gcn = self.spatial_gcn(h_tcn, A_adp)
         skip = self.skip_conv(h_gcn)
-        x_res = self.bn(h_gcn + residual)
+        x_res = self.bn(self.res_scale * h_gcn + residual)
         return x_res, skip
 
 
@@ -579,6 +611,9 @@ class LiteFat(nn.Module):
         self.num_nodes = num_nodes
         self.feature_dim = feature_dim
         self.num_classes = num_classes
+        self.num_blocks = num_blocks
+        self.layers_per_block = layers_per_block
+        self.kernel_size = kernel_size
 
         # 1. MobileNetV3-Small trích xuất ngữ cảnh thị giác từ ảnh mặt
         self.context_encoder = MobileNetV3ContextEncoder(
@@ -590,7 +625,7 @@ class LiteFat(nn.Module):
         )
 
         # 2. Dung hợp đa phương thức FiLM chống Rank-1 Bottleneck
-        self.fusioSelfAdaptiveAdjacencyn = MultimodalFusionModule(
+        self.fusion = MultimodalFusionModule(
             num_features=6,
             feature_dim=feature_dim,
             num_nodes=num_nodes,
@@ -628,14 +663,24 @@ class LiteFat(nn.Module):
         self.end_conv_1 = nn.Conv2d(skip_channels, end_channels, kernel_size=(1, 1))
         self.end_conv_2 = nn.Conv2d(end_channels, num_classes, kernel_size=(1, 1))
 
-        # Attentive Node Pooling: Tự học trọng số chú ý trên 68 đỉnh khuôn mặt
-        self.node_gate = nn.Conv2d(num_classes, 1, kernel_size=(1, 1))
+        # Attentive Node Pooling: Tự học trọng số chú ý trên đặc trưng 256D của 68 đỉnh khuôn mặt
+        self.node_gate = nn.Sequential(
+            nn.Conv2d(end_channels, 64, kernel_size=(1, 1)),
+            nn.ReLU(),
+            nn.Conv2d(64, 1, kernel_size=(1, 1)),
+        )
+        # Prior giải phẫu thiên vị vùng mắt (36..47) và vùng miệng (48..67)
+        node_prior = torch.zeros(1, 1, num_nodes, 1)
+        node_prior[:, :, 36:48, :] = 1.0  # Mắt
+        node_prior[:, :, 48:68, :] = 1.0  # Miệng
+        self.register_buffer("node_prior_bias", node_prior)
 
-        # Attentive Temporal Pooling: Tự học trọng số chú ý cho các thời điểm quan trọng trong cửa sổ T
+        # Attentive Temporal Pooling: Tự học trọng số chú ý từ vector đặc trưng khung hình (end_channels) thay vì class logits
         self.temporal_gate = nn.Sequential(
-            nn.Linear(num_classes, 16),
+            nn.Linear(end_channels, 64),
             nn.GELU(),
-            nn.Linear(16, 1),
+            nn.Dropout(dropout),
+            nn.Linear(64, 1),
         )
 
     def forward_stgl_from_fused(
@@ -653,15 +698,21 @@ class LiteFat(nn.Module):
             skip_sum = skip if skip_sum is None else (skip_sum + skip)
 
         out = F.relu(skip_sum)
-        out = F.relu(self.end_conv_1(out))
-        out = self.end_conv_2(out)  # [B, num_classes, N, T]
+        h_end = F.relu(self.end_conv_1(out))  # [B, end_channels, N, T]
 
-        # Attentive Spatial Pooling trên N=68 đỉnh
-        gate = F.softmax(self.node_gate(out), dim=2)  # [B, 1, N, T]
-        frame_logits = (out * gate).sum(dim=2).permute(0, 2, 1).contiguous()  # [B, T, num_classes]
+        # Attentive Spatial Pooling trên N=68 đỉnh dựa trên không gian đặc trưng 256D và prior giải phẫu
+        node_attn = self.node_gate(h_end) + self.node_prior_bias  # [B, 1, N, T]
+        gate = F.softmax(node_attn, dim=2)  # [B, 1, N, T]
 
-        # Tính toán dự đoán cấp đoạn video (Clip Logits): Kết hợp Mean Pooling + Attentive Temporal Pooling
-        temp_scores = self.temporal_gate(frame_logits)  # [B, T, 1]
+        # Đặc trưng cấp khung hình sau khi gom tụ các đỉnh [B, end_channels, T]
+        pooled_node_feat = (h_end * gate).sum(dim=2)  # [B, end_channels, T]
+        frame_feat = pooled_node_feat.permute(0, 2, 1).contiguous()  # [B, T, end_channels]
+
+        # Dự đoán logits cấp khung hình [B, T, num_classes]
+        frame_logits = self.end_conv_2(pooled_node_feat.unsqueeze(2)).squeeze(2).permute(0, 2, 1).contiguous()
+
+        # Tính toán dự đoán cấp đoạn video (Clip Logits): Tận dụng frame_feat để học trọng số chú ý thời gian
+        temp_scores = self.temporal_gate(frame_feat)  # [B, T, 1]
         if lengths is not None:
             B, T, _ = frame_logits.shape
             valid_bool = (torch.arange(T, device=frame_logits.device).unsqueeze(0) < lengths.to(frame_logits.device).unsqueeze(1)).unsqueeze(-1)

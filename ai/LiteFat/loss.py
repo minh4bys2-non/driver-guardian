@@ -77,9 +77,10 @@ class LiteFatLoss(nn.Module):
 
         # 2. Tính Causal Time-Weighted Frame Loss
         if self.frame_loss_weight > 0:
-            # Trọng số thời gian nhân quả w_t: tăng tuyến tính từ frame 0 đến frame T-1
-            time_weights = torch.arange(1, T + 1, device=device, dtype=torch.float32)
-            time_weights = time_weights / time_weights.sum()  # Tổng = 1.0, shape: [T]
+            # Trọng số thời gian nhân quả mượt mà: tỷ lệ 0.5 ở frame đầu đến 1.0 ở frame cuối (tỷ lệ 2:1 thay vì 200:1)
+            # Giúp không bỏ sót các biến cố chớp mắt / ngáp ngủ diễn ra ở nửa đầu cửa sổ thời gian
+            base_weights = 0.5 + 0.5 * torch.linspace(0.0, 1.0, T, device=device, dtype=torch.float32)
+            time_weights = base_weights / base_weights.sum()  # Tổng = 1.0, shape: [T]
             weight_matrix = time_weights.unsqueeze(0).expand(B, T)  # [B, T]
 
             # Mặt nạ loại bỏ frame đệm (padding)

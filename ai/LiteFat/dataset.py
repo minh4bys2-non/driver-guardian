@@ -90,7 +90,7 @@ class FastPIPNetExtractor:
             self,
             backbone: str = "resnet18",
             device: Optional[str] = None,
-            letterbox_size: Tuple[int, int] = (640, 480),
+            letterbox_size: Tuple[int, int] = (640, 640),
             face_size: Tuple[int, int] = (224, 224),
             conf_threshold: float = 0.5,
             nms_threshold: float = 0.3,
@@ -644,7 +644,7 @@ class LiteFatDataset(Dataset):
             time_interval: float = 0.1,
             window_sec: Optional[float] = 10.0,
             manifest_filename: str = "dataset_merged_split.csv",
-            letterbox_size: Tuple[int, int] = (640, 480),
+            letterbox_size: Tuple[int, int] = (640, 640),
             face_size: Tuple[int, int] = (224, 224),
             conf_threshold: float = 0.5,
             bbox_margin: float = 0.15,
@@ -664,6 +664,8 @@ class LiteFatDataset(Dataset):
             flip_prob: float = 0.5,
             scale_jitter: float = 0.08,
             shift_jitter: float = 0.05,
+            roll_deg: float = 12.0,
+            temporal_dropout: float = 0.05,
             landmark_noise_std: float = 0.002,
             color_jitter: float = 0.2,
             spatial_dropout: float = 0.15,
@@ -715,6 +717,8 @@ class LiteFatDataset(Dataset):
         self.flip_prob = float(flip_prob)
         self.scale_jitter = float(scale_jitter)
         self.shift_jitter = float(shift_jitter)
+        self.roll_deg = float(roll_deg)
+        self.temporal_dropout = float(temporal_dropout)
         self.landmark_noise_std = float(landmark_noise_std)
         self.color_jitter = float(color_jitter)
         self.spatial_dropout = float(spatial_dropout)
@@ -802,6 +806,8 @@ class LiteFatDataset(Dataset):
                             "path": full_path,
                             "label": int(row["label"]),
                             "video_id": row.get("video_id") or Path(rel_path).stem,
+                            "subject_id": str(row.get("subject_id", "") or "unknown"),
+                            "dataset": str(row.get("dataset", "") or "unknown"),
                             "fps": float(row.get("fps", 30.0)),
                             "frame_count": int(float(row.get("frame_count", 0))),
                             "duration_sec": float(row.get("duration_sec", 0.0)),
@@ -820,6 +826,8 @@ class LiteFatDataset(Dataset):
                             "path": p,
                             "label": label,
                             "video_id": p.stem,
+                            "subject_id": "unknown",
+                            "dataset": "unknown",
                             "fps": 30.0,
                             "frame_count": 0,
                             "duration_sec": 0.0,
@@ -1035,6 +1043,8 @@ class LiteFatDataset(Dataset):
                     flip_prob=self.flip_prob,
                     scale_jitter=self.scale_jitter,
                     shift_jitter=self.shift_jitter,
+                    roll_deg=self.roll_deg,
+                    temporal_dropout=self.temporal_dropout,
                     landmark_noise_std=self.landmark_noise_std,
                     color_jitter=self.color_jitter,
                     spatial_dropout=self.spatial_dropout,
@@ -1052,6 +1062,8 @@ class LiteFatDataset(Dataset):
             meta = {
                 "key": key,
                 "video_id": sample["video_id"],
+                "subject_id": str(sample.get("subject_id") or (item.get("meta", {}).get("subject_id", "unknown"))),
+                "dataset": str(sample.get("dataset") or (item.get("meta", {}).get("dataset", "unknown"))),
                 "path": str(sample["path"]),
                 "split": self.split,
                 "label": int(sample["label"]),
@@ -1120,6 +1132,8 @@ class LiteFatDataset(Dataset):
                 flip_prob=self.flip_prob,
                 scale_jitter=self.scale_jitter,
                 shift_jitter=self.shift_jitter,
+                roll_deg=self.roll_deg,
+                temporal_dropout=self.temporal_dropout,
                 landmark_noise_std=self.landmark_noise_std,
                 color_jitter=self.color_jitter,
                 spatial_dropout=self.spatial_dropout,
@@ -1140,6 +1154,8 @@ class LiteFatDataset(Dataset):
         meta = {
             "key": key,
             "video_id": sample["video_id"],
+            "subject_id": str(sample.get("subject_id", "unknown")),
+            "dataset": str(sample.get("dataset", "unknown")),
             "path": str(sample["path"]),
             "split": self.split,
             "label": int(sample["label"]),
@@ -1226,9 +1242,9 @@ def build_litefat_dataloaders(
         dataset_dir: Union[str, Path] = r"E:\LSTM\data_processed",
         batch_size: int = 8,
         num_workers: int = 0,
-        time_interval: float = 0.1,
+        time_interval: float = 0.05,
         window_sec: Optional[float] = 10.0,
-        letterbox_size: Tuple[int, int] = (640, 480),
+        letterbox_size: Tuple[int, int] = (640, 640),
         face_size: Tuple[int, int] = (224, 224),
         manifest_filename: str = "dataset_merged_split.csv",
         use_cache: bool = False,
@@ -1248,9 +1264,12 @@ def build_litefat_dataloaders(
         flip_prob: float = 0.5,
         scale_jitter: float = 0.08,
         shift_jitter: float = 0.05,
+        roll_deg: float = 12.0,
+        temporal_dropout: float = 0.05,
         landmark_noise_std: float = 0.002,
         color_jitter: float = 0.2,
         spatial_dropout: float = 0.15,
+        subject_balanced_sampling: bool = True,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """
     Khởi tạo nhanh bộ 3 DataLoader cho tập train, val, test của mô hình LiteFat theo cơ chế window_sec và time_interval.
@@ -1294,6 +1313,8 @@ def build_litefat_dataloaders(
         flip_prob=flip_prob,
         scale_jitter=scale_jitter,
         shift_jitter=shift_jitter,
+        roll_deg=roll_deg,
+        temporal_dropout=temporal_dropout,
         landmark_noise_std=landmark_noise_std,
         color_jitter=color_jitter,
         spatial_dropout=spatial_dropout,
@@ -1302,8 +1323,36 @@ def build_litefat_dataloaders(
     val_ds = LiteFatDataset(split="val", augment_train=False, **common_cfg)
     test_ds = LiteFatDataset(split="test", augment_train=False, **common_cfg)
 
+    train_sampler = None
+    if subject_balanced_sampling and len(train_ds) > 0:
+        from collections import Counter
+        sub_label_counts = Counter()
+        label_counts = Counter()
+        for s in train_ds.samples:
+            sub = s.get("subject_id", "unknown")
+            lbl = s.get("label", 0)
+            sub_label_counts[(sub, lbl)] += 1
+            label_counts[lbl] += 1
+
+        sample_weights = []
+        for s in train_ds.samples:
+            sub = s.get("subject_id", "unknown")
+            lbl = s.get("label", 0)
+            cnt_sub = max(1, sub_label_counts[(sub, lbl)])
+            cnt_lbl = max(1, label_counts[lbl])
+            w = 1.0 / (math.sqrt(cnt_sub) * cnt_lbl)
+            sample_weights.append(w)
+
+        train_sampler = torch.utils.data.WeightedRandomSampler(
+            weights=torch.as_tensor(sample_weights, dtype=torch.double),
+            num_samples=len(sample_weights),
+            replacement=True,
+        )
+
     train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=shuffle_train,
+        train_ds, batch_size=batch_size,
+        shuffle=(shuffle_train if train_sampler is None else False),
+        sampler=train_sampler,
         num_workers=num_workers, pin_memory=pin_memory, collate_fn=collate_litefat
     )
     val_loader = DataLoader(

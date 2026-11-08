@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import random
 import sys
@@ -41,7 +42,7 @@ def _parse_size(size: Optional[Union[int, Tuple[int, int], List[int]]]) -> Tuple
     Chuẩn hóa kích thước về tuple (width, height).
     """
     if size is None:
-        return (640, 480)
+        return (640, 640)
     if isinstance(size, int):
         return (size, size)
     if isinstance(size, (tuple, list)) and len(size) == 2:
@@ -51,7 +52,7 @@ def _parse_size(size: Optional[Union[int, Tuple[int, int], List[int]]]) -> Tuple
 
 def letterbox(
         image: np.ndarray,
-        new_size: Optional[int | Tuple[int, int] | List[int]] = (640, 480),
+        new_size: Optional[int | Tuple[int, int] | List[int]] = (640, 640),
         color: Tuple[int, int, int] = (114, 114, 114),
 ) -> np.ndarray:
     """
@@ -151,6 +152,8 @@ def augment_multimodal_clip(
         flip_prob: float = 0.5,
         scale_jitter: float = 0.08,
         shift_jitter: float = 0.05,
+        roll_deg: float = 12.0,
+        temporal_dropout: float = 0.05,
         landmark_noise_std: float = 0.002,
         color_jitter: float = 0.2,
         spatial_dropout: float = 0.15,
@@ -161,10 +164,12 @@ def augment_multimodal_clip(
        - Tọa độ x -> (1.0 - x).
        - Hoán vị đỉnh giải phẫu 68 điểm theo FLIP_MAP_68 (mắt trái <-> mắt phải).
        - Lật trục ngang chiều rộng của face_frames.
-    2. Co giãn và dịch chuyển (Scale & Shift Jitter) trên toàn bộ chuỗi khuôn mặt.
-    3. Thêm nhiễu Gaussian nhẹ (Landmark Noise) trên tọa độ điểm mốc hợp lệ.
-    4. Biến đổi độ sáng/độ tương phản (Color Jitter) nhất quán thời gian trên face_frames.
-    5. Cắt ngẫu nhiên vùng ảnh (Random Spatial Cutout / Erasing) trên face_frames.
+    2. Quay 2D trong mặt phẳng (In-plane Roll Rotation) góc ngẫu nhiên quanh tâm mặt.
+    3. Co giãn bất đẳng hướng (Anisotropic Scale: scale_x != scale_y) và dịch chuyển (Shift Jitter).
+    4. Thêm nhiễu Gaussian nhẹ (Landmark Noise) trên tọa độ điểm mốc hợp lệ.
+    5. Che khuất tạm thời vài khung hình (Temporal Frame Dropout) mô phỏng mất tracking.
+    6. Biến đổi độ sáng/độ tương phản (Color Jitter) nhất quán thời gian trên face_frames.
+    7. Cắt ngẫu nhiên vùng ảnh (Random Spatial Cutout / Erasing) trên face_frames.
     """
     if not is_train:
         return face_frames, landmarks
@@ -187,9 +192,34 @@ def augment_multimodal_clip(
         if frames is not None:
             frames = torch.flip(frames, dims=[-1])
 
-    # 2. Co giãn (Scale) và dịch chuyển (Shift) nhẹ trên landmark
+    # 2. Quay 2D góc nghiêng đầu (In-plane Roll Rotation quanh tâm mặt)
+    if roll_deg > 0 and random.random() < 0.5:
+        angle_deg = random.uniform(-roll_deg, roll_deg)
+        theta = math.radians(angle_deg)
+        cos_t = math.cos(theta)
+        sin_t = math.sin(theta)
+
+        valid_coords = lms[valid_pts.squeeze(-1)]
+        if valid_coords.numel() > 0:
+            center_x = valid_coords[:, 0].mean().item()
+            center_y = valid_coords[:, 1].mean().item()
+
+            dx = lms[..., 0] - center_x
+            dy = lms[..., 1] - center_y
+            rot_x = dx * cos_t - dy * sin_t + center_x
+            rot_y = dx * sin_t + dy * cos_t + center_y
+
+            rot_x = torch.clamp(rot_x, 0.0, 1.0)
+            rot_y = torch.clamp(rot_y, 0.0, 1.0)
+
+            lms[..., 0] = torch.where(valid_pts.squeeze(-1), rot_x, lms[..., 0])
+            lms[..., 1] = torch.where(valid_pts.squeeze(-1), rot_y, lms[..., 1])
+
+    # 3. Co giãn bất đẳng hướng (Anisotropic Scale Jitter) và dịch chuyển (Shift)
+    # scale_x khác scale_y làm thay đổi tỷ lệ khuôn mặt, phá vỡ sự triệt tiêu của chuẩn hóa IOD
     if scale_jitter > 0 or shift_jitter > 0:
-        scale = 1.0 + random.uniform(-scale_jitter, scale_jitter)
+        scale_x = 1.0 + random.uniform(-scale_jitter, scale_jitter)
+        scale_y = 1.0 + random.uniform(-scale_jitter, scale_jitter)
         shift_x = random.uniform(-shift_jitter, shift_jitter)
         shift_y = random.uniform(-shift_jitter, shift_jitter)
 
@@ -199,8 +229,8 @@ def augment_multimodal_clip(
             center_x = valid_coords[:, 0].mean().item()
             center_y = valid_coords[:, 1].mean().item()
 
-            new_x = (lms[..., 0] - center_x) * scale + center_x + shift_x
-            new_y = (lms[..., 1] - center_y) * scale + center_y + shift_y
+            new_x = (lms[..., 0] - center_x) * scale_x + center_x + shift_x
+            new_y = (lms[..., 1] - center_y) * scale_y + center_y + shift_y
 
             new_x = torch.clamp(new_x, 0.0, 1.0)
             new_y = torch.clamp(new_y, 0.0, 1.0)
@@ -208,13 +238,23 @@ def augment_multimodal_clip(
             lms[..., 0] = torch.where(valid_pts.squeeze(-1), new_x, lms[..., 0])
             lms[..., 1] = torch.where(valid_pts.squeeze(-1), new_y, lms[..., 1])
 
-    # 3. Nhiễu Gaussian trên điểm mốc
+    # 4. Nhiễu Gaussian trên điểm mốc
     if landmark_noise_std > 0:
         noise = torch.randn_like(lms) * landmark_noise_std
         noisy_lms = torch.clamp(lms + noise, 0.0, 1.0)
         lms = torch.where(valid_pts, noisy_lms, lms)
 
-    # 4. Tăng cường trên khung hình khuôn mặt (nhất quán thời gian)
+    # 5. Temporal Frame Dropout: che khuất ngẫu nhiên 1-3 khung hình mô phỏng mất tracking
+    if temporal_dropout > 0 and random.random() < 0.3:
+        T_len = lms.shape[0]
+        num_drop = min(max(1, int(round(T_len * temporal_dropout))), 4)
+        if T_len > num_drop:
+            start_drop = random.randint(0, T_len - num_drop)
+            lms[start_drop:start_drop + num_drop] = 1.0
+            if frames is not None:
+                frames[start_drop:start_drop + num_drop] = 0.0
+
+    # 6. Tăng cường trên khung hình khuôn mặt (nhất quán thời gian)
     if frames is not None and frames.numel() > 0:
         # Biến đổi độ sáng & tương phản nhất quán cho toàn bộ T frames
         if color_jitter > 0 and random.random() < 0.5:
@@ -297,10 +337,10 @@ def atomic_save(obj: Any, path: Union[str, Path]) -> None:
         raise e
 
 
-def compute_metrics(labels: np.ndarray, preds: np.ndarray) -> Dict[str, float]:
+def compute_metrics(labels: np.ndarray, preds: np.ndarray, probs: Optional[np.ndarray] = None) -> Dict[str, float]:
     """
     Tính toán các chỉ số đánh giá phân loại buồn ngủ:
-    Accuracy, Precision, Recall, F1-Score, F2-Score (ưu tiên Recall để cảnh báo an toàn).
+    Accuracy, Precision, Recall, Specificity, F1-Score, F2-Score và ROC-AUC (nếu có probs).
     """
     labels = np.asarray(labels, dtype=int).ravel()
     preds = np.asarray(preds, dtype=int).ravel()
@@ -314,13 +354,15 @@ def compute_metrics(labels: np.ndarray, preds: np.ndarray) -> Dict[str, float]:
     acc = (tp + tn) / max(1, total)
     prec = tp / max(1, tp + fp)
     rec = tp / max(1, tp + fn)
+    spec = tn / max(1, tn + fp)
     f1 = (2.0 * prec * rec) / max(1e-8, prec + rec) if (prec + rec) > 0 else 0.0
     f2 = (5.0 * prec * rec) / max(1e-8, 4.0 * prec + rec) if (4.0 * prec + rec) > 0 else 0.0
 
-    return {
+    metrics = {
         "accuracy": float(acc),
         "precision": float(prec),
         "recall": float(rec),
+        "specificity": float(spec),
         "f1": float(f1),
         "f2": float(f2),
         "tp": tp,
@@ -328,3 +370,16 @@ def compute_metrics(labels: np.ndarray, preds: np.ndarray) -> Dict[str, float]:
         "fn": fn,
         "tn": tn,
     }
+
+    if probs is not None:
+        try:
+            from sklearn.metrics import roc_auc_score
+            probs_arr = np.asarray(probs, dtype=float).ravel()
+            if len(np.unique(labels)) > 1:
+                metrics["auc"] = float(roc_auc_score(labels, probs_arr))
+            else:
+                metrics["auc"] = 0.5
+        except Exception:
+            metrics["auc"] = 0.5
+
+    return metrics

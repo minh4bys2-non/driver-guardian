@@ -56,10 +56,10 @@ class TrainConfig:
     manifest_filename: str = "dataset_merged_split.csv"
 
     # Thư mục lưu kết quả huấn luyện (checkpoints, metrics json, cấu hình)
-    checkpoint_dir: str = "checkpoints/LiteFat_v2_pretrain"
+    checkpoint_dir: str = "checkpoints/LiteFat_v4"
 
     # Thư mục lưu log TensorBoard
-    log_dir: str = "checkpoints/LiteFat_v2_pretrain/logs"
+    log_dir: str = "checkpoints/LiteFat_v4/logs"
 
     # =================================================================
     # 2. CHẾ ĐỘ ĐA PHƯƠNG THỨC & NGỮ CẢNH THỊ GIÁC (VISUAL CONTEXT)
@@ -70,7 +70,7 @@ class TrainConfig:
     use_visual_context: bool = False
 
     # Kích thước ảnh khung hình đưa vào trích xuất điểm mốc letterbox (w, h)
-    letterbox_size: Tuple[int, int] = (640, 480)
+    letterbox_size: Tuple[int, int] = (640, 640)
 
     # Kích thước ảnh khuôn mặt crop chuẩn hóa cho MobileNetV3-Small (w, h)
     face_size: Tuple[int, int] = (224, 224)
@@ -84,9 +84,9 @@ class TrainConfig:
     time_interval: float = 0.05
 
     # Độ dài cửa sổ trượt (giây).
-    # 4.0s tương ứng T = 80 frames ở 20 FPS (đủ để quan sát hành vi ngáp và mắt nhắm kéo dài).
+    # 10.0s tương ứng T = 200 frames ở 20 FPS (ghi nhận toàn diện chuỗi hành vi ngủ gật).
     # Đặt None để lấy toàn bộ độ dài video.
-    window_sec: Optional[float] = 10
+    window_sec: Optional[float] = 10.0
 
     # =================================================================
     # 4. TĂNG CƯỜNG DỮ LIỆU ĐA PHƯƠNG THỨC (DATA AUGMENTATION)
@@ -102,6 +102,12 @@ class TrainConfig:
 
     # Biên độ dịch chuyển tọa độ khuôn mặt ngẫu nhiên (Shift Jitter)
     shift_jitter: float = 0.05
+
+    # Góc quay 2D nghiêng đầu ngẫu nhiên trong mặt phẳng (Roll Rotation, độ)
+    roll_deg: float = 12.0
+
+    # Tỷ lệ che khuất ngẫu nhiên vài khung hình mô phỏng mất tracking (Temporal Dropout)
+    temporal_dropout: float = 0.05
 
     # Độ lệch chuẩn của nhiễu Gaussian cộng vào tọa độ điểm mốc
     landmark_noise_std: float = 0.002
@@ -127,7 +133,7 @@ class TrainConfig:
     num_blocks: int = 3
     layers_per_block: int = 3
     kernel_size: int = 3
-    dropout: float = 0.4
+    dropout: float = 0.35
     pretrained_backbone: bool = True
 
     # Cặp chỉ số đỉnh giải phẫu dọc mắt (EAR) và dọc miệng (MAR) để tạo cạnh kề cơ sở A_prior
@@ -146,26 +152,32 @@ class TrainConfig:
     # =================================================================
     # 6. THAM SỐ HUẤN LUYỆN & TỐI ƯU HÓA (OPTIMIZATION)
     # =================================================================
-    epochs: int = 10
+    epochs: int = 25
     batch_size: int = 8
     num_workers: int = 0
     pin_memory: bool = True
     seed: int = 42
 
+    # Lấy mẫu cân bằng chủ thể (Subject-Balanced Sampling qua WeightedRandomSampler)
+    subject_balanced_sampling: bool = True
+
     # Tốc độ học cơ bản cho nhánh Đồ thị STGL, Dung hợp FiLM và Đầu phân loại
-    lr: float = 5e-4
+    lr: float = 2e-4
 
     # Tốc độ học riêng biệt cho xương sống MobileNetV3-Small (thường nhỏ hơn 10 lần)
-    backbone_lr: float = 5e-5
+    backbone_lr: float = 3e-5
 
     # Hệ số phạt suy giảm trọng số (Weight Decay L2)
-    weight_decay: float = 1e-3
+    weight_decay: float = 2e-3
 
     # Số epoch đầu tiên đóng băng hoàn toàn MobileNetV3-Small (chỉ huấn luyện STGL)
     freeze_backbone_epochs: int = 5
 
     # Số epoch làm nóng tốc độ học (Linear Warmup)
-    warmup_epochs: int = 2
+    warmup_epochs: int = 3
+
+    # Giảm tốc độ học cho các trọng số đã được tiền huấn luyện (Warm-start) để chống quên thảm khốc
+    pretrained_lr_scale: float = 0.25
 
     # Giới hạn chuẩn đạo hàm để chống nổ gradient (Gradient Clipping)
     grad_clip: float = 1.0
@@ -180,7 +192,8 @@ class TrainConfig:
     resume: Optional[str] = None
 
     # Đường dẫn checkpoint tiền huấn luyện để khởi tạo ấm (Warm-start) các tầng khớp kích thước từ Epoch 1
-    pretrained_from: Optional[str] = r"checkpoints/LiteFat/best.pt"
+    pretrained_from: Optional[str] = None
+        # r"checkpoints/LiteFat/best.pt"
     # =================================================================
     # 7. HÀM MẤT MÁT (LOSS CONFIGURATION)
     # =================================================================

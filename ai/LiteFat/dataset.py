@@ -636,6 +636,8 @@ class LiteFatDataset(Dataset):
       - Cắt khung hình khuôn mặt 224x224 chuẩn hóa ImageNet cho MobileNetV3-Small.
       - Hỗ trợ nạp / lưu cache .pt để tăng tốc tối đa khi huấn luyện nhiều epoch.
     """
+    _SHARED_CACHE: Dict[str, Any] = {}
+    _SHARED_META: Dict[str, Any] = {}
 
     def __init__(
             self,
@@ -669,6 +671,9 @@ class LiteFatDataset(Dataset):
             landmark_noise_std: float = 0.002,
             color_jitter: float = 0.2,
             spatial_dropout: float = 0.15,
+            eval_window_mode: str = "center",
+            drop_single_class_subjects: bool = False,
+            visual_frame_stride: int = 1,
     ):
         split = split.lower().strip()
         if split not in ("train", "val", "test"):
@@ -696,6 +701,17 @@ class LiteFatDataset(Dataset):
         self.return_raw_frames = bool(return_raw_frames)
         self.use_cache = bool(use_cache)
         self.cache_dir = Path(cache_dir) if cache_dir is not None else None
+        self.eval_window_mode = str(eval_window_mode)
+        self.drop_single_class_subjects = bool(drop_single_class_subjects)
+        self.visual_frame_stride = max(1, int(visual_frame_stride))
+        if self.cache_dir is not None:
+            self.crop_cache_dir = self.cache_dir / f"face_crops_stride{self.visual_frame_stride}"
+            try:
+                self.crop_cache_dir.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+        else:
+            self.crop_cache_dir = None
 
         # Cấu hình bối cảnh thị giác (MobileNetV3) & Đa phương thức
         self.use_visual_context = bool(use_visual_context)
@@ -812,70 +828,64 @@ class LiteFatDataset(Dataset):
                             "frame_count": int(float(row.get("frame_count", 0))),
                             "duration_sec": float(row.get("duration_sec", 0.0)),
                         })
-        else:
-            # Fallback quét thư mục train/val/test/0_alert và 1_drowsy
-            for label, folder in ((0, "0_alert"), (1, "1_drowsy")):
-                split_folder = self.root / self.split / folder
-                if split_folder.is_dir():
-                    for p in sorted(split_folder.glob("*.mp4")):
-                        rel_key = p.relative_to(self.root).as_posix()
-                        if not self._is_dataset_selected(rel_key):
-                            continue
-                        samples.append({
-                            "key": rel_key,
-                            "path": p,
-                            "label": label,
-                            "video_id": p.stem,
-                            "subject_id": "unknown",
-                            "dataset": "unknown",
-                            "fps": 30.0,
-                            "frame_count": 0,
-                            "duration_sec": 0.0,
-                        })
+
+        if self.split == "train" and getattr(self, "drop_single_class_subjects", False):
+            from collections import defaultdict
+            sub_labels = defaultdict(set)
+            for s in samples:
+                sub_labels[s["subject_id"]].add(s["label"])
+            single_class_subs = {sub for sub, lbls in sub_labels.items() if len(lbls) < 2}
+            if single_class_subs:
+                orig_cnt = len(samples)
+                samples = [s for s in samples if s["subject_id"] not in single_class_subs]
+                logger.info(
+                    f"[Dataset] Đã loại {orig_cnt - len(samples)} mẫu từ {len(single_class_subs)} subject chỉ có 1 lớp trong train: {sorted(list(single_class_subs))}"
+                )
+
         return samples
 
     def _load_cache(self) -> None:
-        """Nạp dữ liệu cache từ tệp .pt và lưu trữ metadata của cache."""
+        """Nạp dữ liệu cache từ tệp .pt và lưu trữ metadata của cache (hỗ trợ Shared Cross-Split Cache Pool)."""
         cache_path = self.cache_dir / f"{self.split}.pt"
-        if not cache_path.is_file():
+        if not cache_path.is_file() and not self._SHARED_CACHE:
             logger.warning(f"[Cache] Không tìm thấy tệp cache {cache_path}. Sẽ fallback trích xuất on-the-fly.")
             return
 
-        try:
-            payload = torch.load(cache_path, map_location="cpu", weights_only=False)
-            if isinstance(payload, dict) and "samples" in payload:
-                self.cached_data = payload["samples"]
-                self.cache_meta = {
-                    "format_version": payload.get("format_version", 1),
-                    "split": payload.get("split", self.split),
-                    "time_interval": float(payload.get("time_interval", 0.05)),
-                    "window_sec": payload.get("window_sec", None),
-                    "letterbox_size": tuple(payload.get("letterbox_size", self.letterbox_size)),
-                    "face_size": tuple(payload.get("face_size", self.face_size)),
-                    "bbox_margin": float(payload.get("bbox_margin", self.bbox_margin)),
-                    "box_smooth_alpha": float(payload.get("box_smooth_alpha", self.box_smooth_alpha)),
-                    "num_samples": payload.get("num_samples", len(self.cached_data)),
-                }
-            elif isinstance(payload, dict):
-                self.cached_data = payload
-                self.cache_meta = {
-                    "time_interval": 0.05,
-                    "window_sec": None,
-                    "letterbox_size": self.letterbox_size,
-                    "face_size": self.face_size,
-                }
+        # Nạp split hiện tại vào shared pool nếu chưa có
+        if f"{self.split}.pt" not in self._SHARED_META and cache_path.is_file():
+            try:
+                payload = torch.load(cache_path, map_location="cpu", weights_only=False)
+                samples = payload["samples"] if (isinstance(payload, dict) and "samples" in payload) else payload
+                self._SHARED_CACHE.update(samples)
+                self._SHARED_META[f"{self.split}.pt"] = payload.get("meta", {}) if isinstance(payload, dict) else {}
+                logger.info(f"[Cache] Đã nạp {len(samples)} mẫu từ {cache_path.name} vào Shared Cache Pool (Tổng: {len(self._SHARED_CACHE)}).")
+            except Exception as e:
+                logger.warning(f"[Cache] Lỗi khi nạp cache {cache_path}: {e}")
 
-            cached_lbs = self.cache_meta.get("letterbox_size")
-            if cached_lbs and tuple(cached_lbs) != tuple(self.letterbox_size):
-                logger.warning(
-                    f"[Cache] File {cache_path.name} được trích xuất với letterbox_size={cached_lbs}, "
-                    f"khác với cấu hình hiện tại {self.letterbox_size}. "
-                    f"Sẽ sử dụng letterbox_size của cache để bảo đảm tọa độ crop_boxes khớp tuyệt đối."
-                )
+        # Đồng thời kiểm tra nếu các file cache khác tồn tại, nạp vào pool để hỗ trợ manifest re-split
+        for other_split in ("train", "val", "test"):
+            other_name = f"{other_split}.pt"
+            other_path = self.cache_dir / other_name
+            if other_name not in self._SHARED_META and other_path.is_file():
+                try:
+                    payload = torch.load(other_path, map_location="cpu", weights_only=False)
+                    samples = payload["samples"] if (isinstance(payload, dict) and "samples" in payload) else payload
+                    self._SHARED_CACHE.update(samples)
+                    self._SHARED_META[other_name] = payload.get("meta", {}) if isinstance(payload, dict) else {}
+                    logger.info(f"[Cache] Đã nạp bổ sung {len(samples)} mẫu từ {other_name} vào Shared Cache Pool (Tổng: {len(self._SHARED_CACHE)}).")
+                except Exception as e:
+                    logger.warning(f"[Cache] Lỗi khi nạp cache bổ sung {other_path}: {e}")
 
-            logger.info(f"[Cache] Đã nạp thành công cache {cache_path.name} với {len(self.cached_data)} mẫu.")
-        except Exception as e:
-            logger.warning(f"[Cache] Lỗi khi nạp cache {cache_path}: {e}. Bỏ qua cache.")
+        self.cached_data = self._SHARED_CACHE
+        self.cache_meta = {
+            "format_version": 1,
+            "split": self.split,
+            "time_interval": float(self.time_interval),
+            "window_sec": self.window_sec,
+            "letterbox_size": self.letterbox_size,
+            "face_size": self.face_size,
+            "num_samples": len(self.cached_data),
+        }
 
     def _get_frame_indices(self, total_frames: int, fps: float) -> np.ndarray:
         """
@@ -969,12 +979,21 @@ class LiteFatDataset(Dataset):
             return np.clip(pos, 0, T_cache - 1)
         else:
             if self.split != "train":
-                # Đối với tập val và test: Đánh giá trên tối đa 18.0 giây (360 frames)
-                # để bao quát trọn vẹn toàn bộ chuỗi video UL-DD/VBDDD, không bị cắt cụt mất sự kiện buồn ngủ
-                eval_win = min(max(self.window_sec or 10.0, 18.0), duration_sec)
-                timestamps = np.arange(0, eval_win, self.time_interval)
+                eval_mode = getattr(self, "eval_window_mode", "center")
+                if eval_mode == "legacy18s":
+                    # Kế thừa v5: tối đa 18.0 giây tính từ đầu video
+                    eval_win = min(max(self.window_sec or 10.0, 18.0), duration_sec)
+                    start_sec = 0.0
+                else:
+                    # Mặc định v6 ("center"): Cắt cửa sổ chính giữa video đúng bằng window_sec (12s)
+                    # để thống kê phân phối và độ dài T hoàn toàn đồng nhất với quá trình huấn luyện
+                    eval_win = min(self.window_sec or 12.0, duration_sec)
+                    max_start = max(0.0, duration_sec - eval_win)
+                    start_sec = max_start / 2.0
+
+                timestamps = start_sec + np.arange(0, eval_win, self.time_interval)
                 if len(timestamps) == 0:
-                    timestamps = np.array([0.0])
+                    timestamps = np.array([start_sec])
                 pos = np.rint(timestamps / cache_dt).astype(int)
                 return np.clip(pos, 0, T_cache - 1)
             else:
@@ -1034,13 +1053,48 @@ class LiteFatDataset(Dataset):
             raw_frames: Optional[List[np.ndarray]] = None
 
             # Đọc video nếu cần tạo face_frames (cho MobileNetV3) hoặc người dùng yêu cầu return_raw_frames
+            if not self.extract_crops_only and face_frames is None and not self.return_raw_frames and getattr(self, "crop_cache_dir", None) is not None:
+                import hashlib
+                cache_key = hashlib.md5(key.encode()).hexdigest()
+                crop_file = self.crop_cache_dir / f"{cache_key}.pt"
+                if crop_file.is_file():
+                    try:
+                        cached_uint8 = torch.load(crop_file, map_location="cpu", weights_only=True)
+                        norm_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+                        norm_std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+                        face_frames = (cached_uint8.float() / 255.0 - norm_mean) / norm_std
+                    except Exception:
+                        face_frames = None
+
             need_video_read = (not self.extract_crops_only and face_frames is None) or self.return_raw_frames
             if need_video_read:
+                v_stride = getattr(self, "visual_frame_stride", 1)
+                if v_stride > 1 and not self.return_raw_frames:
+                    v_pos = np.arange(0, len(selected_target_indices), v_stride)
+                    v_indices = selected_target_indices[v_pos]
+                    v_crop_boxes = crop_boxes[v_pos] if crop_boxes is not None else None
+                else:
+                    v_indices = selected_target_indices
+                    v_crop_boxes = crop_boxes
+
                 raw_frames, actual_fps, _ = fast_read_video_frames(
-                    sample["path"], selected_target_indices, letterbox_size=cache_lbs
+                    sample["path"], v_indices, letterbox_size=cache_lbs
                 )
-                if not self.extract_crops_only and face_frames is None and crop_boxes is not None:
-                    face_frames = crop_faces_from_boxes(raw_frames, crop_boxes, face_size=self.face_size)
+                if not self.extract_crops_only and face_frames is None and v_crop_boxes is not None:
+                    face_frames = crop_faces_from_boxes(raw_frames, v_crop_boxes, face_size=self.face_size)
+                    if getattr(self, "crop_cache_dir", None) is not None:
+                        try:
+                            import hashlib
+                            cache_key = hashlib.md5(key.encode()).hexdigest()
+                            crop_file = self.crop_cache_dir / f"{cache_key}.pt"
+                            norm_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+                            norm_std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+                            uint8_crops = ((face_frames * norm_std + norm_mean).clamp(0.0, 1.0) * 255.0).to(torch.uint8)
+                            tmp_file = self.crop_cache_dir / f"{cache_key}.tmp_{os.getpid()}"
+                            torch.save(uint8_crops, tmp_file)
+                            tmp_file.replace(crop_file)
+                        except Exception:
+                            pass
 
             if not self.use_visual_context:
                 face_frames = None
@@ -1211,6 +1265,8 @@ def collate_litefat(batch: List[Tuple[Any, ...]]):
     max_len = max(lengths)
 
     has_face_frames = all(f is not None for f in face_frames_list)
+    v_lengths = [f.shape[0] for f in face_frames_list] if has_face_frames else []
+    max_v_len = max(v_lengths) if has_face_frames else 0
 
     # Đệm theo chiều thời gian T nếu các video có số frame khác nhau
     padded_frames = []
@@ -1219,19 +1275,22 @@ def collate_litefat(batch: List[Tuple[Any, ...]]):
         f = face_frames_list[idx]
         if cur_len < max_len:
             pad_t = max_len - cur_len
-            if has_face_frames and f is not None:
-                # Đệm frame bằng frame cuối cùng
-                last_frame = f[-1:].repeat(pad_t, 1, 1, 1)
-                padded_f = torch.cat([f, last_frame], dim=0)
-                padded_frames.append(padded_f)
             # Đệm landmark bằng giá trị 1.0 (chuẩn bài báo LiteFat Section III-B)
             pad_lm = torch.ones((pad_t, lm.shape[1], lm.shape[2]), dtype=lm.dtype)
             padded_l = torch.cat([lm, pad_lm], dim=0)
             padded_landmarks.append(padded_l)
         else:
-            if has_face_frames and f is not None:
-                padded_frames.append(f)
             padded_landmarks.append(lm)
+
+        if has_face_frames and f is not None:
+            cur_v_len = f.shape[0]
+            if cur_v_len < max_v_len:
+                pad_v = max_v_len - cur_v_len
+                last_frame = f[-1:].repeat(pad_v, 1, 1, 1)
+                padded_f = torch.cat([f, last_frame], dim=0)
+                padded_frames.append(padded_f)
+            else:
+                padded_frames.append(f)
 
     batch_frames = torch.stack(padded_frames, dim=0) if has_face_frames else None  # [B, T, 3, 224, 224] hoặc None
     batch_landmarks = torch.stack(padded_landmarks, dim=0)  # [B, T, 68, 2]
@@ -1280,6 +1339,9 @@ def build_litefat_dataloaders(
         color_jitter: float = 0.2,
         spatial_dropout: float = 0.15,
         subject_balanced_sampling: bool = True,
+        eval_window_mode: str = "center",
+        drop_single_class_subjects: bool = False,
+        visual_frame_stride: int = 1,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """
     Khởi tạo nhanh bộ 3 DataLoader cho tập train, val, test của mô hình LiteFat theo cơ chế window_sec và time_interval.
@@ -1315,6 +1377,8 @@ def build_litefat_dataloaders(
         extract_crops_only=extract_crops_only,
         selected_datasets=selected_datasets,
         use_visual_context=use_visual_context,
+        eval_window_mode=eval_window_mode,
+        visual_frame_stride=visual_frame_stride,
     )
 
     train_ds = LiteFatDataset(
@@ -1328,6 +1392,7 @@ def build_litefat_dataloaders(
         landmark_noise_std=landmark_noise_std,
         color_jitter=color_jitter,
         spatial_dropout=spatial_dropout,
+        drop_single_class_subjects=drop_single_class_subjects,
         **common_cfg,
     )
     val_ds = LiteFatDataset(split="val", augment_train=False, **common_cfg)

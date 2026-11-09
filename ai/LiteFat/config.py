@@ -39,10 +39,10 @@ class TrainConfig:
     # 1. ĐƯỜNG DẪN DỮ LIỆU & BỘ DỮ LIỆU CON
     # =================================================================
     # Thư mục gốc chứa các video đã qua tiền xử lý (chứa dataset_merged_split.csv)
-    dataset_dir: str = r"E:\LSTM\data_processed"
+    dataset_dir: str = r"/home/riftuser/train/dataset/data-processed-v3/data_processed"
 
     # Thư mục chứa các tệp cache đặc trưng .pt đã trích xuất sẵn (train.pt, val.pt, test.pt)
-    cache_dir: str = r"E:\LSTM\LiteFat\cache_pt"
+    cache_dir: str = r"/home/riftuser/train/dataset/cache-dataset-processed-v3/LiteFat/cache_pt"
 
     # Cờ sử dụng cache .pt (True: nạp từ cache để tăng tốc; False: trích xuất on-the-fly)
     use_cache: bool = True
@@ -53,13 +53,13 @@ class TrainConfig:
     selected_datasets: Optional[List[str]] = None
 
     # Tên file manifest CSV phân chia tập dữ liệu
-    manifest_filename: str = "dataset_merged_split.csv"
+    manifest_filename: str = "dataset_merged_split_v6.csv"
 
     # Thư mục lưu kết quả huấn luyện (checkpoints, metrics json, cấu hình)
-    checkpoint_dir: str = "checkpoints/LiteFat_v5"
+    checkpoint_dir: str = "./checkpoints/LiteFat_v6"
 
     # Thư mục lưu log TensorBoard
-    log_dir: str = "checkpoints/LiteFat_v5/logs"
+    log_dir: str = "./checkpoints/LiteFat_v6/logs"
 
     # =================================================================
     # 2. CHẾ ĐỘ ĐA PHƯƠNG THỨC & NGỮ CẢNH THỊ GIÁC (VISUAL CONTEXT)
@@ -68,6 +68,11 @@ class TrainConfig:
     # True: Huấn luyện đa phương thức (Landmark + Face Crops).
     # False: Chỉ huấn luyện đồ thị từ Landmark (không cần giải mã video, siêu nhanh).
     use_visual_context: bool = False
+
+    # Bước nhảy lấy mẫu khung hình ảnh mặt (Visual Frame Stride).
+    # Ví dụ: 4 -> lấy 1 ảnh mặt mỗi 4 frame landmark (5 FPS ảnh trên chuỗi 20 FPS landmark),
+    # giảm 4 lần chi phí giải mã video CPU và VRAM GPU.
+    visual_frame_stride: int = 4
 
     # Kích thước ảnh khung hình đưa vào trích xuất điểm mốc letterbox (w, h)
     letterbox_size: Tuple[int, int] = (640, 640)
@@ -84,9 +89,13 @@ class TrainConfig:
     time_interval: float = 0.05
 
     # Độ dài cửa sổ trượt (giây).
-    # 15.0s tương ứng T = 300 frames ở 20 FPS (ghi nhận toàn diện chuỗi hành vi ngủ gật, bảo toàn 83% video UL-DD).
-    # Đặt None để lấy toàn bộ độ dài video.
+    # 12.0s tương ứng T = 240 frames ở 20 FPS.
     window_sec: Optional[float] = 12.0
+
+    # Chế độ trích xuất cửa sổ khi đánh giá val / test:
+    # "center": Cắt cửa sổ chính giữa video có độ dài window_sec (khớp độ dài T lúc train).
+    # "legacy18s": Cắt 18s đầu clip (như v5).
+    eval_window_mode: str = "center"
 
     # =================================================================
     # 4. TĂNG CƯỜNG DỮ LIỆU ĐA PHƯƠNG THỨC (DATA AUGMENTATION)
@@ -136,6 +145,12 @@ class TrainConfig:
     dropout: float = 0.35
     pretrained_backbone: bool = True
 
+    # Hệ số giữ lại hình thái tĩnh của mắt/miệng (Static Shape Ratio).
+    # 0.25: Trừ 75% hình thái tĩnh của khuôn mặt để triệt tiêu shortcut học thuộc lòng từng session / người,
+    # bảo toàn 100% động học đóng/mở mắt (EAR) và ngáp (MAR).
+    # 1.00: Giữ nguyên hình thái gốc như v5.
+    static_shape_ratio: float = 0.25
+
     # Cặp chỉ số đỉnh giải phẫu dọc mắt (EAR) và dọc miệng (MAR) để tạo cạnh kề cơ sở A_prior
     # Cặp mắt trái: (37, 41), (38, 40); Cặp mắt phải: (43, 47), (44, 46)
     # Cặp miệng: (50, 58), (51, 57), (52, 56), (61, 67), (62, 66), (63, 65)
@@ -152,14 +167,23 @@ class TrainConfig:
     # =================================================================
     # 6. THAM SỐ HUẤN LUYỆN & TỐI ƯU HÓA (OPTIMIZATION)
     # =================================================================
-    epochs: int = 25
-    batch_size: int = 8
+    epochs: int = 30
+    batch_size: int = 32
     num_workers: int = 0
     pin_memory: bool = True
     seed: int = 42
 
     # Lấy mẫu cân bằng chủ thể (Subject-Balanced Sampling qua WeightedRandomSampler)
     subject_balanced_sampling: bool = True
+
+    # Loại bỏ các đối tượng chỉ có 1 lớp trong tập Train để ngăn mô hình học thuộc lòng shortcut khuôn mặt
+    drop_single_class_subjects: bool = True
+
+    # Hệ số suy giảm Exponential Moving Average (EMA) cho trọng số mô hình
+    ema_decay: float = 0.995
+
+    # Số epoch kiên nhẫn dừng sớm (Early Stopping) theo val_score
+    early_stop_patience: int = 8
 
     # Tốc độ học cơ bản cho nhánh Đồ thị STGL, Dung hợp FiLM và Đầu phân loại
     lr: float = 3e-4

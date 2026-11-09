@@ -354,6 +354,34 @@ def atomic_save(obj: Any, path: Union[str, Path]) -> None:
         raise e
 
 
+def binary_auc(labels: np.ndarray, probs: np.ndarray) -> float:
+    """
+    Tính toán diện tích dưới đường cong ROC (ROC-AUC) nhị phân thuần NumPy:
+    Sử dụng công thức tương đương kiểm định Mann-Whitney U với xử lý thứ hạng trùng (ties).
+    """
+    y = np.asarray(labels, dtype=int).ravel()
+    p = np.asarray(probs, dtype=float).ravel()
+    pos = p[y == 1]
+    neg = p[y == 0]
+    n_pos = len(pos)
+    n_neg = len(neg)
+    if n_pos == 0 or n_neg == 0:
+        return 0.5
+
+    order = np.argsort(p, kind="mergesort")
+    ranks = np.empty(len(p), dtype=float)
+    ranks[order] = np.arange(1, len(p) + 1, dtype=float)
+
+    unique_vals, inv, counts = np.unique(p, return_inverse=True, return_counts=True)
+    if len(unique_vals) < len(p):
+        sum_ranks = np.bincount(inv, weights=ranks)
+        ranks = (sum_ranks / counts)[inv]
+
+    sum_pos_ranks = ranks[y == 1].sum()
+    u_stat = sum_pos_ranks - (n_pos * (n_pos + 1)) / 2.0
+    return float(u_stat / (n_pos * n_neg))
+
+
 def compute_metrics(labels: np.ndarray, preds: np.ndarray, probs: Optional[np.ndarray] = None) -> Dict[str, float]:
     """
     Tính toán các chỉ số đánh giá phân loại buồn ngủ:
@@ -390,13 +418,12 @@ def compute_metrics(labels: np.ndarray, preds: np.ndarray, probs: Optional[np.nd
 
     if probs is not None:
         try:
-            from sklearn.metrics import roc_auc_score
             probs_arr = np.asarray(probs, dtype=float).ravel()
             if len(np.unique(labels)) > 1:
-                metrics["auc"] = float(roc_auc_score(labels, probs_arr))
+                metrics["auc"] = binary_auc(labels, probs_arr)
             else:
                 metrics["auc"] = 0.5
-        except Exception:
+        except Exception as e:
             metrics["auc"] = 0.5
 
     return metrics

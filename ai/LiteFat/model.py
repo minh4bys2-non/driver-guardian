@@ -36,12 +36,14 @@ class KinematicFeatureExtractor(nn.Module):
             left_eye_idx: int = 36,
             right_eye_idx: int = 45,
             eps: float = 1e-2,
+            static_shape_ratio: float = 0.25,
     ):
         super().__init__()
         self.nose_idx = nose_idx
         self.left_eye_idx = left_eye_idx
         self.right_eye_idx = right_eye_idx
         self.eps = eps
+        self.static_shape_ratio = float(static_shape_ratio)
 
         # Chuẩn hóa phân phối riêng cho 6 kênh [x, y, dx, dy, d2x, d2y]
         self.channel_norm = nn.BatchNorm2d(6, affine=True)
@@ -114,6 +116,17 @@ class KinematicFeatureExtractor(nn.Module):
         pos_feat[:, :, :, 42:48] = (x[:, :, :, 42:48] - c_right_eye) / iod_scale
         # Vùng miệng
         pos_feat[:, :, :, 48:68] = (x[:, :, :, 48:68] - c_mouth) / iod_scale
+
+        # Giảm thiểu shortcut hình thái tĩnh trên mắt, lông mày, miệng nếu static_shape_ratio < 1.0
+        if self.static_shape_ratio < 0.999:
+            organ_indices = list(range(17, 27)) + list(range(36, 68))
+            pos_org = pos_feat[:, :, :, organ_indices]
+            if mask is not None:
+                denom_org = mask.sum(dim=2, keepdim=True).clamp(min=1.0)
+                org_mean = (pos_org * mask).sum(dim=2, keepdim=True) / denom_org
+            else:
+                org_mean = pos_org.mean(dim=2, keepdim=True)
+            pos_feat[:, :, :, organ_indices] = (pos_org - org_mean) + self.static_shape_ratio * org_mean
 
         # Vùng Hàm (0..16) & Mũi (27..35): Trừ trung bình thời gian để bắt gật đầu/quay đầu mà không học thuộc lòng xương sọ
         jaw_nose_indices = list(range(0, 17)) + list(range(27, 36))
@@ -294,6 +307,7 @@ class MultimodalFusionModule(nn.Module):
             left_eye_idx: int = 36,
             right_eye_idx: int = 45,
             eps: float = 1e-2,
+            static_shape_ratio: float = 0.25,
     ):
         super().__init__()
         self.left_eye_idx = left_eye_idx
@@ -308,6 +322,7 @@ class MultimodalFusionModule(nn.Module):
             left_eye_idx=left_eye_idx,
             right_eye_idx=right_eye_idx,
             eps=eps,
+            static_shape_ratio=static_shape_ratio,
         )
 
         # Giữ lại w để tương thích backward compatibility với checkpoint cũ
@@ -326,6 +341,13 @@ class MultimodalFusionModule(nn.Module):
         # Tầng điều biến FiLM từ vector ngữ cảnh thị giác d
         self.film_scale = nn.Linear(feature_dim, feature_dim)
         self.film_shift = nn.Linear(feature_dim, feature_dim)
+
+    def reset_film_to_identity(self) -> None:
+        """Khởi tạo zero-init cho FiLM scale và shift để bảo toàn 100% đặc trưng đồ thị tại thời điểm bắt đầu Stage 2."""
+        nn.init.zeros_(self.film_scale.weight)
+        nn.init.zeros_(self.film_scale.bias)
+        nn.init.zeros_(self.film_shift.weight)
+        nn.init.zeros_(self.film_shift.bias)
 
     def detect_missing_mask(self, coords: torch.Tensor) -> torch.Tensor:
         p_left = coords[:, :, self.left_eye_idx, :]
@@ -663,6 +685,7 @@ class LiteFat(nn.Module):
             freeze_backbone: bool = False,
             vertical_pairs: Optional[List[Tuple[int, int]]] = None,
             cross_region_pairs: Optional[List[Tuple[int, int]]] = None,
+            static_shape_ratio: float = 0.25,
     ):
         super().__init__()
         self.num_nodes = num_nodes
@@ -671,6 +694,7 @@ class LiteFat(nn.Module):
         self.num_blocks = num_blocks
         self.layers_per_block = layers_per_block
         self.kernel_size = kernel_size
+        self.static_shape_ratio = float(static_shape_ratio)
 
         # 1. MobileNetV3-Small trích xuất ngữ cảnh thị giác từ ảnh mặt
         self.context_encoder = MobileNetV3ContextEncoder(
@@ -686,6 +710,7 @@ class LiteFat(nn.Module):
             num_features=6,
             feature_dim=feature_dim,
             num_nodes=num_nodes,
+            static_shape_ratio=static_shape_ratio,
         )
 
         # 3. Ma trận kề giải phẫu + tự thích nghi
@@ -806,12 +831,12 @@ class LiteFat(nn.Module):
             feat_mean = (frame_feat * valid_mask).sum(dim=1) / denom  # [B, end_channels]
             feat_attn = (frame_feat * temp_weights).sum(dim=1)         # [B, end_channels]
 
-            # Top-K event pooling (lấy top 25% frames có điểm chú ý sự kiện cao nhất)
-            k_val = max(1, int(round(T * 0.25)))
+            # Top-K event pooling (lấy top 25% frames có điểm chú ý sự kiện cao nhất theo độ dài từng mẫu)
             scores_2d = masked_scores.squeeze(-1)  # [B, T]
-            topk_idx = torch.topk(scores_2d, k=k_val, dim=1).indices  # [B, K]
-            batch_indices = torch.arange(B, device=frame_feat.device).unsqueeze(1).expand(-1, k_val)
-            feat_topk = frame_feat[batch_indices, topk_idx, :].mean(dim=1)  # [B, end_channels]
+            k_per = (lengths.float() * 0.25).round().clamp(min=1.0).long()  # [B]
+            ranks = scores_2d.argsort(dim=1, descending=True).argsort(dim=1)  # [B, T]
+            topk_mask = (ranks < k_per.unsqueeze(1)) & valid_bool.squeeze(-1)  # [B, T]
+            feat_topk = (frame_feat * topk_mask.unsqueeze(-1).float()).sum(dim=1) / topk_mask.sum(dim=1, keepdim=True).clamp(min=1.0).float()
 
             pooled_clip_feat = 0.50 * feat_attn + 0.30 * feat_topk + 0.20 * feat_mean
             clip_head_logits = self.clip_classifier(pooled_clip_feat)  # [B, num_classes]
@@ -859,10 +884,17 @@ class LiteFat(nn.Module):
 
         d = None
         if video_frames is not None and video_frames.numel() > 0:
-            B, T, C_img, H, W = video_frames.shape
-            frames_flat = video_frames.view(B * T, C_img, H, W)
+            B, T_v, C_img, H, W = video_frames.shape
+            frames_flat = video_frames.view(B * T_v, C_img, H, W)
             d_flat = self.context_encoder(frames_flat)
-            d = d_flat.view(B, T, self.feature_dim)
+            d_sparse = d_flat.view(B, T_v, self.feature_dim)
+            # Xác định chiều dài thời gian T của landmark
+            T_target = landmarks.shape[1] if (landmarks.dim() == 4 and landmarks.size(-1) in (2, 3)) else landmarks.shape[2]
+            if T_v != T_target:
+                # Nội suy đặc trưng ngữ cảnh thị giác từ T_v khung hình lên trọn vẹn T_target khung hình
+                d = F.interpolate(d_sparse.permute(0, 2, 1), size=T_target, mode="linear", align_corners=False).permute(0, 2, 1)
+            else:
+                d = d_sparse
 
         if mask is None and lengths is not None:
             mask = KinematicFeatureExtractor.build_temporal_mask(

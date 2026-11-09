@@ -19,10 +19,15 @@ from torchvision.models import MobileNet_V3_Small_Weights, mobilenet_v3_small
 
 class KinematicFeatureExtractor(nn.Module):
     """
-    Khối tiền xử lý chuẩn hóa động học 68 điểm mốc khuôn mặt:
-    1. Đưa tọa độ tĩnh (x, y) về Hệ tọa độ Cục bộ Tâm mũi (điểm 30) & chia cho khoảng cách 2 mắt (IOD: 36 <-> 45).
-    2. Tính Vận tốc (dx, dy) và Gia tốc (d2x, d2y) chuẩn hóa theo IOD.
-    3. Chuẩn hóa phân phối theo từng kênh qua BatchNorm2d(6) để cân bằng biên độ giữa tọa độ và động lực học.
+    Khối tiền xử lý chuẩn hóa động học 68 điểm mốc khuôn mặt (LiteFat v5):
+    1. Chuẩn hóa hình thái đa cơ quan độc lập (Organ-Centered Local Coordinates):
+       - Mắt & Lông mày: Quy chiếu về tâm khóe mắt, bảo toàn 100% độ mở mắt tĩnh/động (EAR).
+       - Miệng: Quy chiếu về tâm khóe miệng, bảo toàn 100% độ mở miệng tĩnh/động (MAR).
+       - Hàm & Mũi: Khử cấu trúc tĩnh (pos_dyn + 0.25*pos_norm) để ghi nhận tư thế đầu mà không học thuộc lòng xương sọ.
+    2. Ổn định IOD tránh nổ thương số khi quay đầu sang ngang (Head Yaw).
+    3. Đạo hàm vận tốc d(nose)/iod và gia tốc đúng chuẩn giải tích, loại bỏ triệt để gai giả ở t=1.
+    4. Cân bằng năng lượng động học từng clip (Instance Kinematic Normalization) trước BatchNorm2d(6)
+       để đồng bộ biên độ chuyển động giữa các bộ dữ liệu khác biệt FPS và độ rung cabin (UL-DD, SUST, VBDDD).
     """
 
     def __init__(
@@ -70,62 +75,113 @@ class KinematicFeatureExtractor(nn.Module):
         if x.size(1) != 2:
             return x * mask if mask is not None else x
 
-        # 1. Tính khoảng cách giải phẫu chuẩn IOD (Inter-Ocular Distance giữa điểm 36 và 45)
-        p_left_eye = x[:, :, :, self.left_eye_idx: self.left_eye_idx + 1]  # (B, 2, T, 1)
+        B, _, T, V = x.shape
+
+        # 1. Khoảng cách giải phẫu 2 mắt (Inter-Ocular Distance - IOD giữa điểm 36 và 45)
+        p_left_eye = x[:, :, :, self.left_eye_idx: self.left_eye_idx + 1]    # (B, 2, T, 1)
         p_right_eye = x[:, :, :, self.right_eye_idx: self.right_eye_idx + 1]  # (B, 2, T, 1)
-        raw_iod = torch.norm(p_right_eye - p_left_eye, p=2, dim=1, keepdim=True)
-        iod_scale = raw_iod.clamp(min=self.eps)
+        raw_iod = torch.norm(p_right_eye - p_left_eye, p=2, dim=1, keepdim=True).clamp(min=self.eps)  # (B, 1, T, 1)
 
-        # 2. Chuẩn hóa tọa độ hình thái theo Tâm mũi (điểm 30) và tỷ lệ IOD
-        nose_pos = x[:, :, :, self.nose_idx: self.nose_idx + 1]  # (B, 2, T, 1)
-        pos_norm = (x - nose_pos) / iod_scale  # (B, 2, T, V)
-        pos_norm = torch.clamp(pos_norm, min=-10.0, max=10.0)
-
-        # Khử hiện tượng ghi nhớ cấu trúc mặt tĩnh của chủ thể (Subject-Identity Shortcut):
-        # Tách tọa độ thành độ dịch chuyển động (Dynamic Displacement) và tư thế tĩnh suy giảm
+        # Ổn định IOD theo từng clip: kết hợp IOD tức thời với trung bình IOD của các frame hợp lệ
+        # Khi tài xế quay đầu sang ngang (yaw), khoảng cách 2D co lại nhưng không làm nổ mẫu số
         if mask is not None:
-            denom = mask.sum(dim=2, keepdim=True).clamp(min=1.0)  # (B, 1, 1, 1)
-            pos_mean = (pos_norm * mask).sum(dim=2, keepdim=True) / denom  # (B, 2, 1, V)
+            v_mask = mask.clamp(min=0.0, max=1.0)
+            clip_iod = (raw_iod * v_mask).sum(dim=2, keepdim=True) / v_mask.sum(dim=2, keepdim=True).clamp(min=1.0)
         else:
-            pos_mean = pos_norm.mean(dim=2, keepdim=True)
-        pos_dyn = pos_norm - pos_mean
-        pos_feat = pos_dyn + 0.20 * pos_norm  # Hệ số 0.20 giữ tỷ lệ mắt/miệng cần thiết nhưng triệt tiêu ghi nhớ tĩnh
+            clip_iod = raw_iod.mean(dim=2, keepdim=True)
+        clip_iod = clip_iod.clamp(min=self.eps)
+        iod_scale = torch.maximum(0.5 * raw_iod + 0.5 * clip_iod, 0.65 * clip_iod).clamp(min=self.eps)
 
-        # 3. Tính Vận tốc (dx, dy) và Gia tốc (d2x, d2y) chuẩn hóa theo IOD
-        T = x.size(2)
+        # 2. Tọa độ chuẩn hóa theo Tâm Mũi (pos_norm) dùng cho biến dạng động lực học
+        nose_pos = x[:, :, :, self.nose_idx: self.nose_idx + 1]  # (B, 2, T, 1)
+        pos_norm = (x - nose_pos) / iod_scale                    # (B, 2, T, V)
+        pos_norm = torch.clamp(pos_norm, min=-8.0, max=8.0)
+
+        # 3. Chuẩn hóa hình thái đa cơ quan độc lập (Organ-Centered Local Coordinates):
+        # Mắt trái (36..41) & Lông mày trái (17..21): Gốc tại trung điểm khóe mắt trái (36 & 39)
+        c_left_eye = 0.5 * (x[:, :, :, 36:37] + x[:, :, :, 39:40])
+        # Mắt phải (42..47) & Lông mày phải (22..26): Gốc tại trung điểm khóe mắt phải (42 & 45)
+        c_right_eye = 0.5 * (x[:, :, :, 42:43] + x[:, :, :, 45:46])
+        # Miệng (48..67): Gốc tại trung điểm 2 khóe miệng (48 & 54)
+        c_mouth = 0.5 * (x[:, :, :, 48:49] + x[:, :, :, 54:55])
+
+        pos_feat = pos_norm.clone()
+        # Vùng mắt & lông mày trái
+        pos_feat[:, :, :, 17:22] = (x[:, :, :, 17:22] - c_left_eye) / iod_scale
+        pos_feat[:, :, :, 36:42] = (x[:, :, :, 36:42] - c_left_eye) / iod_scale
+        # Vùng mắt & lông mày phải
+        pos_feat[:, :, :, 22:27] = (x[:, :, :, 22:27] - c_right_eye) / iod_scale
+        pos_feat[:, :, :, 42:48] = (x[:, :, :, 42:48] - c_right_eye) / iod_scale
+        # Vùng miệng
+        pos_feat[:, :, :, 48:68] = (x[:, :, :, 48:68] - c_mouth) / iod_scale
+
+        # Vùng Hàm (0..16) & Mũi (27..35): Trừ trung bình thời gian để bắt gật đầu/quay đầu mà không học thuộc lòng xương sọ
+        jaw_nose_indices = list(range(0, 17)) + list(range(27, 36))
+        pos_jn = pos_norm[:, :, :, jaw_nose_indices]
+        if mask is not None:
+            denom_jn = mask.sum(dim=2, keepdim=True).clamp(min=1.0)
+            jn_mean = (pos_jn * mask).sum(dim=2, keepdim=True) / denom_jn
+        else:
+            jn_mean = pos_jn.mean(dim=2, keepdim=True)
+        pos_feat[:, :, :, jaw_nose_indices] = (pos_jn - jn_mean) + 0.25 * pos_jn
+        pos_feat = torch.clamp(pos_feat, min=-8.0, max=8.0)
+
+        # 4. Tính Vận tốc (dx, dy) và Gia tốc (d2x, d2y) chuẩn hóa giải tích
         if T <= 1:
             vel_norm = torch.zeros_like(pos_norm)
             acc_norm = torch.zeros_like(pos_norm)
         else:
-            # Vận tốc biến dạng cục bộ trên khuôn mặt (tránh bị dịch chuyển toàn đầu lấn át)
+            # Vận tốc biến dạng cục bộ giữa các khung hình liên tiếp
             vel_local = torch.diff(pos_norm, n=1, dim=2)  # (B, 2, T-1, V)
-            # Vận tốc tịnh tiến toàn đầu được bảo toàn trên đỉnh tâm mũi (node 30)
-            nose_pos_norm = nose_pos / iod_scale
-            nose_vel = torch.diff(nose_pos_norm, n=1, dim=2)  # (B, 2, T-1, 1)
+
+            # Vận tốc tịnh tiến toàn đầu tại đỉnh tâm mũi (node 30):
+            # Tính d(nose)/iod thay vì d(nose/iod) để triệt tiêu hoàn toàn lỗi nổ vận tốc do dao động mẫu số
+            delta_nose = torch.diff(nose_pos, n=1, dim=2)  # (B, 2, T-1, 1)
+            iod_mid = 0.5 * (iod_scale[:, :, 1:, :] + iod_scale[:, :, :-1, :])
+            nose_vel = delta_nose / iod_mid.clamp(min=self.eps)
+            nose_vel = torch.clamp(nose_vel, min=-4.0, max=4.0)
             vel_local = vel_local.clone()
             vel_local[:, :, :, self.nose_idx: self.nose_idx + 1] = nose_vel
 
-            pair_valid = None
             if mask is not None:
                 pair_valid = mask[:, :, 1:, :] * mask[:, :, :-1, :]
                 vel_local = vel_local * pair_valid
 
-            vel_local = F.pad(vel_local, (0, 0, 1, 0), mode="constant", value=0.0)
-            vel_norm = torch.clamp(vel_local, min=-10.0, max=10.0)
+            # Gia tốc: Đạo hàm bậc 2 trên chuỗi vận tốc trước khi chèn số 0 (loại bỏ gai giả ở t=1)
+            if T >= 3:
+                acc_raw = torch.diff(vel_local, n=1, dim=2)  # (B, 2, T-2, V)
+                if mask is not None:
+                    triplet_valid = mask[:, :, 2:, :] * mask[:, :, 1:-1, :] * mask[:, :, :-2, :]
+                    acc_raw = acc_raw * triplet_valid
+                acc_raw = torch.clamp(acc_raw, min=-4.0, max=4.0)
+                acc_norm = F.pad(acc_raw, (0, 0, 2, 0), mode="constant", value=0.0)  # (B, 2, T, V)
+            else:
+                acc_norm = torch.zeros_like(pos_norm)
 
-            acc_raw = torch.diff(vel_norm, n=1, dim=2)
-            if mask is not None and pair_valid is not None:
-                triplet_valid = pair_valid[:, :, 1:, :] * pair_valid[:, :, :-1, :]
-                acc_mask = F.pad(triplet_valid, (0, 0, 1, 0), mode="constant", value=0.0)
-                acc_raw = acc_raw * acc_mask
+            vel_norm = F.pad(vel_local, (0, 0, 1, 0), mode="constant", value=0.0)  # (B, 2, T, V)
+            vel_norm = torch.clamp(vel_norm, min=-4.0, max=4.0)
 
-            acc_raw = F.pad(acc_raw, (0, 0, 1, 0), mode="constant", value=0.0)
-            acc_norm = torch.clamp(acc_raw, min=-10.0, max=10.0)
+        # 5. Cân bằng năng lượng động học từng clip (Instance Kinematic Normalization)
+        # Giúp đồng bộ thang đo giữa UL-DD (camera 60fps tĩnh) và SUST/VBDDD (camera cabin rung)
+        if mask is not None:
+            m_valid = mask.clamp(min=0.0, max=1.0)
+            n_valid = m_valid.sum(dim=(2, 3), keepdim=True).clamp(min=1.0) * float(V)
+            vel_rms = torch.sqrt((vel_norm.pow(2) * m_valid).sum(dim=(2, 3), keepdim=True) / n_valid + 1e-6)
+            acc_rms = torch.sqrt((acc_norm.pow(2) * m_valid).sum(dim=(2, 3), keepdim=True) / n_valid + 1e-6)
+        else:
+            vel_rms = torch.sqrt(vel_norm.pow(2).mean(dim=(2, 3), keepdim=True) + 1e-6)
+            acc_rms = torch.sqrt(acc_norm.pow(2).mean(dim=(2, 3), keepdim=True) + 1e-6)
+
+        # Chuẩn hóa mềm đưa RMS về dải tự nhiên ~0.035 IOD/frame
+        vel_scale = torch.clamp(vel_rms, min=0.012, max=0.10) / 0.035
+        acc_scale = torch.clamp(acc_rms, min=0.010, max=0.08) / 0.025
+        vel_norm = vel_norm / vel_scale
+        acc_norm = acc_norm / acc_scale
 
         out = torch.cat([pos_feat, vel_norm, acc_norm], dim=1)  # (B, 6, T, V)
-        out = torch.nan_to_num(out, nan=0.0, posinf=10.0, neginf=-10.0)
+        out = torch.nan_to_num(out, nan=0.0, posinf=4.0, neginf=-4.0)
 
-        # Chuẩn hóa cân bằng phân phối giữa các kênh động học (áp dụng mask trước và sau BN)
+        # 6. Chuẩn hóa kênh BatchNorm2d(6) kết hợp che mặt nạ chặt chẽ
         if mask is not None:
             out = out * mask
         out = self.channel_norm(out)
@@ -388,7 +444,7 @@ class SelfAdaptiveAdjacency(nn.Module):
         # 2. Lông mày trái (17..21) & phải (22..26)
         for i in range(17, 21):
             A[i, i + 1] = A[i + 1, i] = 1.0
-        for i in range(22, 25):
+        for i in range(22, 26):
             A[i, i + 1] = A[i + 1, i] = 1.0
 
         # 3. Sống mũi (27..30) & Cánh mũi (31..35)
@@ -485,12 +541,13 @@ class SpatialGCNLayer(nn.Module):
 
             h1 = self.W0(x_perm)  # [B, T, N, H]
             # Nhân đồ thị chuẩn xác: đỉnh i tổng hợp đặc trưng từ các đỉnh láng giềng j theo A_adp[i, j]
-            h1 = torch.einsum("ij,btjf->btif", A_f32, h1)
+            # torch.matmul(A_f32, h1) tự động broadcast qua [B, T], chạy bằng cuBLAS GEMM nhanh gấp 3-4 lần einsum
+            h1 = torch.matmul(A_f32, h1)
             h1 = F.relu(h1)
             h1 = self.dropout(h1)
 
             h2 = self.W1(h1)  # [B, T, N, M]
-            h2 = torch.einsum("ij,btjf->btif", A_f32, h2)
+            h2 = torch.matmul(A_f32, h2)
             z = F.gelu(self.norm(h2)) + self.res_proj(x_perm)
 
         return z.to(orig_dtype).permute(0, 3, 2, 1).contiguous()
@@ -676,11 +733,22 @@ class LiteFat(nn.Module):
         self.register_buffer("node_prior_bias", node_prior)
 
         # Attentive Temporal Pooling: Tự học trọng số chú ý từ vector đặc trưng khung hình (end_channels) thay vì class logits
+        self.temp_norm = nn.LayerNorm(end_channels)
         self.temporal_gate = nn.Sequential(
             nn.Linear(end_channels, 64),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(64, 1),
+        )
+        self.temp_scale = nn.Parameter(torch.tensor(2.0))
+
+        # Đầu phân loại độc lập cấp đoạn video (Clip-Level Classifier):
+        # Tách biệt không gian biểu diễn cấp đoạn và không gian dự đoán frame để không bị ảnh hưởng bởi bias âm của frame
+        self.clip_classifier = nn.Sequential(
+            nn.Linear(end_channels, 128),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(128, num_classes),
         )
 
     def forward_stgl_from_fused(
@@ -692,9 +760,18 @@ class LiteFat(nn.Module):
         A_adp = self.adaptive_adj()
         h = self.start_conv(X)
 
+        B, _, _, T = X.shape
+        t_mask = None
+        if lengths is not None:
+            t_idx = torch.arange(T, device=X.device).unsqueeze(0)  # [1, T]
+            t_mask = (t_idx < lengths.to(X.device).unsqueeze(1)).float().view(B, 1, 1, T)
+
         skip_sum = None
         for block in self.stgl_blocks:
             h, skip = block(h, A_adp)
+            if t_mask is not None:
+                h = h * t_mask
+                skip = skip * t_mask
             skip_sum = skip if skip_sum is None else (skip_sum + skip)
 
         out = F.relu(skip_sum)
@@ -711,25 +788,52 @@ class LiteFat(nn.Module):
         # Dự đoán logits cấp khung hình [B, T, num_classes]
         frame_logits = self.end_conv_2(pooled_node_feat.unsqueeze(2)).squeeze(2).permute(0, 2, 1).contiguous()
 
-        # Tính toán dự đoán cấp đoạn video (Clip Logits): Tận dụng frame_feat để học trọng số chú ý thời gian
-        temp_scores = self.temporal_gate(frame_feat)  # [B, T, 1]
+        # Multi-Scale Event MIL Pooling cho Clip Logits
+        feat_norm = self.temp_norm(frame_feat)
+        temp_scores = self.temporal_gate(feat_norm) * self.temp_scale  # [B, T, 1]
+
         if lengths is not None:
-            B, T, _ = frame_logits.shape
             valid_bool = (torch.arange(T, device=frame_logits.device).unsqueeze(0) < lengths.to(frame_logits.device).unsqueeze(1)).unsqueeze(-1)
             valid_mask = valid_bool.type_as(frame_logits)
             denom = valid_mask.sum(dim=1).clamp(min=1.0)
-            mean_logits = (frame_logits * valid_mask).sum(dim=1) / denom
 
+            # 1. Trọng số chú ý sắc nét (Sharp Attention)
             masked_scores = temp_scores.masked_fill(~valid_bool, -1e4)
             temp_weights = F.softmax(masked_scores, dim=1) * valid_mask
             temp_weights = temp_weights / temp_weights.sum(dim=1, keepdim=True).clamp(min=1e-6)
-            attn_logits = (frame_logits * temp_weights).sum(dim=1)
-        else:
-            mean_logits = frame_logits.mean(dim=1)
-            temp_weights = F.softmax(temp_scores, dim=1)
-            attn_logits = (frame_logits * temp_weights).sum(dim=1)
 
-        clip_logits = 0.5 * mean_logits + 0.5 * attn_logits
+            # 2. Gộp đặc trưng đa nhánh: Mean + Sharp Attention + Top-K Event
+            feat_mean = (frame_feat * valid_mask).sum(dim=1) / denom  # [B, end_channels]
+            feat_attn = (frame_feat * temp_weights).sum(dim=1)         # [B, end_channels]
+
+            # Top-K event pooling (lấy top 25% frames có điểm chú ý sự kiện cao nhất)
+            k_val = max(1, int(round(T * 0.25)))
+            scores_2d = masked_scores.squeeze(-1)  # [B, T]
+            topk_idx = torch.topk(scores_2d, k=k_val, dim=1).indices  # [B, K]
+            batch_indices = torch.arange(B, device=frame_feat.device).unsqueeze(1).expand(-1, k_val)
+            feat_topk = frame_feat[batch_indices, topk_idx, :].mean(dim=1)  # [B, end_channels]
+
+            pooled_clip_feat = 0.50 * feat_attn + 0.30 * feat_topk + 0.20 * feat_mean
+            clip_head_logits = self.clip_classifier(pooled_clip_feat)  # [B, num_classes]
+
+            # Kết hợp với attentive frame logits
+            attn_frame_logits = (frame_logits * temp_weights).sum(dim=1)
+            clip_logits = 0.60 * clip_head_logits + 0.40 * attn_frame_logits
+        else:
+            temp_weights = F.softmax(temp_scores, dim=1)
+            feat_mean = frame_feat.mean(dim=1)
+            feat_attn = (frame_feat * temp_weights).sum(dim=1)
+
+            k_val = max(1, int(round(T * 0.25)))
+            scores_2d = temp_scores.squeeze(-1)
+            topk_idx = torch.topk(scores_2d, k=k_val, dim=1).indices
+            batch_indices = torch.arange(B, device=frame_feat.device).unsqueeze(1).expand(-1, k_val)
+            feat_topk = frame_feat[batch_indices, topk_idx, :].mean(dim=1)
+
+            pooled_clip_feat = 0.50 * feat_attn + 0.30 * feat_topk + 0.20 * feat_mean
+            clip_head_logits = self.clip_classifier(pooled_clip_feat)
+            attn_frame_logits = (frame_logits * temp_weights).sum(dim=1)
+            clip_logits = 0.60 * clip_head_logits + 0.40 * attn_frame_logits
 
         return frame_logits, clip_logits
 

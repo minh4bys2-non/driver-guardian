@@ -968,14 +968,24 @@ class LiteFatDataset(Dataset):
             pos = np.rint(timestamps / cache_dt).astype(int)
             return np.clip(pos, 0, T_cache - 1)
         else:
-            win = min(self.window_sec, duration_sec)
-            max_start = max(0.0, duration_sec - win)
-            start_sec = random.uniform(0.0, max_start) if (self.split == "train" and max_start > 0) else max_start / 2.0
-            timestamps = start_sec + np.arange(0, win, self.time_interval)
-            if len(timestamps) == 0:
-                timestamps = np.array([start_sec])
-            pos = np.rint(timestamps / cache_dt).astype(int)
-            return np.clip(pos, 0, T_cache - 1)
+            if self.split != "train":
+                # Đối với tập val và test: Đánh giá trên tối đa 18.0 giây (360 frames)
+                # để bao quát trọn vẹn toàn bộ chuỗi video UL-DD/VBDDD, không bị cắt cụt mất sự kiện buồn ngủ
+                eval_win = min(max(self.window_sec or 10.0, 18.0), duration_sec)
+                timestamps = np.arange(0, eval_win, self.time_interval)
+                if len(timestamps) == 0:
+                    timestamps = np.array([0.0])
+                pos = np.rint(timestamps / cache_dt).astype(int)
+                return np.clip(pos, 0, T_cache - 1)
+            else:
+                win = min(self.window_sec, duration_sec)
+                max_start = max(0.0, duration_sec - win)
+                start_sec = random.uniform(0.0, max_start) if max_start > 0 else 0.0
+                timestamps = start_sec + np.arange(0, win, self.time_interval)
+                if len(timestamps) == 0:
+                    timestamps = np.array([start_sec])
+                pos = np.rint(timestamps / cache_dt).astype(int)
+                return np.clip(pos, 0, T_cache - 1)
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -1243,7 +1253,7 @@ def build_litefat_dataloaders(
         batch_size: int = 8,
         num_workers: int = 0,
         time_interval: float = 0.05,
-        window_sec: Optional[float] = 10.0,
+        window_sec: Optional[float] = 15.0,
         letterbox_size: Tuple[int, int] = (640, 640),
         face_size: Tuple[int, int] = (224, 224),
         manifest_filename: str = "dataset_merged_split.csv",
@@ -1266,7 +1276,7 @@ def build_litefat_dataloaders(
         shift_jitter: float = 0.05,
         roll_deg: float = 12.0,
         temporal_dropout: float = 0.05,
-        landmark_noise_std: float = 0.002,
+        landmark_noise_std: float = 0.0003,
         color_jitter: float = 0.2,
         spatial_dropout: float = 0.15,
         subject_balanced_sampling: bool = True,

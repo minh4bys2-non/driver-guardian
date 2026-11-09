@@ -215,11 +215,13 @@ def augment_multimodal_clip(
             lms[..., 0] = torch.where(valid_pts.squeeze(-1), rot_x, lms[..., 0])
             lms[..., 1] = torch.where(valid_pts.squeeze(-1), rot_y, lms[..., 1])
 
-    # 3. Co giãn bất đẳng hướng (Anisotropic Scale Jitter) và dịch chuyển (Shift)
-    # scale_x khác scale_y làm thay đổi tỷ lệ khuôn mặt, phá vỡ sự triệt tiêu của chuẩn hóa IOD
+    # 3. Co giãn gần như đẳng hướng (Near-Isotropic Scale Jitter) và dịch chuyển (Shift)
+    # Giới hạn biến dạng tỷ lệ trục y/x trong ngưỡng ±1.5% để bảo toàn độ mở mắt EAR và miệng MAR
     if scale_jitter > 0 or shift_jitter > 0:
-        scale_x = 1.0 + random.uniform(-scale_jitter, scale_jitter)
-        scale_y = 1.0 + random.uniform(-scale_jitter, scale_jitter)
+        base_scale = 1.0 + random.uniform(-scale_jitter, scale_jitter)
+        aspect_ratio = 1.0 + random.uniform(-0.015, 0.015)
+        scale_x = base_scale
+        scale_y = base_scale * aspect_ratio
         shift_x = random.uniform(-shift_jitter, shift_jitter)
         shift_y = random.uniform(-shift_jitter, shift_jitter)
 
@@ -238,9 +240,24 @@ def augment_multimodal_clip(
             lms[..., 0] = torch.where(valid_pts.squeeze(-1), new_x, lms[..., 0])
             lms[..., 1] = torch.where(valid_pts.squeeze(-1), new_y, lms[..., 1])
 
-    # 4. Nhiễu Gaussian trên điểm mốc
+    # 4. Nhiễu Gaussian mượt theo thời gian (Temporally Smoothed Landmark Noise)
+    # Bộ lọc 3-tap [0.25, 0.50, 0.25] tránh tạo ra gai đạo hàm bậc 2 (acc) giả,
+    # và giữ nguyên tọa độ gốc của 2 khóe mắt (36, 45) để bảo vệ mẫu số IOD
     if landmark_noise_std > 0:
-        noise = torch.randn_like(lms) * landmark_noise_std
+        raw_noise = torch.randn_like(lms) * landmark_noise_std
+        if lms.shape[0] >= 3:
+            smooth_noise = 0.5 * raw_noise
+            smooth_noise[1:-1] += 0.25 * (raw_noise[:-2] + raw_noise[2:])
+            smooth_noise[0] += 0.25 * raw_noise[0]
+            smooth_noise[-1] += 0.25 * raw_noise[-1]
+            noise = smooth_noise
+        else:
+            noise = raw_noise
+
+        # Không làm nhiễu 2 nút gốc đo khoảng cách mắt (36, 45)
+        noise[:, 36, :] = 0.0
+        noise[:, 45, :] = 0.0
+
         noisy_lms = torch.clamp(lms + noise, 0.0, 1.0)
         lms = torch.where(valid_pts, noisy_lms, lms)
 

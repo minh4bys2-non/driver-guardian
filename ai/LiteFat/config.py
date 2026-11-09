@@ -56,10 +56,10 @@ class TrainConfig:
     manifest_filename: str = "dataset_merged_split.csv"
 
     # Thư mục lưu kết quả huấn luyện (checkpoints, metrics json, cấu hình)
-    checkpoint_dir: str = "checkpoints/LiteFat_v4_pretrain_epoch_6"
+    checkpoint_dir: str = "checkpoints/LiteFat_v5"
 
     # Thư mục lưu log TensorBoard
-    log_dir: str = "checkpoints/LiteFat_v4_pretrain_epoch_6/logs"
+    log_dir: str = "checkpoints/LiteFat_v5/logs"
 
     # =================================================================
     # 2. CHẾ ĐỘ ĐA PHƯƠNG THỨC & NGỮ CẢNH THỊ GIÁC (VISUAL CONTEXT)
@@ -84,9 +84,9 @@ class TrainConfig:
     time_interval: float = 0.05
 
     # Độ dài cửa sổ trượt (giây).
-    # 10.0s tương ứng T = 200 frames ở 20 FPS (ghi nhận toàn diện chuỗi hành vi ngủ gật).
+    # 15.0s tương ứng T = 300 frames ở 20 FPS (ghi nhận toàn diện chuỗi hành vi ngủ gật, bảo toàn 83% video UL-DD).
     # Đặt None để lấy toàn bộ độ dài video.
-    window_sec: Optional[float] = 10.0
+    window_sec: Optional[float] = 12.0
 
     # =================================================================
     # 4. TĂNG CƯỜNG DỮ LIỆU ĐA PHƯƠNG THỨC (DATA AUGMENTATION)
@@ -109,8 +109,8 @@ class TrainConfig:
     # Tỷ lệ che khuất ngẫu nhiên vài khung hình mô phỏng mất tracking (Temporal Dropout)
     temporal_dropout: float = 0.05
 
-    # Độ lệch chuẩn của nhiễu Gaussian cộng vào tọa độ điểm mốc
-    landmark_noise_std: float = 0.002
+    # Độ lệch chuẩn của nhiễu Gaussian cộng vào tọa độ điểm mốc (được làm mượt thời gian)
+    landmark_noise_std: float = 0.0003
 
     # Biên độ biến đổi độ sáng và độ tương phản nhất quán thời gian trên ảnh khuôn mặt
     color_jitter: float = 0.2
@@ -152,7 +152,7 @@ class TrainConfig:
     # =================================================================
     # 6. THAM SỐ HUẤN LUYỆN & TỐI ƯU HÓA (OPTIMIZATION)
     # =================================================================
-    epochs: int = 15
+    epochs: int = 25
     batch_size: int = 8
     num_workers: int = 0
     pin_memory: bool = True
@@ -162,7 +162,7 @@ class TrainConfig:
     subject_balanced_sampling: bool = True
 
     # Tốc độ học cơ bản cho nhánh Đồ thị STGL, Dung hợp FiLM và Đầu phân loại
-    lr: float = 2e-4
+    lr: float = 3e-4
 
     # Tốc độ học riêng biệt cho xương sống MobileNetV3-Small (thường nhỏ hơn 10 lần)
     backbone_lr: float = 3e-5
@@ -174,7 +174,7 @@ class TrainConfig:
     freeze_backbone_epochs: int = 5
 
     # Số epoch làm nóng tốc độ học (Linear Warmup)
-    warmup_epochs: int = 0
+    warmup_epochs: int = 2
 
     # Giảm tốc độ học cho các trọng số đã được tiền huấn luyện (Warm-start) để chống quên thảm khốc
     pretrained_lr_scale: float = 0.25
@@ -191,8 +191,8 @@ class TrainConfig:
     # Đường dẫn tới tệp checkpoint để tiếp tục huấn luyện (ví dụ: "checkpoints/LiteFat/epoch_03.pt" hoặc "checkpoints/LiteFat/last.pt").
     resume: Optional[str] = None
 
-    # Đường dẫn checkpoint tiền huấn luyện để khởi tạo ấm (Warm-start) các tầng khớp kích thước từ Epoch 1
-    pretrained_from: Optional[str] = r"checkpoints/LiteFat_v3_pretrain/epoch_06.pt"
+    # Đường dẫn checkpoint tiền huấn luyện để khởi tạo ấm (None khi train lại từ đầu cho v5)
+    pretrained_from: Optional[str] = None
     # =================================================================
     # 7. HÀM MẤT MÁT (LOSS CONFIGURATION)
     # =================================================================

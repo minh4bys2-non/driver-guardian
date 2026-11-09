@@ -256,7 +256,11 @@ class LiteFatTrainer:
         else:
             self.logger.warning("Checkpoint không chứa 'model_state_dict'!")
 
-        # 2. Khôi phục Optimizer & Scheduler & GradScaler
+        # 2. Khôi phục Epochs trước để tính đúng remaining_epochs cho Scheduler
+        ckpt_epoch = checkpoint.get("epoch", 0)
+        self.start_epoch = ckpt_epoch + 1
+
+        # 3. Khôi phục Optimizer & Scheduler & GradScaler
         if "optimizer_state_dict" in checkpoint:
             self._safe_load_optimizer(checkpoint["optimizer_state_dict"])
         if "scheduler_state_dict" in checkpoint:
@@ -276,9 +280,7 @@ class LiteFatTrainer:
         if "scaler_state_dict" in checkpoint and self.scaler.is_enabled():
             self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
 
-        # 3. Khôi phục Epochs & Metrics
-        ckpt_epoch = checkpoint.get("epoch", 0)
-        self.start_epoch = ckpt_epoch + 1
+        # 4. Khôi phục Best Metrics
 
         if "best_epoch" in checkpoint:
             self.best_epoch = checkpoint.get("best_epoch", -1)
@@ -386,10 +388,13 @@ class LiteFatTrainer:
                 else:
                     skipped_keys.append(f"{name} (shape lệch: {saved_param.shape} vs {curr_param.shape})")
             else:
-                # Tầng mới: Zero-init skip_conv và res_scale để tầng mới bắt đầu như identity pass-through
-                if name.startswith("stgl_blocks.") and ("skip_conv" in name or "res_scale" in name):
+                # Tầng mới: Zero-init skip_conv; Khởi tạo res_scale = 1.0 (không được zero-init làm ngắt kết nối GCN)
+                if name.startswith("stgl_blocks.") and "skip_conv" in name:
                     curr_param.zero_()
                     skipped_keys.append(f"{name} (tầng mới - zero-init)")
+                elif name.startswith("stgl_blocks.") and "res_scale" in name:
+                    curr_param.fill_(1.0)
+                    skipped_keys.append(f"{name} (khởi tạo res_scale = 1.0)")
                 else:
                     skipped_keys.append(f"{name} (mới)")
 
@@ -597,11 +602,15 @@ class LiteFatTrainer:
             m_th = compute_metrics(targets_np, (probs_np >= th).astype(int), probs_np)
             candidates.append((float(th), m_th))
 
-        valid_candidates = [c for c in candidates if c[1]["specificity"] >= 0.50 and c[1]["recall"] >= 0.50]
+        valid_candidates = [c for c in candidates if c[1]["specificity"] >= 0.65 and c[1]["recall"] >= 0.55]
         if valid_candidates:
             best_th, best_m = max(valid_candidates, key=lambda c: c[1]["f1"])
         else:
-            best_th, best_m = max(candidates, key=lambda c: c[1]["f1"])
+            fallback_candidates = [c for c in candidates if c[1]["specificity"] >= 0.50 and c[1]["recall"] >= 0.50]
+            if fallback_candidates:
+                best_th, best_m = max(fallback_candidates, key=lambda c: c[1]["f1"])
+            else:
+                best_th, best_m = max(candidates, key=lambda c: c[1]["f1"])
 
         metrics["optimal_threshold"] = best_th
         metrics["calibrated_f1"] = best_m["f1"]
@@ -611,8 +620,8 @@ class LiteFatTrainer:
         metrics["calibrated_specificity"] = best_m["specificity"]
 
         auc = metrics.get("auc", 0.5)
-        # Composite validation score kết hợp hài hòa F1, AUC và Accuracy
-        metrics["val_score"] = 0.50 * metrics["calibrated_f1"] + 0.30 * auc + 0.20 * metrics["accuracy"]
+        # Composite validation score cân bằng giữa điểm hiệu chuẩn và điểm ngưỡng mặc định 0.50
+        metrics["val_score"] = 0.35 * metrics["calibrated_f1"] + 0.20 * metrics["f1"] + 0.25 * auc + 0.20 * metrics["calibrated_accuracy"]
 
         if return_raw:
             return metrics, targets_np, probs_np

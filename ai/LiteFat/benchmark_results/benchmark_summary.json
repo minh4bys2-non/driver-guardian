@@ -1,0 +1,622 @@
+{
+  "Stage 1 (Landmark-Only)": {
+    "val": {
+      "metrics_default": {
+        "accuracy": 0.7072800808897877,
+        "precision": 0.7576197387518142,
+        "recall": 0.5588865096359743,
+        "specificity": 0.8400383141762452,
+        "f1": 0.643253234750462,
+        "f2": 0.5898305084745763,
+        "tp": 522,
+        "fp": 167,
+        "fn": 412,
+        "tn": 877,
+        "total": 1978,
+        "auc": 0.770773339240444,
+        "macro_auc": 0.8234488887808894
+      },
+      "metrics_optimal": {
+        "accuracy": 0.6966632962588474,
+        "precision": 0.6557835820895522,
+        "recall": 0.7526766595289079,
+        "specificity": 0.646551724137931,
+        "f1": 0.7008973080757727,
+        "f2": 0.7310732113144759,
+        "tp": 703,
+        "fp": 369,
+        "fn": 231,
+        "tn": 675,
+        "total": 1978,
+        "auc": 0.770773339240444,
+        "optimal_threshold": 0.42,
+        "macro_auc": 0.8234488887808894
+      },
+      "per_dataset": {
+        "SUST": {
+          "num_samples": 360,
+          "auc": 0.7374277836134454,
+          "acc_default": 0.6972222222222222,
+          "acc_optimal": 0.6861111111111111,
+          "f1_default": 0.5855513307984791,
+          "f1_optimal": 0.6295081967213115
+        },
+        "UL-DD": {
+          "num_samples": 1564,
+          "auc": 0.7691030932555386,
+          "acc_default": 0.7014066496163683,
+          "acc_optimal": 0.6924552429667519,
+          "f1_default": 0.6486079759217457,
+          "f1_optimal": 0.7111111111111111
+        },
+        "VBDDD": {
+          "num_samples": 54,
+          "auc": 0.9638157894736842,
+          "acc_default": 0.9444444444444444,
+          "acc_optimal": 0.8888888888888888,
+          "f1_default": 0.9032258064516129,
+          "f1_optimal": 0.8333333333333334
+        }
+      },
+      "per_subject": {
+        "SUST:ob10": {
+          "dataset": "SUST",
+          "subject_id": "ob10",
+          "num_samples": 120,
+          "auc": 0.7040559440559441,
+          "acc_default": 0.6916666666666667,
+          "acc_optimal": 0.6583333333333333
+        },
+        "SUST:ob14": {
+          "dataset": "SUST",
+          "subject_id": "ob14",
+          "num_samples": 120,
+          "auc": 0.6183310533515732,
+          "acc_default": 0.625,
+          "acc_optimal": 0.5833333333333334
+        },
+        "SUST:ob5": {
+          "dataset": "SUST",
+          "subject_id": "ob5",
+          "num_samples": 120,
+          "auc": 0.8464004663363451,
+          "acc_default": 0.775,
+          "acc_optimal": 0.8166666666666667
+        },
+        "UL-DD:subject_D": {
+          "dataset": "UL-DD",
+          "subject_id": "subject_D",
+          "num_samples": 345,
+          "auc": 0.5059511307148358,
+          "acc_default": 0.48695652173913045,
+          "acc_optimal": 0.5014492753623189
+        },
+        "UL-DD:subject_H": {
+          "dataset": "UL-DD",
+          "subject_id": "subject_H",
+          "num_samples": 391,
+          "auc": 0.9301092207519429,
+          "acc_default": 0.8337595907928389,
+          "acc_optimal": 0.8670076726342711
+        },
+        "UL-DD:subject_P": {
+          "dataset": "UL-DD",
+          "subject_id": "subject_P",
+          "num_samples": 437,
+          "auc": 0.6405587061541693,
+          "acc_default": 0.5903890160183066,
+          "acc_optimal": 0.597254004576659
+        },
+        "UL-DD:subject_Q": {
+          "dataset": "UL-DD",
+          "subject_id": "subject_Q",
+          "num_samples": 391,
+          "auc": 0.9502025384823116,
+          "acc_default": 0.8823529411764706,
+          "acc_optimal": 0.7928388746803069
+        },
+        "VBDDD:subject11": {
+          "dataset": "VBDDD",
+          "subject_id": "subject11",
+          "num_samples": 9,
+          "auc": 1.0,
+          "acc_default": 0.8888888888888888,
+          "acc_optimal": 0.7777777777777778
+        },
+        "VBDDD:subject12": {
+          "dataset": "VBDDD",
+          "subject_id": "subject12",
+          "num_samples": 14,
+          "auc": 1.0,
+          "acc_default": 1.0,
+          "acc_optimal": 0.9285714285714286
+        },
+        "VBDDD:subject14": {
+          "dataset": "VBDDD",
+          "subject_id": "subject14",
+          "num_samples": 9,
+          "auc": 1.0,
+          "acc_default": 1.0,
+          "acc_optimal": 1.0
+        },
+        "VBDDD:subject15": {
+          "dataset": "VBDDD",
+          "subject_id": "subject15",
+          "num_samples": 13,
+          "auc": 1.0,
+          "acc_default": 1.0,
+          "acc_optimal": 0.9230769230769231
+        },
+        "VBDDD:subject28": {
+          "dataset": "VBDDD",
+          "subject_id": "subject28",
+          "num_samples": 9,
+          "auc": 0.6666666666666666,
+          "acc_default": 0.7777777777777778,
+          "acc_optimal": 0.7777777777777778
+        }
+      },
+      "pr_ap": 0.7496112795903693
+    },
+    "test": {
+      "metrics_default": {
+        "accuracy": 0.6620825147347741,
+        "precision": 0.6659528907922913,
+        "recall": 0.6232464929859719,
+        "specificity": 0.6994219653179191,
+        "f1": 0.6438923395445134,
+        "f2": 0.6313438895655704,
+        "tp": 311,
+        "fp": 156,
+        "fn": 188,
+        "tn": 363,
+        "total": 1018,
+        "auc": 0.6869229789057885,
+        "macro_auc": 0.7238114579620181
+      },
+      "metrics_optimal": {
+        "accuracy": 0.6149312377210217,
+        "precision": 0.5765379113018598,
+        "recall": 0.8076152304609219,
+        "specificity": 0.4296724470134875,
+        "f1": 0.672787979966611,
+        "f2": 0.7476808905380334,
+        "tp": 403,
+        "fp": 296,
+        "fn": 96,
+        "tn": 223,
+        "total": 1018,
+        "auc": 0.6869229789057885,
+        "optimal_threshold": 0.42,
+        "macro_auc": 0.7238114579620181
+      },
+      "per_dataset": {
+        "SUST": {
+          "num_samples": 299,
+          "auc": 0.6128018673130443,
+          "acc_default": 0.5986622073578596,
+          "acc_optimal": 0.5953177257525084,
+          "f1_default": 0.5833333333333334,
+          "f1_optimal": 0.6388059701492537
+        },
+        "UL-DD": {
+          "num_samples": 664,
+          "auc": 0.7124786604191639,
+          "acc_default": 0.6807228915662651,
+          "acc_optimal": 0.6159638554216867,
+          "f1_default": 0.6718266253869969,
+          "f1_optimal": 0.6894031668696711
+        },
+        "VBDDD": {
+          "num_samples": 55,
+          "auc": 0.8461538461538461,
+          "acc_default": 0.7818181818181819,
+          "acc_optimal": 0.7090909090909091,
+          "f1_default": 0.625,
+          "f1_optimal": 0.6190476190476191
+        }
+      },
+      "per_subject": {
+        "SUST:ob15": {
+          "dataset": "SUST",
+          "subject_id": "ob15",
+          "num_samples": 120,
+          "auc": 0.47230136119025007,
+          "acc_default": 0.5916666666666667,
+          "acc_optimal": 0.675
+        },
+        "SUST:ob17": {
+          "dataset": "SUST",
+          "subject_id": "ob17",
+          "num_samples": 119,
+          "auc": 0.7482456140350877,
+          "acc_default": 0.680672268907563,
+          "acc_optimal": 0.5630252100840336
+        },
+        "SUST:ob7": {
+          "dataset": "SUST",
+          "subject_id": "ob7",
+          "num_samples": 60,
+          "auc": 0.7118055555555556,
+          "acc_default": 0.45,
+          "acc_optimal": 0.5
+        },
+        "UL-DD:subject_N": {
+          "dataset": "UL-DD",
+          "subject_id": "subject_N",
+          "num_samples": 319,
+          "auc": 0.5045489369852518,
+          "acc_default": 0.542319749216301,
+          "acc_optimal": 0.6426332288401254
+        },
+        "UL-DD:subject_O": {
+          "dataset": "UL-DD",
+          "subject_id": "subject_O",
+          "num_samples": 345,
+          "auc": 0.7624574669187145,
+          "acc_default": 0.808695652173913,
+          "acc_optimal": 0.591304347826087
+        },
+        "VBDDD:subject10": {
+          "dataset": "VBDDD",
+          "subject_id": "subject10",
+          "num_samples": 7,
+          "auc": NaN,
+          "acc_default": 1.0,
+          "acc_optimal": 0.7142857142857143
+        },
+        "VBDDD:subject17": {
+          "dataset": "VBDDD",
+          "subject_id": "subject17",
+          "num_samples": 6,
+          "auc": 1.0,
+          "acc_default": 1.0,
+          "acc_optimal": 1.0
+        },
+        "VBDDD:subject2": {
+          "dataset": "VBDDD",
+          "subject_id": "subject2",
+          "num_samples": 11,
+          "auc": 0.9444444444444444,
+          "acc_default": 0.6363636363636364,
+          "acc_optimal": 0.45454545454545453
+        },
+        "VBDDD:subject26": {
+          "dataset": "VBDDD",
+          "subject_id": "subject26",
+          "num_samples": 7,
+          "auc": 0.9166666666666666,
+          "acc_default": 0.5714285714285714,
+          "acc_optimal": 0.8571428571428571
+        },
+        "VBDDD:subject4": {
+          "dataset": "VBDDD",
+          "subject_id": "subject4",
+          "num_samples": 16,
+          "auc": 0.7454545454545455,
+          "acc_default": 0.75,
+          "acc_optimal": 0.6875
+        },
+        "VBDDD:subject5": {
+          "dataset": "VBDDD",
+          "subject_id": "subject5",
+          "num_samples": 8,
+          "auc": 1.0,
+          "acc_default": 0.875,
+          "acc_optimal": 0.75
+        }
+      },
+      "pr_ap": 0.6659190674306787
+    }
+  },
+  "Stage 2 (Multimodal)": {
+    "val": {
+      "metrics_default": {
+        "accuracy": 0.5874620829120324,
+        "precision": 0.5477346278317152,
+        "recall": 0.7248394004282656,
+        "specificity": 0.46455938697318006,
+        "f1": 0.6239631336405531,
+        "f2": 0.680812550281577,
+        "tp": 677,
+        "fp": 559,
+        "fn": 257,
+        "tn": 485,
+        "total": 1978,
+        "auc": 0.6597637565942225,
+        "macro_auc": 0.7732924671581222
+      },
+      "metrics_optimal": {
+        "accuracy": 0.6061678463094035,
+        "precision": 0.5672159583694709,
+        "recall": 0.7002141327623126,
+        "specificity": 0.5220306513409961,
+        "f1": 0.6267369429803545,
+        "f2": 0.6688484352628349,
+        "tp": 654,
+        "fp": 499,
+        "fn": 280,
+        "tn": 545,
+        "total": 1978,
+        "auc": 0.6597637565942225,
+        "optimal_threshold": 0.5800000000000001,
+        "macro_auc": 0.7732924671581222
+      },
+      "per_dataset": {
+        "SUST": {
+          "num_samples": 360,
+          "auc": 0.6909466911764706,
+          "acc_default": 0.6805555555555556,
+          "acc_optimal": 0.6944444444444444,
+          "f1_default": 0.5907473309608542,
+          "f1_optimal": 0.5864661654135338
+        },
+        "UL-DD": {
+          "num_samples": 1564,
+          "auc": 0.6387991313505276,
+          "acc_default": 0.5537084398976982,
+          "acc_optimal": 0.5741687979539642,
+          "f1_default": 0.6239224137931034,
+          "f1_optimal": 0.62751677852349
+        },
+        "VBDDD": {
+          "num_samples": 54,
+          "auc": 0.9901315789473685,
+          "acc_default": 0.9444444444444444,
+          "acc_optimal": 0.9444444444444444,
+          "f1_default": 0.9090909090909091,
+          "f1_optimal": 0.9090909090909091
+        }
+      },
+      "per_subject": {
+        "SUST:ob10": {
+          "dataset": "SUST",
+          "subject_id": "ob10",
+          "num_samples": 120,
+          "auc": 0.6441958041958042,
+          "acc_default": 0.5916666666666667,
+          "acc_optimal": 0.6166666666666667
+        },
+        "SUST:ob14": {
+          "dataset": "SUST",
+          "subject_id": "ob14",
+          "num_samples": 120,
+          "auc": 0.48768809849521205,
+          "acc_default": 0.7,
+          "acc_optimal": 0.7
+        },
+        "SUST:ob5": {
+          "dataset": "SUST",
+          "subject_id": "ob5",
+          "num_samples": 120,
+          "auc": 0.8204605071407752,
+          "acc_default": 0.75,
+          "acc_optimal": 0.7666666666666667
+        },
+        "UL-DD:subject_D": {
+          "dataset": "UL-DD",
+          "subject_id": "subject_D",
+          "num_samples": 345,
+          "auc": 0.16869705243996358,
+          "acc_default": 0.2956521739130435,
+          "acc_optimal": 0.34202898550724636
+        },
+        "UL-DD:subject_H": {
+          "dataset": "UL-DD",
+          "subject_id": "subject_H",
+          "num_samples": 391,
+          "auc": 0.9659472799831968,
+          "acc_default": 0.8593350383631714,
+          "acc_optimal": 0.887468030690537
+        },
+        "UL-DD:subject_P": {
+          "dataset": "UL-DD",
+          "subject_id": "subject_P",
+          "num_samples": 437,
+          "auc": 0.4161520688930897,
+          "acc_default": 0.5011441647597255,
+          "acc_optimal": 0.4759725400457666
+        },
+        "UL-DD:subject_Q": {
+          "dataset": "UL-DD",
+          "subject_id": "subject_Q",
+          "num_samples": 391,
+          "auc": 0.9975965433432352,
+          "acc_default": 0.5345268542199488,
+          "acc_optimal": 0.5754475703324808
+        },
+        "VBDDD:subject11": {
+          "dataset": "VBDDD",
+          "subject_id": "subject11",
+          "num_samples": 9,
+          "auc": 1.0,
+          "acc_default": 1.0,
+          "acc_optimal": 1.0
+        },
+        "VBDDD:subject12": {
+          "dataset": "VBDDD",
+          "subject_id": "subject12",
+          "num_samples": 14,
+          "auc": 1.0,
+          "acc_default": 1.0,
+          "acc_optimal": 1.0
+        },
+        "VBDDD:subject14": {
+          "dataset": "VBDDD",
+          "subject_id": "subject14",
+          "num_samples": 9,
+          "auc": 1.0,
+          "acc_default": 0.8888888888888888,
+          "acc_optimal": 0.8888888888888888
+        },
+        "VBDDD:subject15": {
+          "dataset": "VBDDD",
+          "subject_id": "subject15",
+          "num_samples": 13,
+          "auc": 1.0,
+          "acc_default": 1.0,
+          "acc_optimal": 1.0
+        },
+        "VBDDD:subject28": {
+          "dataset": "VBDDD",
+          "subject_id": "subject28",
+          "num_samples": 9,
+          "auc": 0.8888888888888888,
+          "acc_default": 0.7777777777777778,
+          "acc_optimal": 0.7777777777777778
+        }
+      },
+      "pr_ap": 0.7047195843212573
+    },
+    "test": {
+      "metrics_default": {
+        "accuracy": 0.668958742632613,
+        "precision": 0.6411149825783972,
+        "recall": 0.7374749498997996,
+        "specificity": 0.603082851637765,
+        "f1": 0.6859273066169617,
+        "f2": 0.7159533073929961,
+        "tp": 368,
+        "fp": 206,
+        "fn": 131,
+        "tn": 313,
+        "total": 1018,
+        "auc": 0.7309764036744009,
+        "macro_auc": 0.8059131121458981
+      },
+      "metrics_optimal": {
+        "accuracy": 0.6738703339882122,
+        "precision": 0.6627680311890838,
+        "recall": 0.6813627254509018,
+        "specificity": 0.6666666666666666,
+        "f1": 0.6719367588932806,
+        "f2": 0.6775607811877241,
+        "tp": 340,
+        "fp": 173,
+        "fn": 159,
+        "tn": 346,
+        "total": 1018,
+        "auc": 0.7309764036744009,
+        "optimal_threshold": 0.5800000000000001,
+        "macro_auc": 0.8059131121458981
+      },
+      "per_dataset": {
+        "SUST": {
+          "num_samples": 299,
+          "auc": 0.8379118412783912,
+          "acc_default": 0.7224080267558528,
+          "acc_optimal": 0.7190635451505016,
+          "f1_default": 0.6914498141263941,
+          "f1_optimal": 0.6718750000000001
+        },
+        "UL-DD": {
+          "num_samples": 664,
+          "auc": 0.6567505720823799,
+          "acc_default": 0.6370481927710844,
+          "acc_optimal": 0.6445783132530121,
+          "f1_default": 0.683311432325887,
+          "f1_optimal": 0.6703910614525139
+        },
+        "VBDDD": {
+          "num_samples": 55,
+          "auc": 0.9230769230769231,
+          "acc_default": 0.7636363636363637,
+          "acc_optimal": 0.7818181818181819,
+          "f1_default": 0.6976744186046512,
+          "f1_optimal": 0.7000000000000001
+        }
+      },
+      "per_subject": {
+        "SUST:ob15": {
+          "dataset": "SUST",
+          "subject_id": "ob15",
+          "num_samples": 120,
+          "auc": 0.8103830326052548,
+          "acc_default": 0.6916666666666667,
+          "acc_optimal": 0.7083333333333334
+        },
+        "SUST:ob17": {
+          "dataset": "SUST",
+          "subject_id": "ob17",
+          "num_samples": 119,
+          "auc": 0.8460526315789474,
+          "acc_default": 0.8319327731092437,
+          "acc_optimal": 0.8235294117647058
+        },
+        "SUST:ob7": {
+          "dataset": "SUST",
+          "subject_id": "ob7",
+          "num_samples": 60,
+          "auc": 0.6793981481481481,
+          "acc_default": 0.5666666666666667,
+          "acc_optimal": 0.5333333333333333
+        },
+        "UL-DD:subject_N": {
+          "dataset": "UL-DD",
+          "subject_id": "subject_N",
+          "num_samples": 319,
+          "auc": 0.15035433824937752,
+          "acc_default": 0.5172413793103449,
+          "acc_optimal": 0.45768025078369906
+        },
+        "UL-DD:subject_O": {
+          "dataset": "UL-DD",
+          "subject_id": "subject_O",
+          "num_samples": 345,
+          "auc": 0.8544423440453687,
+          "acc_default": 0.7478260869565218,
+          "acc_optimal": 0.8173913043478261
+        },
+        "VBDDD:subject10": {
+          "dataset": "VBDDD",
+          "subject_id": "subject10",
+          "num_samples": 7,
+          "auc": NaN,
+          "acc_default": 0.8571428571428571,
+          "acc_optimal": 1.0
+        },
+        "VBDDD:subject17": {
+          "dataset": "VBDDD",
+          "subject_id": "subject17",
+          "num_samples": 6,
+          "auc": 1.0,
+          "acc_default": 0.8333333333333334,
+          "acc_optimal": 0.8333333333333334
+        },
+        "VBDDD:subject2": {
+          "dataset": "VBDDD",
+          "subject_id": "subject2",
+          "num_samples": 11,
+          "auc": 1.0,
+          "acc_default": 0.5454545454545454,
+          "acc_optimal": 0.5454545454545454
+        },
+        "VBDDD:subject26": {
+          "dataset": "VBDDD",
+          "subject_id": "subject26",
+          "num_samples": 7,
+          "auc": 1.0,
+          "acc_default": 0.7142857142857143,
+          "acc_optimal": 0.8571428571428571
+        },
+        "VBDDD:subject4": {
+          "dataset": "VBDDD",
+          "subject_id": "subject4",
+          "num_samples": 16,
+          "auc": 0.8363636363636363,
+          "acc_default": 0.875,
+          "acc_optimal": 0.8125
+        },
+        "VBDDD:subject5": {
+          "dataset": "VBDDD",
+          "subject_id": "subject5",
+          "num_samples": 8,
+          "auc": 1.0,
+          "acc_default": 0.75,
+          "acc_optimal": 0.75
+        }
+      },
+      "pr_ap": 0.6970245025833816
+    }
+  }
+}

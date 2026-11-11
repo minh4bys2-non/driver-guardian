@@ -210,7 +210,7 @@ if __name__ == "__main__":
 
     BASE_DIR = Path(__file__).resolve().parent
     OUTPUT_DIR = BASE_DIR / "output" / "nspsofs"
-    FITNESS_METHOD = "physical_quadratic"
+    FITNESS_METHOD = "weighted_mean"
     CONFIG = NSPSOFSConfig(
         population_size=50,
         generations=100,
@@ -221,7 +221,7 @@ if __name__ == "__main__":
         archive_size=100,
         leader_fraction=0.20,
         seed=42,
-        dimensions=33
+        dimensions=9
     )
 
     from ai.OptimalAlgorithsm.TrainingSystem.engine import run_experiment

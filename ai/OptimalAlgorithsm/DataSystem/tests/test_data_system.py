@@ -39,14 +39,14 @@ class Capture:
 
 
 class DataSystemTests(unittest.TestCase):
-    def test_default_image_size_is_224(self):
-        self.assertEqual(MODEL_IMAGE_SIZE, 224)
-        self.assertEqual(DataSystemConfig().neural_size, 224)
-        self.assertEqual(DEFAULT_CONFIG.neural_size, 224)
-        self.assertEqual(self.make_engine().neural_size, 224)
+    def test_default_image_size_is_640(self):
+        self.assertEqual(MODEL_IMAGE_SIZE, 640)
+        self.assertEqual(DataSystemConfig().neural_size, 640)
+        self.assertEqual(DEFAULT_CONFIG.neural_size, 640)
+        self.assertEqual(self.make_engine().neural_size, 640)
 
     def test_default_letterbox_preserves_aspect_ratio_channels_and_dtype(self):
-        for height, width in ((100, 200), (200, 100), (224, 224)):
+        for height, width in ((100, 200), (200, 100), (640, 640)):
             for dtype in (np.uint8, np.float32):
                 for chw in (False, True):
                     with self.subTest(shape=(height, width), dtype=dtype, chw=chw):
@@ -56,19 +56,17 @@ class DataSystemTests(unittest.TestCase):
                         frame = np.broadcast_to(color, (height, width, 3)).copy()
                         result = letterbox(frame.transpose(2, 0, 1) if chw else frame)
                         self.assertEqual(result.dtype, dtype)
-                        self.assertEqual(result.shape, (3, 224, 224) if chw else (224, 224, 3))
+                        self.assertEqual(result.shape, (3, 640, 640) if chw else (640, 640, 3))
                         result = result.transpose(1, 2, 0) if chw else result
-                        expected = np.full((224, 224, 3), 114 if dtype == np.uint8 else 114 / 255, dtype=dtype)
-                        if width > height:
-                            expected[56:168] = color
-                        elif height > width:
-                            expected[:, 56:168] = color
-                        else:
-                            expected[:] = color
+                        expected = np.full((640, 640, 3), 114 if dtype == np.uint8 else 114 / 255, dtype=dtype)
+                        scale = min(640 / height, 640 / width)
+                        nw, nh = round(width * scale), round(height * scale)
+                        pad_l, pad_t = (640 - nw) // 2, (640 - nh) // 2
+                        expected[pad_t : pad_t + nh, pad_l : pad_l + nw] = color
                         np.testing.assert_allclose(result, expected, atol=1e-7)
 
-    def test_engine_passes_default_224_rgb_frames_to_neural(self):
-        model = self.make_engine(fps=5, window_sec=2, stride_sec=2, neural_sec=1)
+    def test_engine_passes_default_640_rgb_frames_to_neural(self):
+        model = self.make_engine(fps=5, window_sec=2, stride_sec=2, neural_sec=1, neural_fps=5)
         frames = ((np.full((3, 4, 8), i, np.uint8), i / 5) for i in range(10))
         with patch.object(engine, "CameraMetrics") as camera, patch.object(
             engine, "read_video", return_value=frames
@@ -80,17 +78,15 @@ class DataSystemTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         model.neural.assert_called_once()
         batch = model.neural.call_args.args[0]
-        self.assertEqual(batch.shape, (5, 3, 224, 224))
+        self.assertEqual(batch.shape, (5, 3, 640, 640))
         self.assertEqual(batch.dtype, np.uint8)
-        np.testing.assert_array_equal(batch[:, 0, 112, 112], [5, 6, 7, 8, 9])
-        self.assertTrue(np.all(batch[:, :, :56] == 114))
-        self.assertTrue(np.all(batch[:, :, 168:] == 114))
+        np.testing.assert_array_equal(batch[:, 0, 320, 320], [5, 6, 7, 8, 9])
         self.assertEqual(rows[0]["neuralnetwork_score"], .7)
         camera.return_value.close.assert_called_once()
 
-    def test_30fps_timeline_samples_last_ten_seconds_at_5fps(self):
+    def test_30fps_timeline_samples_last_twelve_seconds_at_10fps(self):
         model = self.make_engine()
-        frames = ((np.full((3, 4, 8), (i // 6) % 256, np.uint8), i / 30)
+        frames = ((np.full((3, 4, 8), (i // 3) % 256, np.uint8), i / 30)
                   for i in range(900))
         with patch.object(engine, "CameraMetrics") as camera, patch.object(
             engine, "read_video", return_value=frames
@@ -100,8 +96,8 @@ class DataSystemTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         model.neural.assert_called_once()
         batch = model.neural.call_args.args[0]
-        self.assertEqual(batch.shape, (50, 3, 224, 224))
-        np.testing.assert_array_equal(batch[:, 0, 112, 112], np.arange(100, 150) % 256)
+        self.assertEqual(batch.shape, (120, 3, 640, 640))
+        np.testing.assert_array_equal(batch[:, 0, 320, 320], np.arange(180, 300) % 256)
 
     def test_inherited_config_reaches_camera_and_neural_pipeline(self):
         config = DataSystemConfig(
@@ -489,6 +485,7 @@ class DataSystemTests(unittest.TestCase):
                 fps=10,
                 stride_sec=1,
                 neural_sec=1,
+                neural_fps=5,
                 neural_size=8,
                 window_sec=2,
             )

@@ -8,8 +8,9 @@ import os
 import random
 import sys
 import warnings
+import collections
 from pathlib import Path
-from typing import List, Tuple, Dict, Any, Optional
+from typing import List, Tuple, Dict, Any, Optional, Set
 
 import cv2
 import numpy as np
@@ -393,6 +394,7 @@ class GCNDataset(Dataset):
             time_interval: float = 0.1,
             window_sec: Optional[float] = 10.0,
             manifest_filename: str = "dataset_merged_split.csv",
+            selected_datasets: Optional[List[str] | str] = None,
             landmark_model_path: Optional[str | Path] = None,
             letterbox_size: int | Tuple[int, int] = (640, 480),
             return_frames: bool = False,
@@ -407,6 +409,20 @@ class GCNDataset(Dataset):
             raise ValueError(f"Split không hợp lệ: {split}. Chỉ chấp nhận 'train', 'val', 'test'.")
 
         self.manifest_filename = manifest_filename
+
+        # Chuẩn hóa cấu hình lọc dataset
+        if selected_datasets is None:
+            self.selected_datasets: Optional[List[str]] = None
+        elif isinstance(selected_datasets, str):
+            if selected_datasets.strip().lower() in ("all", "*", ""):
+                self.selected_datasets = None
+            else:
+                self.selected_datasets = [d.strip() for d in selected_datasets.split(",") if d.strip()]
+        elif isinstance(selected_datasets, (list, tuple, set)):
+            cleaned = [str(d).strip() for d in selected_datasets if str(d).strip()]
+            self.selected_datasets = None if (not cleaned or any(d.lower() in ("all", "*") for d in cleaned)) else cleaned
+        else:
+            self.selected_datasets = None
 
         if time_interval < 0:
             raise ValueError(f"time_interval phải là số không âm (>= 0): {time_interval}")
@@ -443,15 +459,19 @@ class GCNDataset(Dataset):
             logger.warning(f"Không tìm thấy mẫu nào trong {self.root} cho split={split}")
 
     def _load_samples(self) -> List[Dict[str, Any]]:
-        """Nạp danh sách video từ manifest CSV hoặc quét thư mục dự phòng."""
-        manifest = self.root / self.manifest_filename
+        """Nạp danh sách video từ manifest CSV hoặc quét thư mục dự phòng, hỗ trợ lọc theo selected_datasets."""
+        manifest = Path(self.manifest_filename) if Path(self.manifest_filename).is_file() else (self.root / self.manifest_filename)
         samples = []
+        target_datasets = {d.strip().upper() for d in self.selected_datasets} if self.selected_datasets is not None else None
 
         if manifest.is_file():
             with manifest.open(encoding="utf-8-sig", newline="") as f:
                 reader = csv.DictReader(f)
                 for row in reader:
                     if row.get("split", "").strip().lower() == self.split:
+                        row_ds = (row.get("dataset") or "").strip()
+                        if target_datasets is not None and row_ds.upper() not in target_datasets:
+                            continue
                         rel_path = row.get("rel_path") or row.get("processed_path")
                         if not rel_path:
                             continue
@@ -461,6 +481,7 @@ class GCNDataset(Dataset):
                             "path": self.root / norm_key,
                             "label": int(row["label"]),
                             "video_id": row.get("video_id") or row.get("clip_id") or Path(rel_path).stem,
+                            "dataset": row_ds,
                             "fps": float(row.get("fps", 0.0)),
                             "total_frames": int(float(row.get("frame_count", 0))),
                             "duration_sec": float(row.get("duration_sec", 0.0)),
@@ -470,15 +491,32 @@ class GCNDataset(Dataset):
                 split_dir = self.root / self.split / folder
                 if split_dir.is_dir():
                     for p in sorted(split_dir.glob("*.mp4")):
+                        stem = p.stem.lower()
+                        ds_name = ""
+                        if stem.startswith("sust"):
+                            ds_name = "SUST"
+                        elif stem.startswith("uldd"):
+                            ds_name = "UL-DD"
+                        elif stem.startswith("vbddd"):
+                            ds_name = "VBDDD"
+
+                        if target_datasets is not None and ds_name.upper() not in target_datasets:
+                            continue
+
                         samples.append({
                             "key": p.relative_to(self.root).as_posix(),
                             "path": p,
                             "label": label,
                             "video_id": p.stem,
+                            "dataset": ds_name,
                             "fps": 0.0,
                             "total_frames": 0,
                             "duration_sec": 0.0,
                         })
+
+        ds_counts = collections.Counter(s.get("dataset", "unknown") for s in samples)
+        filter_str = f" (lọc theo: {list(self.selected_datasets)})" if self.selected_datasets else " (toàn bộ datasets)"
+        logger.info(f"[{self.split.upper()}] Đã nạp {len(samples)} mẫu{filter_str} | Phân bố dataset: {dict(ds_counts)}")
         return samples
 
     @staticmethod
@@ -729,6 +767,7 @@ class GCNDataset(Dataset):
             label_tensor = torch.tensor(sample["label"], dtype=torch.long)
             meta = {
                 "video_id": sample["video_id"],
+                "dataset": sample.get("dataset", ""),
                 "path": str(sample["path"]),
                 "fps": c_fps,
                 "num_sampled_frames": landmarks_tensor.shape[1],
@@ -761,6 +800,7 @@ class GCNDataset(Dataset):
         label_tensor = torch.tensor(sample["label"], dtype=torch.long)
         meta = {
             "video_id": sample["video_id"],
+            "dataset": sample.get("dataset", ""),
             "path": str(sample["path"]),
             "fps": fps,
             "num_sampled_frames": len(indices),
@@ -1088,6 +1128,7 @@ def build_gcn_dataloaders(
         time_interval: float = 0.1,
         window_sec: Optional[float] = 10.0,
         manifest_filename: str = "dataset_merged_split.csv",
+        selected_datasets: Optional[List[str] | str] = None,
         pin_memory: bool = True,
         shuffle_train: bool = True,
         landmark_model_path: Optional[str | Path] = None,
@@ -1108,6 +1149,7 @@ def build_gcn_dataloaders(
         time_interval=time_interval,
         window_sec=window_sec,
         manifest_filename=manifest_filename,
+        selected_datasets=selected_datasets,
         landmark_model_path=landmark_model_path,
         letterbox_size=letterbox_size,
         device=device,

@@ -77,6 +77,7 @@ class TrainConfig:
     # =====================================================================
     dataset_dir: str = r"E:\LSTM\data_processed"
     manifest_filename: str = "dataset_merged_split.csv"
+    selected_datasets: Optional[List[str] | str] = None  # None / "all": nạp tất cả. Hoặc danh sách: ["SUST"], ["UL-DD"], ["VBDDD"], ["SUST", "UL-DD"]
     time_interval: float = 0.1                # Khoảng lấy mẫu thời gian thực (0.1s = 10 FPS; 0: đọc mọi frame)
     window_sec: Optional[float] = 10.0        # Cửa sổ thời gian (giây), None: toàn bộ video
     landmark_model_path: Optional[str] = None # None: tự tìm hoặc nạp mặc định của InsightFace
@@ -124,6 +125,22 @@ class TrainConfig:
         """Tự động điều chỉnh và đồng bộ các thuộc tính phụ thuộc."""
         if not (0.0 <= float(self.label_smoothing) < 1.0):
             raise ValueError(f"label_smoothing phải nằm trong khoảng [0.0, 1.0), nhận được: {self.label_smoothing}")
+
+        # Chuẩn hóa selected_datasets về danh sách tên dataset hoặc None (nếu chọn tất cả)
+        if self.selected_datasets is not None:
+            if isinstance(self.selected_datasets, str):
+                if self.selected_datasets.strip().lower() in ("all", "*", ""):
+                    self.selected_datasets = None
+                else:
+                    self.selected_datasets = [d.strip() for d in self.selected_datasets.split(",") if d.strip()]
+            elif isinstance(self.selected_datasets, (list, tuple, set)):
+                cleaned = [str(d).strip() for d in self.selected_datasets if str(d).strip()]
+                if not cleaned or any(d.lower() in ("all", "*") for d in cleaned):
+                    self.selected_datasets = None
+                else:
+                    self.selected_datasets = cleaned
+            else:
+                self.selected_datasets = None
 
         # Chuẩn hóa letterbox_size về tuple (w, h) hoặc int tương thích
         if isinstance(self.letterbox_size, int):
@@ -270,6 +287,7 @@ class TrainConfig:
             "time_interval": self.time_interval,
             "window_sec": self.window_sec,
             "manifest_filename": self.manifest_filename,
+            "selected_datasets": self.selected_datasets,
             "landmark_model_path": self.landmark_model_path,
             "letterbox_size": self.letterbox_size,
             "device": self.device,
@@ -289,6 +307,7 @@ class TrainConfig:
             "time_interval": self.time_interval,
             "window_sec": self.window_sec,
             "manifest_filename": self.manifest_filename,
+            "selected_datasets": self.selected_datasets,
             "pin_memory": self.pin_memory,
             "shuffle_train": self.shuffle_train,
             "landmark_model_path": self.landmark_model_path,

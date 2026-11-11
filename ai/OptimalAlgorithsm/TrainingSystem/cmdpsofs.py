@@ -98,12 +98,12 @@ class ParetoArchive:
         positions = np.asarray(positions, dtype=np.float32)
         objectives = np.asarray(objectives, dtype=np.float32)
         if (
-            positions.ndim != 2
-            or positions.shape[1] not in (9, 33)
-            or (len(self) > 0 and positions.shape[1] != self.positions.shape[1])
-            or objectives.shape != (len(positions), 2)
-            or not np.isfinite(positions).all()
-            or not np.isfinite(objectives).all()
+                positions.ndim != 2
+                or positions.shape[1] not in (9, 33)
+                or (len(self) > 0 and positions.shape[1] != self.positions.shape[1])
+                or objectives.shape != (len(positions), 2)
+                or not np.isfinite(positions).all()
+                or not np.isfinite(objectives).all()
         ):
             raise ValueError(
                 "Archive requires finite positions [N,9] or [N,33] of consistent width and objectives [N,2]"
@@ -229,7 +229,7 @@ class RunLogger:
                 f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     def log_generation(
-        self, generation, particles, archive, elapsed_seconds, evaluations
+            self, generation, particles, archive, elapsed_seconds, evaluations
     ):
         pop_obj = np.vstack([p.objectives for p in particles])
         recall = 1.0 - archive.objectives[:, 0]
@@ -435,10 +435,10 @@ class CMDPSOFS:
         r = self.rng.random()
         if self.rng.random() < 0.5:
             distance = 1.0 - child[dim]
-            child[dim] += distance * (1.0 - r**exponent)
+            child[dim] += distance * (1.0 - r ** exponent)
         else:
             distance = child[dim]
-            child[dim] -= distance * (1.0 - r**exponent)
+            child[dim] -= distance * (1.0 - r ** exponent)
         return np.clip(child, 0.0, 1.0)
 
     def _mutate(self, position, particle_index, generation):
@@ -465,9 +465,9 @@ class CMDPSOFS:
             r1 = self.rng.random(cfg.dimensions)
             r2 = self.rng.random(cfg.dimensions)
             particle.velocity = (
-                cfg.inertia * particle.velocity
-                + cfg.cognitive * r1 * (particle.pbest_position - particle.position)
-                + cfg.social * r2 * (leader - particle.position)
+                    cfg.inertia * particle.velocity
+                    + cfg.cognitive * r1 * (particle.pbest_position - particle.position)
+                    + cfg.social * r2 * (leader - particle.position)
             )
             particle.velocity = np.clip(
                 particle.velocity, -cfg.velocity_limit, cfg.velocity_limit
@@ -514,7 +514,7 @@ if __name__ == "__main__":
     OUTPUT_DIR = Path(__file__).resolve().parent / "output" / "cmdpsofs"
     # cooccurrence, weighted_mean, noisy_or
     # Must match a method implemented in Fitness.
-    FITNESS_METHOD = "physical_quadratic"
+    FITNESS_METHOD = "weighted_mean"
 
     CONFIG = CMDPSOFSConfig(
         population_size=50,
@@ -526,6 +526,7 @@ if __name__ == "__main__":
         archive_size=100,
         nonuniform_b=5.0,
         seed=42,
+        dimensions=9
     )
 
     from ai.OptimalAlgorithsm.TrainingSystem.engine import run_experiment

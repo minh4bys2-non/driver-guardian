@@ -224,7 +224,7 @@ if __name__ == "__main__":
     # cooccurrence, weighted_mean, noisy_or
     BASE_DIR = Path(__file__).resolve().parent
     OUTPUT_DIR = BASE_DIR / "output" / "ibgwo4"
-    FITNESS_METHOD = "physical_quadratic"
+    FITNESS_METHOD = "cooccurrence"
     CONFIG = IBGWO4Config(
         population_size=50,
         generations=100,
@@ -234,7 +234,7 @@ if __name__ == "__main__":
         velocity_limit=0.20,
         archive_size=100,
         seed=42,
-        dimensions=33
+        dimensions=9
     )
 
     from ai.OptimalAlgorithsm.TrainingSystem.engine import run_experiment

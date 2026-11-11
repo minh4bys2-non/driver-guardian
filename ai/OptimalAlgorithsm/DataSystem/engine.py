@@ -18,12 +18,12 @@ from tqdm import tqdm
 
 if __package__:
     from .loadvideo2handle import read_video
-    from .neuralnetwork import NeuralNetwork, letterbox
+    from .neuralnetwork_v1 import NeuralNetwork, letterbox
     from .physicalbranch import CameraMetrics
     from .normalization import PhysicalNormalizer, FEATURE_ENCODING
     from .config import DEFAULT_CONFIG, PROGRESS_INTERVAL_SEC
 else:
-    from neuralnetwork import NeuralNetwork, letterbox
+    from neuralnetwork_v1 import NeuralNetwork, letterbox
     from loadvideo2handle import read_video
     from physicalbranch import CameraMetrics
     from normalization import PhysicalNormalizer, FEATURE_ENCODING
@@ -32,19 +32,20 @@ else:
 
 class Engine:
     def __init__(
-        self,
-        video_root,
-        fps=None,
-        window_sec=None,
-        stride_sec=None,
-        neural_sec=None,
-        neural_size=None,
-        min_observed_ratio=None,
-        neural_fps=None,
-        device=None,
-        checkpoint_path=None,
-        chunk_size=None,
-        *, config=DEFAULT_CONFIG,
+            self,
+            video_root,
+            fps=None,
+            window_sec=None,
+            stride_sec=None,
+            neural_sec=None,
+            neural_size=None,
+            min_observed_ratio=None,
+            neural_fps=None,
+            device=None,
+            checkpoint_path=None,
+            chunk_size=None,
+            neural_class=None,
+            *, config=DEFAULT_CONFIG,
     ):
         self.config = config
         fps = config.fps if fps is None else fps
@@ -60,10 +61,10 @@ class Engine:
         values = (fps, window_sec, stride_sec, neural_sec, neural_size, neural_fps)
         if not np.isfinite(values).all() or any(v <= 0 for v in values):
             raise ValueError("Engine timing and sizes must be finite and positive")
-        if fps != int(fps) or neural_size != int(neural_size) or fps % neural_fps:
-            raise ValueError(
-                "fps and neural_size must be integers; neural_fps must divide fps"
-            )
+        # if fps != int(fps) or neural_size != int(neural_size) or fps % neural_fps:
+        #     raise ValueError(
+        #         "fps and neural_size must be integers; neural_fps must divide fps"
+        #     )
         self.neural_step = int(fps / neural_fps)
         self.fps = int(fps)
         self.window = round(window_sec * fps)
@@ -72,24 +73,24 @@ class Engine:
         self.neural_size = int(neural_size)
         self.min_observed_ratio = float(min_observed_ratio)
         if (
-            fps <= 0
-            or self.window <= 0
-            or self.stride <= 0
-            or self.neural_count <= 0
-            or self.neural_size <= 0
-            or not 0 <= min_observed_ratio <= 1
+                fps <= 0
+                or self.window <= 0
+                or self.stride <= 0
+                or self.neural_count <= 0
+                or self.neural_size <= 0
+                or not 0 <= min_observed_ratio <= 1
         ):
             raise ValueError("Invalid engine configuration")
         if (
-            abs(self.window / fps - window_sec) > 1e-6
-            or abs(self.stride / fps - stride_sec) > 1e-6
+                abs(self.window / fps - window_sec) > 1e-6
+                or abs(self.stride / fps - stride_sec) > 1e-6
         ):
             raise ValueError("window_sec and stride_sec must be multiples of 1/fps")
         if (
-            neural_sec > window_sec
-            or abs(self.neural_count / neural_fps - neural_sec) > 1e-6
-            or self.window % self.neural_step
-            or self.stride % self.neural_step
+                neural_sec > window_sec
+                or abs(self.neural_count / neural_fps - neural_sec) > 1e-6
+                or self.window % self.neural_step
+                or self.stride % self.neural_step
         ):
             raise ValueError("Neural sampling must align with complete video windows")
         self.window_sec = self.window / fps
@@ -100,12 +101,10 @@ class Engine:
             checkpoint_path=str(checkpoint_path or config.checkpoint_path),
         )
         self.normalizer = PhysicalNormalizer(self.config)
-        self.neural = NeuralNetwork(
-            checkpoint_path=checkpoint_path,
-            config=self.config,
-            device=device,
-            chunk_size=chunk_size,
-        ).eval()
+
+        target_ckpt = Path(checkpoint_path or self.config.checkpoint_path).expanduser().resolve()
+
+        self.neural = NeuralNetwork(checkpoint_path=target_ckpt).eval()
 
     @staticmethod
     def _duration(history, percentile):
@@ -113,7 +112,7 @@ class Engine:
         return float(np.percentile(values, percentile)) if values else 0.0
 
     def _features(
-        self, m, blink_durations, nod_durations, nn_frames, source, start, label
+            self, m, blink_durations, nod_durations, nn_frames, source, start, label
     ):
         window = self.window_sec
         coverage = [
@@ -124,19 +123,19 @@ class Engine:
         required = [windows.get(k, window) * self.min_observed_ratio
                     for k in ("perclos", "pom", "over_angle")]
         if (
-            not m["eye_ready"]
-            or not m["mouth_ready"]
-            or not m["head_calibrated"]
-            or m["perclos_pct"] is None
-            or any(
-                v is None or not np.isfinite(v) or v < minimum - 1e-9
-                for v, minimum in zip(coverage, required)
-            )
+                not m["eye_ready"]
+                or not m["mouth_ready"]
+                or not m["head_calibrated"]
+                or m["perclos_pct"] is None
+                or any(
+            v is None or not np.isfinite(v) or v < minimum - 1e-9
+            for v, minimum in zip(coverage, required)
+        )
         ):
             tqdm.write(f"[skip] {source} [{start:g}, {start + window:g}): "
-                  f"ready eye/mouth/head={m['eye_ready']}/{m['mouth_ready']}/{m['head_calibrated']}, "
-                  f"coverage eye/mouth/head={coverage}s (need {required}s), "
-                  f"perclos={m['perclos_pct']}", file=sys.stderr)
+                       f"ready eye/mouth/head={m['eye_ready']}/{m['mouth_ready']}/{m['head_calibrated']}, "
+                       f"coverage eye/mouth/head={coverage}s (need {required}s), "
+                       f"perclos={m['perclos_pct']}", file=sys.stderr)
             return None
 
         motion_window = windows.get("head_motion", self.window_sec)
@@ -144,19 +143,19 @@ class Engine:
         resolution = m["head_motion_resolution_hz"]
         observed = m["head_motion_observed_sec"]
         reliable_motion = (
-            frequency is not None
-            and resolution is not None
-            and observed is not None
-            and np.isfinite((frequency, resolution, observed)).all()
-            and frequency >= 0
-            and resolution > 0
-            and observed >= motion_window - 1e-9
+                frequency is not None
+                and resolution is not None
+                and observed is not None
+                and np.isfinite((frequency, resolution, observed)).all()
+                and frequency >= 0
+                and resolution > 0
+                and observed >= motion_window - 1e-9
         )
         if not reliable_motion:
             tqdm.write(f"[skip] {source} [{start:g}, {start + window:g}): "
-                  f"FFT observed={observed}s (need {motion_window:g}s), "
-                  f"frequency={frequency}Hz, resolution={resolution}Hz",
-                  file=sys.stderr)
+                       f"FFT observed={observed}s (need {motion_window:g}s), "
+                       f"frequency={frequency}Hz, resolution={resolution}Hz",
+                       file=sys.stderr)
             return None
 
         with torch.inference_mode():
@@ -191,7 +190,7 @@ class Engine:
             raise ValueError("video_path must be a nonempty relative path")
         relative = Path(video_path)
         if relative.is_absolute() or not (
-            self.root / relative
+                self.root / relative
         ).resolve().is_relative_to(self.root):
             raise ValueError(f"Invalid relative video path: {video_path}")
         return (self.root / relative).resolve().relative_to(self.root).as_posix()
@@ -203,7 +202,7 @@ class Engine:
             raise ValueError("label must be 0 (alert) or 1 (drowsy)")
         path = self.root / video_path
         tqdm.write(f"[video] {video_path}: starting face tracking; window={self.window_sec:g}s, "
-              f"stride={self.stride / self.fps:g}s", file=sys.stderr)
+                   f"stride={self.stride / self.fps:g}s", file=sys.stderr)
         camera = CameraMetrics(config=self.config)
         nn_frames = deque(maxlen=self.neural_count)
         blink_durations, nod_durations = deque(), deque()
@@ -217,11 +216,11 @@ class Engine:
         try:
             for i, (frame, timestamp) in enumerate(progress):
                 if (
-                    not isinstance(frame, np.ndarray)
-                    or frame.dtype != np.uint8
-                    or frame.ndim != 3
-                    or frame.shape[0] != 3
-                    or min(frame.shape[1:]) == 0
+                        not isinstance(frame, np.ndarray)
+                        or frame.dtype != np.uint8
+                        or frame.ndim != 3
+                        or frame.shape[0] != 3
+                        or min(frame.shape[1:]) == 0
                 ):
                     raise ValueError(f"Invalid RGB frame [3,H,W]: {path}")
                 rgb = np.moveaxis(frame, 0, -1)
@@ -234,13 +233,13 @@ class Engine:
                     )
 
                 if (
-                    metrics["blink_detected"]
-                    and metrics["blink_duration_ms"] is not None
+                        metrics["blink_detected"]
+                        and metrics["blink_duration_ms"] is not None
                 ):
                     blink_durations.append((timestamp, metrics["blink_duration_ms"]))
                 if (
-                    metrics["nod_detected"]
-                    and metrics["nod_event_duration_ms"] is not None
+                        metrics["nod_detected"]
+                        and metrics["nod_event_duration_ms"] is not None
                 ):
                     nod_durations.append((timestamp, metrics["nod_event_duration_ms"]))
                 cutoff = timestamp - self.window_sec
@@ -258,8 +257,8 @@ class Engine:
                 if count >= self.window and (count - self.window) % self.stride == 0:
                     start = (count - self.window) / self.fps
                     if (
-                        saved_windows
-                        and (start, start + self.window_sec) in saved_windows
+                            saved_windows
+                            and (start, start + self.window_sec) in saved_windows
                     ):
                         resumed += 1
                         continue
@@ -281,14 +280,15 @@ class Engine:
             progress.close()
             camera.close()
             tqdm.write(f"[video summary] {video_path}: frames={frame_count}, samples={emitted}, "
-                  f"skipped={skipped}, resumed={resumed}, elapsed={time.monotonic() - started:.1f}s",
-                  file=sys.stderr)
+                       f"skipped={skipped}, resumed={resumed}, elapsed={time.monotonic() - started:.1f}s",
+                       file=sys.stderr)
 
     def run(self, input_jsonl, output_jsonl, strict=False, resume=False):
         src, dst = Path(input_jsonl).resolve(), Path(output_jsonl).resolve()
         if src == dst:
             raise ValueError("Input and output JSONL must be different files")
         saved = {}
+        last_saved_key = None
         video_labels = {}
         video_subjects = {}
         needs_newline = False
@@ -304,30 +304,30 @@ class Engine:
                         source = self._source(source)
                         start, end = row["start_second"], row["end_second"]
                         if (
-                            row["feature_encoding"] != FEATURE_ENCODING
-                            or row["normalization_id"] != self.normalizer.id
-                            or row["normalization_scales"] != self.normalizer.scales
-                            or any(type(v) not in (int, float)
-                                   for v in row["normalization_scales"].values())
-                            or not isinstance(source, str)
-                            or not source
-                            or type(label) is not int
-                            or label not in (0, 1)
-                            or type(start) not in (int, float)
-                            or type(end) not in (int, float)
-                            or not np.isfinite((start, end)).all()
-                            or start < 0
-                            or abs(end - start - self.window_sec) > 1e-6
-                            or abs(
-                                start * self.fps / self.stride
-                                - round(start * self.fps / self.stride)
-                            )
-                            > 1e-6
-                            or any(
-                                type(row[k]) not in (int, float)
-                                or not np.isfinite(row[k]) or not 0 <= row[k] <= 1
-                                for k in self.normalizer.scales
-                            )
+                                row["feature_encoding"] != FEATURE_ENCODING
+                                or row["normalization_id"] != self.normalizer.id
+                                or row["normalization_scales"] != self.normalizer.scales
+                                or any(type(v) not in (int, float)
+                                       for v in row["normalization_scales"].values())
+                                or not isinstance(source, str)
+                                or not source
+                                or type(label) is not int
+                                or label not in (0, 1)
+                                or type(start) not in (int, float)
+                                or type(end) not in (int, float)
+                                or not np.isfinite((start, end)).all()
+                                or start < 0
+                                or abs(end - start - self.window_sec) > 1e-6
+                                or abs(
+                            start * self.fps / self.stride
+                            - round(start * self.fps / self.stride)
+                        )
+                                > 1e-6
+                                or any(
+                            type(row[k]) not in (int, float)
+                            or not np.isfinite(row[k]) or not 0 <= row[k] <= 1
+                            for k in self.normalizer.scales
+                        )
                         ):
                             raise ValueError("Incompatible saved sample")
                         if source in video_labels and video_labels[source] != label:
@@ -346,6 +346,7 @@ class Engine:
                                 f"Duplicate saved window: {source}, {start}, {end}"
                             )
                         windows.add((start, end))
+                        last_saved_key = (source, label)
                     except (ValueError, KeyError, TypeError) as exc:
                         raise ValueError(
                             f"Cannot resume {dst}, line {line_number}: {exc}"
@@ -356,7 +357,7 @@ class Engine:
         with src.open(encoding="utf-8") as manifest:
             total = sum(bool(line.strip()) for line in manifest)
         with src.open(encoding="utf-8") as fin, dst.open(
-            "a" if resume else "w", encoding="utf-8"
+                "a" if resume else "w", encoding="utf-8"
         ) as fout, tqdm(
             ((n, line) for n, line in enumerate(fin, 1) if line.strip()),
             total=total, desc="Dataset", unit="video", position=0, dynamic_ncols=True,
@@ -371,7 +372,7 @@ class Engine:
                     source, label = record["video_path"], record["label"]
                     subject = record.get("subject_id")
                     if subject is not None and (
-                        type(subject) not in (str, int) or not str(subject).strip()
+                            type(subject) not in (str, int) or not str(subject).strip()
                     ):
                         raise ValueError("subject_id must be a nonempty string or integer")
                     source = self._source(source)
@@ -390,6 +391,8 @@ class Engine:
                     if key in seen:
                         continue
                     seen.add(key)
+                    if resume and key in saved and key != last_saved_key:
+                        continue
                     windows = saved.setdefault(key, set()) if resume else None
                     samples = (
                         self.process_video(*key, saved_windows=windows)
@@ -416,8 +419,8 @@ class Engine:
                         count += 1
                         progress.set_postfix(saved=count, refresh=False)
                         tqdm.write(f"[saved] {source}: [{sample.get('start_second')}, "
-                              f"{sample.get('end_second')}), total_new={count}",
-                              file=sys.stderr)
+                                   f"{sample.get('end_second')}), total_new={count}",
+                                   file=sys.stderr)
                 except (OSError, ValueError, KeyError, RuntimeError, cv2.error) as exc:
                     if strict:
                         raise

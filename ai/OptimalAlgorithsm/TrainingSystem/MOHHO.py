@@ -231,7 +231,7 @@ if __name__ == "__main__":
 
     BASE_DIR = Path(__file__).resolve().parent
     OUTPUT_DIR = BASE_DIR / "output" / "mohho"
-    FITNESS_METHOD = "physical_quadratic"
+    FITNESS_METHOD = "cooccurrence"
     CONFIG = MOHHOConfig(
         population_size=50,
         generations=100,
@@ -239,7 +239,7 @@ if __name__ == "__main__":
         levy_beta=1.5,
         levy_scale=0.01,
         seed=42,
-        dimensions=33
+        dimensions=9
     )
 
     from ai.OptimalAlgorithsm.TrainingSystem.engine import run_experiment

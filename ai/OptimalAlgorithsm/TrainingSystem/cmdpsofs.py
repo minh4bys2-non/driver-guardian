@@ -514,7 +514,7 @@ if __name__ == "__main__":
     OUTPUT_DIR = Path(__file__).resolve().parent / "output" / "cmdpsofs"
     # cooccurrence, weighted_mean, noisy_or
     # Must match a method implemented in Fitness.
-    FITNESS_METHOD = "weighted_mean"
+    FITNESS_METHOD = "physical_quadratic"
 
     CONFIG = CMDPSOFSConfig(
         population_size=50,
@@ -526,7 +526,7 @@ if __name__ == "__main__":
         archive_size=100,
         nonuniform_b=5.0,
         seed=42,
-        dimensions=9
+        dimensions=33
     )
 
     from ai.OptimalAlgorithsm.TrainingSystem.engine import run_experiment

@@ -224,7 +224,7 @@ if __name__ == "__main__":
     # cooccurrence, weighted_mean, noisy_or
     BASE_DIR = Path(__file__).resolve().parent
     OUTPUT_DIR = BASE_DIR / "output" / "ibgwo4"
-    FITNESS_METHOD = "cooccurrence"
+    FITNESS_METHOD = "weighted_mean"
     CONFIG = IBGWO4Config(
         population_size=50,
         generations=100,

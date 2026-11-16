@@ -231,7 +231,7 @@ if __name__ == "__main__":
 
     BASE_DIR = Path(__file__).resolve().parent
     OUTPUT_DIR = BASE_DIR / "output" / "mohho"
-    FITNESS_METHOD = "cooccurrence"
+    FITNESS_METHOD = "weighted_mean"
     CONFIG = MOHHOConfig(
         population_size=50,
         generations=100,

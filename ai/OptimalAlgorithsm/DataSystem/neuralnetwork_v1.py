@@ -342,6 +342,7 @@ class NeuralNetwork(nn.Module):
         # 5. Đưa dữ liệu lên thiết bị suy luận và gọi mô hình LiteFat
         landmarks_gpu = landmarks_tensor.unsqueeze(0).to(self.device, non_blocking=True)  # [1, T, 68, 2]
         face_frames_gpu = face_frames_tensor.unsqueeze(0).to(self.device, non_blocking=True)  # [1, T_v, 3, 224, 224]
+        # face_frames_gpu = None
         # batch_lengths = torch.tensor([240]).unsqueeze(0).to(self.device)
         self.model.eval()
         frame_logits, clip_logits = self.model(
@@ -362,7 +363,7 @@ class NeuralNetwork(nn.Module):
                 "clip_logits": clip_logits.cpu(),
                 "frame_logits": frame_logits.cpu(),
                 "landmarks": landmarks_tensor,
-                "face_frames": face_frames_tensor,
+                # "face_frames": face_frames_tensor,
                 "bboxes": chosen_bboxes,
                 "found": found,
                 "crop_boxes": crop_boxes,
@@ -586,7 +587,7 @@ def main():
     # CÁC HẰNG SỐ CẤU HÌNH (TÙY CHỈNH TRỰC TIẾP TẠI ĐÂY)
     # =========================================================================
     VIDEO_PATH: Optional[
-        str] = r"E:\LSTM\drowsy_dataset\UTA-RLDD\Fold1_part2\09\10.mp4"
+        str] = r"E:\LSTM\drowsy_dataset\UTA-RLDD\Fold5_part2\60\10.mov"
     CHECKPOINT_PATH: Union[
         str, Path] = Path(
         r"D:\Project\DATN\driver-guardian\ai\LiteFat\checkpoints\LiteFat_v6_stage2_visual")  # Trọng số mô hình LiteFat Stage 2

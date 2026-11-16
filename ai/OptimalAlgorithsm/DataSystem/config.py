@@ -8,7 +8,7 @@ from ai.PhysicalBranch.config import PhysicalConfig
 
 MODEL_IMAGE_SIZE = 640  # Cạnh ảnh vuông đầu vào FaceBoxesV2 & PIPNet, pixel; dùng chung cho letterbox và buffer.
 LITEFAT_DEFAULT_CHECKPOINT = str(
-    Path(__file__).resolve().parents[2] / "LiteFat" / "checkpoints" / "LiteFat_v6_stage1"
+    Path(__file__).resolve().parents[2] / "LiteFat" / "checkpoints" / "LiteFat_v6_stage2_visual"
 )
 
 @dataclass(frozen=True)
@@ -41,7 +41,7 @@ DEFAULT_CONFIG = DataSystemConfig()
 LETTERBOX_COLOR = (114, 114, 114)  # Màu RGB viền padding khi giữ tỷ lệ ảnh; các kênh trong [0,255].
 VIDEO_ROOT = r"E:\LSTM\drowsy_dataset\UTA-RLDD"  # Gốc chứa video; video_path trong manifest phải tương đối với thư mục này.
 INPUT_JSONL = r"E:\LSTM\drowsy_dataset\UTA-RLDD/dataset.jsonl"  # Manifest đầu vào: mỗi dòng có video_path và label nguyên 0/1.
-OUTPUT_JSONL = "ai/OptimalAlgorithsm/DataSystem/drowsiness_physical_30.jsonl"  # Dataset physical_v1; các entrypoint TrainingSystem dùng chung đường dẫn này.
+OUTPUT_JSONL = "ai/OptimalAlgorithsm/DataSystem/drowsiness_physical_60_visual.jsonl"  # Dataset physical_v1; các entrypoint TrainingSystem dùng chung đường dẫn này.
 # Tùy chọn khi chạy python -m ai.OptimalAlgorithsm.DataSystem.engine.
 RUN_DEVICE = None  # Thiết bị của entrypoint; ghi đè DataSystemConfig.device khi chạy module engine.
 STRICT = False  # True: dừng ngay khi lỗi xử lý; False: ghi lỗi và chuyển dòng manifest tiếp theo.

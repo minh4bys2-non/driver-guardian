@@ -2,7 +2,7 @@ import json
 import numpy as np
 from sklearn.metrics import accuracy_score, recall_score, precision_score, f1_score
 
-JSONL_PATH = "/home/tranmanhduy/Workspace/ptithcm/driver-guardian/ai/OptimalAlgorithsm/drowsiness_risk_10_clean.jsonl"
+JSONL_PATH = r"D:\Project\DATN\driver-guardian\ai\OptimalAlgorithsm\DataSystem\drowsiness_physical_60_visual.jsonl"
 THRESHOLDS = np.arange(0.0, 1.01, 0.05)
 
 scores, labels = [], []

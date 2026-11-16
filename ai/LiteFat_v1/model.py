@@ -937,7 +937,7 @@ class HybridKSSHead(nn.Module):
         return clip_kss.to(orig_dtype), clip_logits
 
 
-class LiteFat_v1(nn.Module):
+class LiteFatV1(nn.Module):
     """
     Mô hình LiteFat_v1 Dự đoán Điểm Buồn ngủ KSS (thang 1-9):
       - Cửa sổ mặc định 60s ở 10 FPS (600 frames) và bước trượt mặc định 30s (300 frames).
@@ -1683,3 +1683,6 @@ class LiteFat_v1(nn.Module):
             "backbone_trainable": backbone_trainable,
             "is_backbone_frozen": self.is_backbone_frozen,
         }
+
+
+LiteFat_v1 = LiteFatV1

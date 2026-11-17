@@ -875,9 +875,8 @@ class LiteFatDataset(Dataset):
         meta_pool = self._SHARED_META.setdefault(pool_key, {})
 
         cache_path = self.cache_dir / f"{self.split}.pt"
-        if not cache_path.is_file() and not cache_pool:
-            logger.warning(f"[Cache] Không tìm thấy tệp cache {cache_path}. Sẽ trích xuất on-the-fly từ video.")
-            return
+        if not cache_path.is_file():
+            logger.warning(f"[Cache] Không tìm thấy tệp cache {cache_path}. Sẽ trích xuất on-the-fly nếu mẫu không có trong cache.")
 
         for split_name in (self.split, "train", "val", "test"):
             split_file = f"{split_name}.pt"
@@ -885,9 +884,15 @@ class LiteFatDataset(Dataset):
             if split_file not in meta_pool and split_path.is_file():
                 try:
                     payload = torch.load(split_path, map_location="cpu", weights_only=False)
-                    items = payload["samples"] if (isinstance(payload, dict) and "samples" in payload) else payload
+                    if isinstance(payload, dict) and "samples" in payload:
+                        items = payload["samples"]
+                        header_meta = {k: v for k, v in payload.items() if k not in ("samples", "meta")}
+                        nested_meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+                        meta_pool[split_file] = {**header_meta, **nested_meta}
+                    else:
+                        items = payload
+                        meta_pool[split_file] = {}
                     cache_pool.update(items)
-                    meta_pool[split_file] = payload.get("meta", {}) if isinstance(payload, dict) else {}
                     logger.info(
                         f"[Cache] Đã nạp {len(items)} mẫu từ {split_file} vào Shared Cache Pool "
                         f"(Tổng: {len(cache_pool)})."
@@ -897,13 +902,15 @@ class LiteFatDataset(Dataset):
 
         if cache_pool:
             self.cached_data = cache_pool
-            split_meta = meta_pool.get(f"{self.split}.pt", {})
+            split_meta = meta_pool.get(f"{self.split}.pt") or next(iter(meta_pool.values()), {})
+            raw_dt = split_meta.get("time_interval", self.time_interval)
+            raw_lbs = split_meta.get("letterbox_size", self.letterbox_size)
             self.cache_meta = {
                 "format_version": 1,
                 "split": self.split,
-                "time_interval": float(split_meta.get("time_interval", self.time_interval)),
+                "time_interval": float(self.time_interval if raw_dt is None else raw_dt),
                 "window_sec": self.window_sec,
-                "letterbox_size": split_meta.get("letterbox_size", self.letterbox_size),
+                "letterbox_size": self.letterbox_size if raw_lbs is None else raw_lbs,
                 "face_size": self.face_size,
                 "num_samples": len(cache_pool),
             }
@@ -1414,18 +1421,31 @@ def build_litefat_dataloaders(
     train_sampler = None
     if len(train_ds) > 0:
         if subject_balanced_sampling:
+            ds_label_counts: Counter = Counter()
             sub_label_counts: Counter = Counter()
-            label_counts: Counter = Counter()
             for s in train_ds.samples:
-                sub = s.get("subject_id", "unknown")
-                lbl = s.get("label", 1)
-                sub_label_counts[(sub, lbl)] += 1
-                label_counts[lbl] += 1
+                ds_name = str(s.get("dataset", "unknown"))
+                sub = str(s.get("subject_id", "unknown"))
+                lbl = int(s.get("label", 1))
+                ds_label_counts[(ds_name, lbl)] += 1
+                sub_label_counts[(ds_name, sub, lbl)] += 1
+
+            raw_weights: List[float] = []
+            ds_totals: Counter = Counter()
+            for s in train_ds.samples:
+                ds_name = str(s.get("dataset", "unknown"))
+                sub = str(s.get("subject_id", "unknown"))
+                lbl = int(s.get("label", 1))
+                w = 1.0 / (
+                    float(max(1, ds_label_counts[(ds_name, lbl)]))
+                    * math.sqrt(float(max(1, sub_label_counts[(ds_name, sub, lbl)])))
+                )
+                raw_weights.append(w)
+                ds_totals[ds_name] += w
 
             sample_weights = [
-                1.0 / (math.sqrt(max(1, sub_label_counts[(s.get("subject_id", "unknown"), s.get("label", 1))]))
-                       * max(1, label_counts[s.get("label", 1)]))
-                for s in train_ds.samples
+                w / max(1e-12, float(ds_totals[str(s.get("dataset", "unknown"))]))
+                for s, w in zip(train_ds.samples, raw_weights)
             ]
             train_sampler = torch.utils.data.WeightedRandomSampler(
                 weights=torch.as_tensor(sample_weights, dtype=torch.double),
@@ -1499,6 +1519,7 @@ def render_kinematic_frame(
         target_w: int = 640,
         target_h: int = 640,
         zoom_scale: float = 260.0,
+        coord_mode: str = "nose",
 ) -> np.ndarray:
     """Dựng khung hình trực quan hóa mô phỏng cho lớp KinematicFeatureExtractor."""
     canvas = np.full((720, 1280, 3), (22, 26, 32), dtype=np.uint8)
@@ -1515,21 +1536,51 @@ def render_kinematic_frame(
     viewport_rect = (vx1, vy1, vx2 - vx1, vy2 - vy1)
     cx, cy = 360, 380
     S = float(zoom_scale)
+    is_model_mode = (coord_mode == "model")
 
-    cv2.putText(canvas, "LOCAL NOSE-CENTERED SPACE (0,0) & IOD = 1.0", (25, 78),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.48, (130, 160, 190), 1, cv2.LINE_AA)
-    cv2.line(canvas, (vx1, cy), (vx2, cy), (38, 48, 60), 1, cv2.LINE_AA)
-    cv2.line(canvas, (cx, vy1), (cx, vy2), (38, 48, 60), 1, cv2.LINE_AA)
-    cv2.circle(canvas, (cx, cy), int(S), (32, 40, 52), 1, cv2.LINE_AA)
-    cv2.circle(canvas, (cx, cy), int(S * 0.5), (28, 35, 45), 1, cv2.LINE_AA)
-    cv2.circle(canvas, (cx, cy), 6, (0, 255, 255), -1, cv2.LINE_AA)
+    if is_model_mode:
+        cv2.putText(canvas, "MODEL INPUT SPACE (ORGAN-CENTERED, static_shape_ratio=0.25) | [M]: Nose IOD=1.0",
+                    (25, 78), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (130, 160, 190), 1, cv2.LINE_AA)
+        organ_groups = [
+            ("L-Eye/Brow (0,0)", (cx - 170, cy - 165)),
+            ("R-Eye/Brow (0,0)", (cx + 170, cy - 165)),
+            ("Jaw/Nose (0,0)", (cx, cy + 5)),
+            ("Mouth (0,0)", (cx, cy + 205)),
+        ]
+        for g_label, (ox, oy) in organ_groups:
+            cv2.line(canvas, (ox - 55, oy), (ox + 55, oy), (38, 48, 60), 1, cv2.LINE_AA)
+            cv2.line(canvas, (ox, oy - 55), (ox, oy + 55), (38, 48, 60), 1, cv2.LINE_AA)
+            cv2.circle(canvas, (ox, oy), 4, (0, 255, 255), -1, cv2.LINE_AA)
+            cv2.putText(canvas, g_label, (ox - 55, oy - 62), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (130, 160, 190), 1, cv2.LINE_AA)
+    else:
+        cv2.putText(canvas, "LOCAL NOSE-CENTERED SPACE (0,0) & IOD = 1.0 | [M]: Model Input", (25, 78),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.46, (130, 160, 190), 1, cv2.LINE_AA)
+        cv2.line(canvas, (vx1, cy), (vx2, cy), (38, 48, 60), 1, cv2.LINE_AA)
+        cv2.line(canvas, (cx, vy1), (cx, vy2), (38, 48, 60), 1, cv2.LINE_AA)
+        cv2.circle(canvas, (cx, cy), int(S), (32, 40, 52), 1, cv2.LINE_AA)
+        cv2.circle(canvas, (cx, cy), int(S * 0.5), (28, 35, 45), 1, cv2.LINE_AA)
+        cv2.circle(canvas, (cx, cy), 6, (0, 255, 255), -1, cv2.LINE_AA)
 
     num_visible = 0
     if is_missing:
         cv2.putText(canvas, "[CANH BAO: MAT MAT / HEAD TURNED]", (120, cy - 20),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 0, 255), 2, cv2.LINE_AA)
     else:
-        pts_raw = [(int(round(cx + pos_t[i, 0] * S)), int(round(cy + pos_t[i, 1] * S))) for i in range(68)]
+        if is_model_mode:
+            node_anchors = [(cx, cy + 5)] * 68
+            for i in (*range(17, 22), *range(36, 42)):
+                node_anchors[i] = (cx - 170, cy - 165)
+            for i in (*range(22, 27), *range(42, 48)):
+                node_anchors[i] = (cx + 170, cy - 165)
+            for i in range(48, 68):
+                node_anchors[i] = (cx, cy + 205)
+        else:
+            node_anchors = [(cx, cy)] * 68
+
+        pts_raw = [
+            (int(round(node_anchors[i][0] + pos_t[i, 0] * S)), int(round(node_anchors[i][1] + pos_t[i, 1] * S)))
+            for i in range(68)
+        ]
         for start, end, is_closed, color in KINEMATIC_REGIONS:
             pts_region = pts_raw[start:end]
             for j in range(len(pts_region) - 1):
@@ -1546,7 +1597,7 @@ def render_kinematic_frame(
                 cv2.circle(canvas, (px, py), 3, (0, 255, 120), -1, cv2.LINE_AA)
                 num_visible += 1
 
-        if raw_landmarks is not None and len(raw_landmarks) > 0 and raw_iod > 1.0:
+        if (not is_model_mode) and raw_landmarks is not None and len(raw_landmarks) > 0 and raw_iod > 1.0:
             trail_pts = []
             for k in range(max(0, t - 10), t + 1):
                 rdx = (raw_landmarks[k, 30, 0] - raw_landmarks[t, 30, 0]) * target_w / max(1.0, raw_iod)
@@ -1622,24 +1673,34 @@ def visualize_kinematic_simulation(
     from model import KinematicFeatureExtractor
     kfe = KinematicFeatureExtractor(fps=10.0)
     kfe.eval()
+    lms_in = landmarks.unsqueeze(0).permute(0, 3, 1, 2).float()
     with torch.no_grad():
-        kfe_out = kfe(landmarks.unsqueeze(0).permute(0, 3, 1, 2).float())
-    pos_norm_all = kfe_out[0, :2].permute(1, 2, 0).cpu().numpy()
+        kfe_out = kfe(lms_in)
+        p_left_t = lms_in[:, :, :, kfe.left_eye_idx:kfe.left_eye_idx + 1]
+        p_right_t = lms_in[:, :, :, kfe.right_eye_idx:kfe.right_eye_idx + 1]
+        raw_iod_t = torch.norm(p_right_t - p_left_t, p=2, dim=1, keepdim=True).clamp(min=kfe.eps)
+        clip_iod_t = raw_iod_t.mean(dim=2, keepdim=True).clamp(min=kfe.eps)
+        iod_scale_t = torch.maximum(0.5 * raw_iod_t + 0.5 * clip_iod_t, 0.65 * clip_iod_t).clamp(min=kfe.eps)
+        nose_pos_t = lms_in[:, :, :, kfe.nose_idx:kfe.nose_idx + 1]
+        pos_norm_t = torch.clamp((lms_in - nose_pos_t) / iod_scale_t, min=-8.0, max=8.0)
+    pos_norm_all = pos_norm_t[0].permute(1, 2, 0).cpu().numpy()
+    pos_feat_all = kfe_out[0, :2].permute(1, 2, 0).cpu().numpy()
     vel_norm_all = kfe_out[0, 2:4].permute(1, 2, 0).cpu().numpy()
     acc_norm_all = kfe_out[0, 4:6].permute(1, 2, 0).cpu().numpy()
 
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(window_name, 1280, 720)
 
-    t, paused, zoom_scale = 0, False, 260.0
+    t, paused, zoom_scale, coord_mode = 0, False, 260.0, "nose"
     while True:
         is_missing = np.allclose(lms_np[t], 1.0)
         p_left = lms_np[t, 36, :2] * np.array([640, 640])
         p_right = lms_np[t, 45, :2] * np.array([640, 640])
         raw_iod = float(np.linalg.norm(p_right - p_left)) if not is_missing else 0.0
+        pos_cur = pos_norm_all[t] if coord_mode == "nose" else pos_feat_all[t]
 
         canvas = render_kinematic_frame(
-            pos_t=pos_norm_all[t],
+            pos_t=pos_cur,
             vel_t=vel_norm_all[t],
             acc_t=acc_norm_all[t],
             vel_all=vel_norm_all,
@@ -1655,6 +1716,7 @@ def visualize_kinematic_simulation(
             target_w=640,
             target_h=640,
             zoom_scale=zoom_scale,
+            coord_mode=coord_mode,
         )
         cv2.imshow(window_name, canvas)
         if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
@@ -1682,6 +1744,9 @@ def visualize_kinematic_simulation(
             continue
         elif key == ord("0"):
             zoom_scale = 260.0
+            continue
+        elif key in (ord("m"), ord("M")):
+            coord_mode = "model" if coord_mode == "nose" else "nose"
             continue
 
         if not paused:
@@ -1789,50 +1854,87 @@ def visualize_litefat_sample(
 
 
 # =====================================================================
-# 6. KIỂM THỬ TÍCH HỢP VỚI E:\LSTM\data_processed_v1 & LITEFAT_V1
+# 6. KIỂM THỬ TÍCH HỢP VỚI CACHE & TRỰC QUAN HÓA MẪU LITEFAT_V1
 # =====================================================================
 if __name__ == "__main__":
     DATASET_DIR = r"E:\LSTM\data_processed_v1"
+    CACHE_DIR = r"E:\LSTM\litefat_v1_cache_pt\cache_pt"
+    MANIFEST_FILENAME = "dataset_merged_split.csv"
+    SPLIT = "test"
+    SAMPLE_IDX = 10
+
     print("=" * 72)
-    print("KIỂM THỬ LITEFAT_V1 DATASET (KSS 1-9 @ 10 FPS | MANIFEST CSV / JSON)")
+    print("TRỰC QUAN HÓA MẪU LITEFAT_V1 TỪ CACHE .PT (KSS 1-9 @ 10 FPS)")
     print("=" * 72)
 
     if not Path(DATASET_DIR).is_dir():
         print(f"[ERROR] Không tìm thấy thư mục {DATASET_DIR}.")
         sys.exit(1)
+    if not Path(CACHE_DIR).is_dir():
+        print(f"[ERROR] Không tìm thấy thư mục cache {CACHE_DIR}.")
+        sys.exit(1)
 
-    ds_csv = LiteFatDataset(
+    ds = LiteFatDataset(
         dataset_dir=DATASET_DIR,
-        manifest_filename="dataset_merged_split.csv",
-        split="test",
+        manifest_filename=MANIFEST_FILENAME,
+        split=SPLIT,
         time_interval=0.1,
         window_sec=60.0,
         eval_window_mode="center",
         return_meta=True,
-        use_visual_context=False,
+        return_raw_frames=True,
+        use_cache=True,
+        cache_dir=CACHE_DIR,
+        use_visual_context=True,
+        visual_frame_stride=5,
     )
-    ds_json = LiteFatDataset(
-        dataset_dir=DATASET_DIR,
-        manifest_filename="dataset_merged_split.json",
-        split="test",
-        time_interval=0.1,
-        window_sec=60.0,
-        eval_window_mode="center",
-        return_meta=True,
-        use_visual_context=False,
-    )
-    print(f"Số mẫu test (CSV): {len(ds_csv)} | Số mẫu test (JSON): {len(ds_json)}")
+    print(f"Số mẫu ({SPLIT}): {len(ds)}")
+    if len(ds) == 0:
+        print("[ERROR] Không có mẫu hợp lệ nào để trực quan hóa.")
+        sys.exit(1)
 
-    if len(ds_csv) > 0:
-        _, landmarks, label, meta = ds_csv[0]
-        print(f"Video ID        : {meta['video_id']} | Dataset: {meta['dataset']}")
-        print(f"Landmarks shape : {landmarks.shape} | Label (KSS 1-9): {label.item()} (dtype={label.dtype})")
-        print(f"KSS raw         : {meta['kss_raw']} | Sample weight: {meta['sample_weight']:.4f}")
+    idx = min(SAMPLE_IDX, len(ds) - 1)
+    face_frames, landmarks, label, meta, raw_frames = ds[idx]
+    print(f"\n--- THÔNG TIN MẪU [{idx}] ---")
+    print(f"Video ID          : {meta['video_id']} | Dataset: {meta['dataset']}")
+    print(f"Nguồn cache       : {meta.get('cached', False)} ({CACHE_DIR})")
+    print(f"Đường dẫn video   : {meta['path']}")
+    print(f"FPS / Tỷ lệ mặt   : {meta['fps']:.2f} FPS | {meta['found_faces_ratio'] * 100:.1f}%")
+    print(f"face_frames shape : {tuple(face_frames.shape) if face_frames is not None else None}")
+    print(f"landmarks shape   : {tuple(landmarks.shape)}")
+    print(f"raw_frames count  : {len(raw_frames)}")
+    print(f"Label (KSS 1-9)   : {label.item()} (kss_raw={meta['kss_raw']}, weight={meta['sample_weight']:.4f})")
 
-        from model import LiteFatV1
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        model = LiteFatV1(pretrained_backbone=False).to(device)
-        model.eval()
-        with torch.no_grad():
-            frame_kss, clip_kss = model(landmarks=landmarks.unsqueeze(0).to(device))
-        print(f"LiteFat_v1 out  : frame_kss={frame_kss.shape}, clip_kss={clip_kss.item():.3f}")
+    from model import LiteFatV1
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = LiteFatV1(pretrained_backbone=False).to(device)
+    model.eval()
+    with torch.no_grad():
+        video_in = face_frames.unsqueeze(0).to(device) if face_frames is not None else None
+        frame_kss, clip_kss = model(video_frames=video_in, landmarks=landmarks.unsqueeze(0).to(device))
+    print(f"LiteFat_v1 out    : frame_kss={tuple(frame_kss.shape)}, clip_kss={clip_kss.item():.3f}")
+
+    if not os.environ.get("HEADLESS"):
+        print("\n[1/2] Mở cửa sổ visualize_litefat_sample (video + 68 landmarks + bbox + ảnh mặt cắt 224x224)...")
+        print("Phím điều khiển: [Space] Tạm dừng/Tiếp tục | [a/d] Lùi/Tiến frame | [r] Phát lại | [q/ESC] Đóng & chuyển bước tiếp")
+        try:
+            visualize_litefat_sample(
+                face_frames=face_frames,
+                landmarks=landmarks,
+                label=label,
+                raw_frames=raw_frames,
+                meta=meta,
+                delay_ms=100,
+            )
+            print("\n[2/2] Mở cửa sổ visualize_kinematic_simulation (mô phỏng KinematicFeatureExtractor)...")
+            print("Phím điều khiển: [Space] Tạm dừng/Tiếp tục | [a/d] Lùi/Tiến | [m] Đổi hệ tọa độ | [+/-] Zoom | [0] Reset Zoom | [r] Phát lại | [q/ESC] Thoát")
+            visualize_kinematic_simulation(
+                landmarks=landmarks,
+                label=label,
+                video_id=meta["video_id"],
+                delay_ms=100,
+            )
+        except Exception as e:
+            print(f"[INFO] Không thể mở GUI trực quan hóa ({e}).")
+    else:
+        print("\n[INFO] HEADLESS=1 đang bật, bỏ qua bước mở cửa sổ GUI OpenCV.")

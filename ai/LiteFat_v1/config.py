@@ -57,11 +57,11 @@ class TrainConfig:
     # None: lấy toàn bộ video dài >60s để model tự chạy sliding window 60s/30s.
     # Có thể đặt giá trị (vd: 120.0) nếu muốn cắt cửa sổ cố định khi train.
     dataset_window_sec: Optional[float] = None
-    eval_window_mode: str = "center"
+    eval_window_mode: str = "full"
 
     # Tham số cửa sổ trượt của kiến trúc LiteFatV1 và LiteFatLoss
     window_sec: float = 60.0
-    stride_sec: float = 30.0
+    stride_sec: float = 50.0
 
     # =================================================================
     # 4. TĂNG CƯỜNG DỮ LIỆU ĐA PHƯƠNG THỨC (DATA AUGMENTATION)
@@ -95,7 +95,7 @@ class TrainConfig:
     kernel_size: int = 3
     dropout: float = 0.3
     pretrained_backbone: bool = True
-    static_shape_ratio: float = 0.25
+    static_shape_ratio: float = 0.60
 
     vertical_pairs: List[Tuple[int, int]] = field(default_factory=lambda: [
         (37, 41), (38, 40), (43, 47), (44, 46),
@@ -109,7 +109,8 @@ class TrainConfig:
     # 6. THAM SỐ HUẤN LUYỆN, TỐI ƯU HÓA & CHECKPOINT
     # =================================================================
     epochs: int = 30
-    batch_size: int = 8
+    batch_size: int = 2
+    grad_accum_steps: int = 8
     num_workers: int = 0
     pin_memory: bool = True
     seed: int = 42

@@ -87,6 +87,11 @@ class LiteFatTrainer:
             f"Model Window={self.cfg.window_sec}s / Stride={self.cfg.stride_sec}s | "
             f"Dataset Window={self.cfg.dataset_window_sec}"
         )
+        self.grad_accum_steps = max(1, int(getattr(self.cfg, "grad_accum_steps", 1)))
+        self.logger.info(
+            f"Batch size: {self.cfg.batch_size} | Grad accum steps: {self.grad_accum_steps} | "
+            f"Effective batch size: {self.cfg.batch_size * self.grad_accum_steps}"
+        )
         self.logger.info(f"Bộ dữ liệu: {self.cfg.selected_datasets or 'Tất cả'} ({self.cfg.manifest_filename})")
         self.logger.info("=" * 72)
 
@@ -324,8 +329,19 @@ class LiteFatTrainer:
             return batch[0], batch[1], batch[2], batch[3]
         return batch[0], batch[1], batch[2], None
 
+    def _step_optimizer(self) -> None:
+        """Thực hiện gradient clipping (nếu bật), bước tối ưu AMP và cập nhật EMA."""
+        if self.cfg.grad_clip > 0:
+            self.scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.cfg.grad_clip)
+
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
+        self.ema.update(self.model)
+        self.optimizer.zero_grad(set_to_none=True)
+
     def _train_epoch(self, epoch: int) -> Dict[str, float]:
-        """Thực thi một epoch huấn luyện cho LiteFatV1."""
+        """Thực thi một epoch huấn luyện cho LiteFatV1 (hỗ trợ tích lũy gradient)."""
         self.model.train()
 
         # Đóng/mở khóa backbone MobileNetV3 theo epoch
@@ -354,9 +370,16 @@ class LiteFatTrainer:
         all_pred_kss: List[float] = []
         all_pred_logits: List[np.ndarray] = []
 
-        num_batches = max(1, len(self.train_loader))
+        total_batches = len(self.train_loader)
+        num_batches = max(1, total_batches)
+        accum_steps = max(1, int(getattr(self.cfg, "grad_accum_steps", 1)))
         valid_steps = 0
+        opt_steps = 0
+        accum_count = 0
+        current_accum_target = min(accum_steps, num_batches)
         start_time = time.time()
+
+        self.optimizer.zero_grad(set_to_none=True)
 
         pbar = tqdm(
             self.train_loader,
@@ -366,6 +389,10 @@ class LiteFatTrainer:
         )
 
         for batch_idx, batch in enumerate(pbar):
+            # Tính kích thước cửa sổ tích lũy hiện tại để giữ đúng trung bình gradient ở nhóm lẻ cuối epoch
+            if accum_count == 0:
+                current_accum_target = min(accum_steps, max(1, total_batches - batch_idx))
+
             batch_frames, batch_landmarks, batch_labels, batch_lengths = self._unpack_batch(batch)
             batch_landmarks = batch_landmarks.to(self.device, non_blocking=True)
             batch_labels = batch_labels.to(self.device, non_blocking=True)
@@ -373,8 +400,6 @@ class LiteFatTrainer:
                 batch_frames = batch_frames.to(self.device, non_blocking=True)
             if batch_lengths is not None:
                 batch_lengths = batch_lengths.to(self.device, non_blocking=True)
-
-            self.optimizer.zero_grad(set_to_none=True)
 
             with torch.amp.autocast(device_type=self.device.type, enabled=self.scaler.is_enabled()):
                 out_dict = self.model(
@@ -394,20 +419,16 @@ class LiteFatTrainer:
                 self.logger.warning(
                     f"Epoch {epoch:02d} | Batch {batch_idx + 1}/{num_batches}: Loss không hữu hạn ({loss.item()}). Bỏ qua bước cập nhật."
                 )
-                self.optimizer.zero_grad(set_to_none=True)
+                del out_dict, loss, loss_details, batch_frames, batch_landmarks, batch_labels, batch_lengths
                 continue
 
-            self.scaler.scale(loss).backward()
-            if self.cfg.grad_clip > 0:
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.cfg.grad_clip)
+            loss_to_backward = loss if current_accum_target == 1 else (loss / float(current_accum_target))
+            self.scaler.scale(loss_to_backward).backward()
+            accum_count += 1
 
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-            self.ema.update(self.model)
-
+            last_loss = float(loss.item())
             valid_steps += 1
-            total_loss += float(loss.item())
+            total_loss += last_loss
             for k in comp_sums:
                 comp_sums[k] += float(loss_details.get(k, 0.0))
 
@@ -419,12 +440,31 @@ class LiteFatTrainer:
             all_targets.extend(targets_np.tolist())
             all_pred_logits.append(clip_logits_np)
 
+            del out_dict, loss, loss_details, loss_to_backward
+            del batch_frames, batch_landmarks, batch_labels, batch_lengths
+
+            if accum_count >= current_accum_target:
+                self._step_optimizer()
+                accum_count = 0
+                opt_steps += 1
+
             current_lr = self.optimizer.param_groups[0]["lr"]
-            pbar.set_postfix({
-                "loss": f"{loss.item():.4f}",
+            postfix = {
+                "loss": f"{last_loss:.4f}",
                 "avg_loss": f"{total_loss / valid_steps:.4f}",
                 "lr": f"{current_lr:.2e}",
-            })
+            }
+            if accum_steps > 1:
+                postfix["opt_steps"] = opt_steps
+            pbar.set_postfix(postfix)
+
+        # Flush phần gradient hợp lệ còn lại nếu kết thúc epoch mà vẫn còn tích lũy
+        if accum_count > 0:
+            self._step_optimizer()
+            opt_steps += 1
+
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
 
         elapsed = time.time() - start_time
         logits_cat = np.concatenate(all_pred_logits, axis=0) if all_pred_logits else None
@@ -439,6 +479,7 @@ class LiteFatTrainer:
         metrics["loss"] = total_loss / denom
         for k, v in comp_sums.items():
             metrics[k] = v / denom
+        metrics["opt_steps"] = float(opt_steps)
         metrics["time"] = elapsed
         return metrics
 
@@ -611,11 +652,13 @@ class LiteFatTrainer:
             self.logger.info(
                 f"Epoch [{epoch:02d}/{self.cfg.epochs:02d}]\n"
                 f"  Train: Loss={train_m['loss']:.4f} | MAE={train_m['mae']:.4f} | RMSE={train_m['rmse']:.4f} | "
-                f"Within1={train_m['within_1_acc']*100:.1f}% | QWK={train_m['qwk']:.4f}\n"
+                f"Within1={train_m['within_1_acc']*100:.1f}% | QWK={train_m['qwk']:.4f} | "
+                f"Pred=[{train_m['pred_min']:.2f}..{train_m['pred_max']:.2f}, {train_m['pred_mean']:.2f}±{train_m['pred_std']:.2f}]\n"
                 f"  Val  : Loss={val_m['loss']:.4f} | MAE={val_m['mae']:.4f} | RMSE={val_m['rmse']:.4f} | "
                 f"Within1={val_m['within_1_acc']*100:.1f}% | Exact={val_m['exact_acc']*100:.1f}% | "
                 f"QWK={val_m['qwk']:.4f} | RegimeAcc={val_m['regime_acc']*100:.1f}% | "
-                f"DrowsyAUC={val_m['auc']:.4f} | Score={val_m['val_score']:.4f}\n"
+                f"DrowsyAUC={val_m['auc']:.4f} | Score={val_m['val_score']:.4f} | "
+                f"Pred=[{val_m['pred_min']:.2f}..{val_m['pred_max']:.2f}, {val_m['pred_mean']:.2f}±{val_m['pred_std']:.2f}]\n"
                 f"  Val Per-Dataset: {per_ds_str or 'N/A'}\n"
                 f"  LR: {current_lr:.2e} | Time: {train_m['time']:.1f}s"
             )
@@ -643,7 +686,8 @@ class LiteFatTrainer:
             checkpoint_payload = {
                 "epoch": epoch,
                 "model_state_dict": self.model.state_dict(),
-                "ema_state_dict": self.ema.state_dict(),
+                "ema_state_dict": self.ema.shadow,
+                "ema_num_updates": self.ema.num_updates,
                 "optimizer_state_dict": self.optimizer.state_dict(),
                 "scheduler_state_dict": self.scheduler.state_dict(),
                 "scaler_state_dict": self.scaler.state_dict(),
@@ -717,7 +761,10 @@ class LiteFatTrainer:
         eval_epoch = int(checkpoint.get("epoch", self.best_epoch))
 
         if self.cfg.use_ema_eval and "ema_state_dict" in checkpoint:
-            self.model.load_state_dict(checkpoint["ema_state_dict"], strict=False)
+            ema_sd = checkpoint["ema_state_dict"]
+            if isinstance(ema_sd, dict) and "shadow" in ema_sd and isinstance(ema_sd["shadow"], dict):
+                ema_sd = ema_sd["shadow"]
+            self.model.load_state_dict(ema_sd, strict=False)
             self.logger.info(f"\n--- ĐÁNH GIÁ TEST BẰNG EMA CHECKPOINT ({ckpt_target.name}, Epoch {eval_epoch}) ---")
         elif "model_state_dict" in checkpoint:
             self.model.load_state_dict(checkpoint["model_state_dict"], strict=False)

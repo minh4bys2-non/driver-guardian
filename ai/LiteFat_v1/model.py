@@ -18,6 +18,73 @@ import torch.nn.functional as F
 from torchvision.models import MobileNet_V3_Small_Weights, mobilenet_v3_small
 
 
+class MaskedBatchNorm2d(nn.Module):
+    """
+    BatchNorm2d có mặt nạ (Masked BatchNorm2d):
+      - Khi training và có mask: chỉ tính mean/var và cập nhật running stats trên các vị trí hợp lệ (mask > 0.5),
+        triệt tiêu hoàn toàn nhiễu từ các khung hình đệm (padding).
+      - Khi eval hoặc không có mask: dùng running stats cố định và che lại đầu ra theo mask (bất biến batch_size & padding).
+    """
+
+    def __init__(
+            self,
+            num_features: int,
+            eps: float = 1e-5,
+            momentum: float = 0.05,
+            affine: bool = True,
+    ):
+        super().__init__()
+        self.bn = nn.BatchNorm2d(num_features, eps=eps, momentum=momentum, affine=affine)
+
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if (not self.training) or (mask is None) or (not self.bn.track_running_stats):
+            out = self.bn(x)
+            if mask is not None:
+                out = out * mask.to(dtype=out.dtype)
+            return out
+
+        B, C, H, W = x.shape
+        dev_type = x.device.type if x.device.type in ("cuda", "cpu") else "cpu"
+        with torch.amp.autocast(dev_type, enabled=False):
+            x_32 = x.float()
+            m_broad = (mask > 0.5).float().expand(B, 1, H, W)
+            valid_count = m_broad.sum()
+
+            if valid_count.item() < 2.0:
+                out_32 = F.batch_norm(
+                    x_32,
+                    self.bn.running_mean,
+                    self.bn.running_var,
+                    self.bn.weight.float() if self.bn.affine else None,
+                    self.bn.bias.float() if self.bn.affine else None,
+                    training=False,
+                    momentum=0.0,
+                    eps=self.bn.eps,
+                ) * m_broad
+            else:
+                mean = (x_32 * m_broad).sum(dim=(0, 2, 3)) / valid_count
+                mean_4d = mean.view(1, C, 1, 1)
+                var = (((x_32 - mean_4d) * m_broad).pow(2)).sum(dim=(0, 2, 3)) / valid_count
+
+                with torch.no_grad():
+                    mom = float(self.bn.momentum) if self.bn.momentum is not None else 0.1
+                    self.bn.num_batches_tracked.add_(1)
+                    var_unbiased = var * (valid_count / (valid_count - 1.0))
+                    self.bn.running_mean.mul_(1.0 - mom).add_(mean.detach() * mom)
+                    self.bn.running_var.mul_(1.0 - mom).add_(var_unbiased.detach() * mom)
+
+                inv_std = torch.rsqrt(var.view(1, C, 1, 1) + self.bn.eps)
+                out_32 = (x_32 - mean_4d) * inv_std
+                if self.bn.affine:
+                    out_32 = (
+                        out_32 * self.bn.weight.float().view(1, C, 1, 1)
+                        + self.bn.bias.float().view(1, C, 1, 1)
+                    )
+                out_32 = out_32 * m_broad
+
+        return out_32.to(x.dtype)
+
+
 class KinematicFeatureExtractor(nn.Module):
     """
     Khối tiền xử lý chuẩn hóa động học 68 điểm mốc khuôn mặt (LiteFat v5):
@@ -37,8 +104,9 @@ class KinematicFeatureExtractor(nn.Module):
             left_eye_idx: int = 36,
             right_eye_idx: int = 45,
             eps: float = 1e-2,
-            static_shape_ratio: float = 0.25,
+            static_shape_ratio: float = 0.60,
             fps: float = 10.0,
+            num_nodes: int = 68,
     ):
         super().__init__()
         self.nose_idx = nose_idx
@@ -47,9 +115,10 @@ class KinematicFeatureExtractor(nn.Module):
         self.eps = eps
         self.static_shape_ratio = float(static_shape_ratio)
         self.fps = float(max(fps, 1.0))
+        self.num_nodes = int(num_nodes)
 
-        # Chuẩn hóa phân phối riêng cho 6 kênh [x, y, dx, dy, d2x, d2y]
-        self.channel_norm = nn.BatchNorm2d(6, affine=True)
+        # Chuẩn hóa phân phối riêng cho 6 kênh [x, y, dx, dy, d2x, d2y] chỉ tính trên frame hợp lệ
+        self.channel_norm = MaskedBatchNorm2d(6, momentum=0.05, affine=True)
 
     @staticmethod
     def build_temporal_mask(
@@ -140,6 +209,8 @@ class KinematicFeatureExtractor(nn.Module):
         else:
             jn_mean = pos_jn.mean(dim=2, keepdim=True)
         pos_feat[:, :, :, jaw_nose_indices] = (pos_jn - jn_mean) + 0.25 * pos_jn
+        # Khuếch đại biên độ vùng mắt (36..47) và miệng (48..67) để cân bằng phương sai với viền hàm/mũi
+        pos_feat[:, :, :, 36:68] = pos_feat[:, :, :, 36:68] * 2.0
         pos_feat = torch.clamp(pos_feat, min=-8.0, max=8.0)
 
         # 4. Tính Vận tốc (dx, dy) và Gia tốc (d2x, d2y) chuẩn hóa giải tích
@@ -198,13 +269,8 @@ class KinematicFeatureExtractor(nn.Module):
         out = torch.cat([pos_feat, vel_norm, acc_norm], dim=1)  # (B, 6, T, V)
         out = torch.nan_to_num(out, nan=0.0, posinf=4.0, neginf=-4.0)
 
-        # 6. Chuẩn hóa kênh BatchNorm2d(6) kết hợp che mặt nạ chặt chẽ
-        if mask is not None:
-            out = out * mask
-        out = self.channel_norm(out)
-        if mask is not None:
-            out = out * mask
-
+        # 6. Chuẩn hóa kênh MaskedBatchNorm2d(6) chỉ tính trên các khung hình hợp lệ
+        out = self.channel_norm(out, mask=mask)
         return out
 
 
@@ -311,7 +377,7 @@ class MultimodalFusionModule(nn.Module):
             left_eye_idx: int = 36,
             right_eye_idx: int = 45,
             eps: float = 1e-2,
-            static_shape_ratio: float = 0.25,
+            static_shape_ratio: float = 0.60,
             fps: float = 10.0,
     ):
         super().__init__()
@@ -329,6 +395,7 @@ class MultimodalFusionModule(nn.Module):
             eps=eps,
             static_shape_ratio=static_shape_ratio,
             fps=fps,
+            num_nodes=num_nodes,
         )
 
         # Giữ lại w để tương thích backward compatibility với checkpoint cũ
@@ -648,19 +715,26 @@ class STGLBlock(nn.Module):
         )
         # Skip connection lấy từ h_gcn để truyền gradient trực tiếp qua GCN
         self.skip_conv = nn.Conv2d(residual_channels, skip_channels, kernel_size=(1, 1))
-        self.bn = nn.BatchNorm2d(residual_channels)
+        self.bn = MaskedBatchNorm2d(residual_channels, momentum=0.05)
         self.res_scale = nn.Parameter(torch.ones(1))
 
     def forward(
             self,
             x: torch.Tensor,
             A_adp: torch.Tensor,
+            t_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         residual = x
         h_tcn = self.gated_tcn(x)
+        if t_mask is not None:
+            h_tcn = h_tcn * t_mask.to(dtype=h_tcn.dtype)
         h_gcn = self.spatial_gcn(h_tcn, A_adp)
+        if t_mask is not None:
+            h_gcn = h_gcn * t_mask.to(dtype=h_gcn.dtype)
         skip = self.skip_conv(h_gcn)
-        x_res = self.bn(self.res_scale * h_gcn + residual)
+        x_res = self.bn(self.res_scale * h_gcn + residual, mask=t_mask)
+        if t_mask is not None:
+            skip = skip * t_mask.to(dtype=skip.dtype)
         return x_res, skip
 
 
@@ -813,7 +887,13 @@ class CrossWindowFeatureAccumulator(nn.Module):
                 valid_bool = torch.ones((B, W_num), dtype=torch.bool, device=dev)
                 last_state = ws_32[:, -1, :]
 
-            recency_bias = torch.linspace(-0.5, 0.5, W_num, device=dev, dtype=ws_32.dtype).view(1, W_num)
+            valid_w_counts = valid_bool.float().sum(dim=1, keepdim=True).clamp(min=1.0)
+            w_idx = torch.arange(W_num, device=dev, dtype=ws_32.dtype).unsqueeze(0)
+            recency_bias = torch.where(
+                valid_w_counts > 1.0,
+                -0.5 + (w_idx / (valid_w_counts - 1.0).clamp(min=1.0)),
+                torch.zeros((B, W_num), device=dev, dtype=ws_32.dtype),
+            )
             scores = self.window_attn_gate(ws_32).squeeze(-1) + recency_bias
             scores = scores.masked_fill(~valid_bool, -1e4)
             attn_w = F.softmax(scores, dim=1) * valid_bool.float()
@@ -971,7 +1051,7 @@ class LiteFatV1(nn.Module):
             freeze_backbone: bool = False,
             vertical_pairs: Optional[List[Tuple[int, int]]] = None,
             cross_region_pairs: Optional[List[Tuple[int, int]]] = None,
-            static_shape_ratio: float = 0.25,
+            static_shape_ratio: float = 0.60,
     ):
         super().__init__()
         self.num_nodes = num_nodes
@@ -1162,10 +1242,7 @@ class LiteFatV1(nn.Module):
 
         skip_sum = None
         for block in self.stgl_blocks:
-            h, skip = block(h, A_adp)
-            if t_mask is not None:
-                h = h * t_mask
-                skip = skip * t_mask
+            h, skip = block(h, A_adp, t_mask=t_mask)
             skip_sum = skip if skip_sum is None else (skip_sum + skip)
 
         out = F.relu(skip_sum)

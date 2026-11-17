@@ -304,28 +304,43 @@ def atomic_save(obj: Any, path: Union[str, Path]) -> None:
 
 
 class ModelEMA:
-    """Theo dõi trọng số mô hình bằng Exponential Moving Average (EMA)."""
+    """Theo dõi trọng số mô hình bằng Exponential Moving Average (EMA) có warmup và đồng bộ buffer."""
 
     def __init__(self, model: nn.Module, decay: float = 0.995):
         self.decay = float(decay)
+        self.num_updates = 0
+        self.param_keys: Set[str] = {k for k, _ in model.named_parameters()}
         self.shadow: Dict[str, torch.Tensor] = {
             k: v.clone().detach() for k, v in model.state_dict().items()
         }
 
+    def _effective_decay(self) -> float:
+        """Warmup decay để tránh giữ trọng số khởi tạo ngẫu nhiên quá lâu khi số step/epoch ít."""
+        return min(self.decay, float(1 + self.num_updates) / float(10 + self.num_updates))
+
     @torch.no_grad()
     def update(self, model: nn.Module) -> None:
+        self.num_updates += 1
+        eff_decay = self._effective_decay()
         for k, v in model.state_dict().items():
-            if k in self.shadow:
-                if v.dtype.is_floating_point:
-                    self.shadow[k].lerp_(v.detach().to(self.shadow[k].device), 1.0 - self.decay)
-                else:
-                    self.shadow[k].copy_(v.detach().to(self.shadow[k].device))
+            if k not in self.shadow:
+                continue
+            target = v.detach().to(self.shadow[k].device)
+            if k in self.param_keys and v.dtype.is_floating_point:
+                self.shadow[k].lerp_(target, 1.0 - eff_decay)
+            else:
+                # Buffers (BatchNorm running_mean/running_var, num_batches_tracked, ...) sao chép trực tiếp
+                self.shadow[k].copy_(target)
 
-    def state_dict(self) -> Dict[str, torch.Tensor]:
-        return self.shadow
+    def state_dict(self) -> Dict[str, Any]:
+        return {"shadow": self.shadow, "num_updates": self.num_updates}
 
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
-        src = state_dict.get("shadow", state_dict) if isinstance(state_dict, dict) else state_dict
+        if isinstance(state_dict, dict) and "shadow" in state_dict and isinstance(state_dict["shadow"], dict):
+            src = state_dict["shadow"]
+            self.num_updates = int(state_dict.get("num_updates", 0))
+        else:
+            src = state_dict
         for k, v in src.items():
             if k in self.shadow and isinstance(v, torch.Tensor) and self.shadow[k].shape == v.shape:
                 self.shadow[k].copy_(v.to(self.shadow[k].device))
@@ -523,6 +538,10 @@ def compute_kss_metrics(
             "f2": 0.0,
             "auc": 0.5,
             "val_score": 0.0,
+            "pred_mean": 0.0,
+            "pred_std": 0.0,
+            "pred_min": 0.0,
+            "pred_max": 0.0,
             "num_samples": 0,
         }
 
@@ -596,6 +615,10 @@ def compute_kss_metrics(
         "regime_acc": regime_acc,
         "regime_macro_f1": regime_macro_f1,
         "val_score": float(val_score),
+        "pred_mean": float(np.mean(y_pred)),
+        "pred_std": float(np.std(y_pred)),
+        "pred_min": float(np.min(y_pred)),
+        "pred_max": float(np.max(y_pred)),
         "num_samples": int(n),
     }
     metrics.update(bin_m)
@@ -732,6 +755,8 @@ def load_checkpoint(
     # 2. Khôi phục EMA shadow nếu có
     if ema is not None and "ema_state_dict" in checkpoint:
         ema.load_state_dict(checkpoint["ema_state_dict"])
+        if "ema_num_updates" in checkpoint:
+            ema.num_updates = int(checkpoint["ema_num_updates"])
 
     # 3. Khôi phục epoch
     ckpt_epoch = int(checkpoint.get("epoch", 0))

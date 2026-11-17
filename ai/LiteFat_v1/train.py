@@ -138,6 +138,9 @@ class LiteFatTrainer:
                 visual_frame_stride=self.cfg.visual_frame_stride,
             )
 
+        if hasattr(self.train_loader, "dataset") and hasattr(self.train_loader.dataset, "return_meta"):
+            self.train_loader.dataset.return_meta = True
+
         self.logger.info(
             f"Kích thước tập dữ liệu: Train={len(self.train_loader.dataset)} | "
             f"Val={len(self.val_loader.dataset)} | Test={len(self.test_loader.dataset)}"
@@ -145,6 +148,7 @@ class LiteFatTrainer:
 
         # 5. Khởi tạo Mô hình LiteFatV1 & EMA
         self.logger.info("Đang khởi tạo mô hình LiteFatV1 (KSS 1-9)...")
+        use_dann = bool(getattr(self.cfg, "use_dann", False))
         self.model = LiteFatV1(
             num_nodes=self.cfg.num_nodes,
             feature_dim=self.cfg.feature_dim,
@@ -169,7 +173,10 @@ class LiteFatTrainer:
             vertical_pairs=self.cfg.vertical_pairs,
             cross_region_pairs=self.cfg.cross_region_pairs,
             static_shape_ratio=self.cfg.static_shape_ratio,
+            use_dann=use_dann,
         ).to(self.device)
+        self.model.set_visual_context_enabled(self.cfg.use_visual_context)
+        self.model.set_dann_enabled(use_dann)
 
         self.ema = ModelEMA(self.model, decay=self.cfg.ema_decay)
         self.early_stop_counter = 0
@@ -190,6 +197,7 @@ class LiteFatTrainer:
             frame_loss_weight=self.cfg.frame_loss_weight,
             window_loss_weight=self.cfg.window_loss_weight,
             window_smooth_weight=self.cfg.window_smooth_weight,
+            dann_weight=float(getattr(self.cfg, "dann_weight", 0.05)),
             huber_beta=self.cfg.huber_beta,
             ordinal_sigma=self.cfg.ordinal_sigma,
             label_smoothing=self.cfg.label_smoothing,
@@ -324,10 +332,33 @@ class LiteFatTrainer:
         return self.pretrained_param_names
 
     @staticmethod
-    def _unpack_batch(batch: Tuple[Any, ...]) -> Tuple[Optional[torch.Tensor], torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        if len(batch) >= 4:
-            return batch[0], batch[1], batch[2], batch[3]
-        return batch[0], batch[1], batch[2], None
+    def _unpack_batch(
+            batch: Tuple[Any, ...],
+    ) -> Tuple[
+        Optional[torch.Tensor],
+        torch.Tensor,
+        torch.Tensor,
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+    ]:
+        batch_frames = batch[0]
+        batch_landmarks = batch[1]
+        batch_labels = batch[2]
+        batch_lengths = batch[3] if len(batch) >= 4 else None
+        sample_weights = None
+        domain_targets = None
+        if len(batch) >= 5 and isinstance(batch[4], (list, tuple)) and batch[4] and isinstance(batch[4][0], dict):
+            metas = batch[4]
+            sample_weights = torch.tensor(
+                [max(1e-6, float(m.get("sample_weight", 1.0))) for m in metas],
+                dtype=torch.float32,
+            )
+            domain_targets = torch.tensor(
+                [int(m.get("domain_id", -1)) for m in metas],
+                dtype=torch.long,
+            )
+        return batch_frames, batch_landmarks, batch_labels, batch_lengths, sample_weights, domain_targets
 
     def _step_optimizer(self) -> None:
         """Thực hiện gradient clipping (nếu bật), bước tối ưu AMP và cập nhật EMA."""
@@ -365,6 +396,7 @@ class LiteFatTrainer:
             "loss_frame": 0.0,
             "loss_window": 0.0,
             "loss_smooth": 0.0,
+            "loss_domain": 0.0,
         }
         all_targets: List[float] = []
         all_pred_kss: List[float] = []
@@ -372,6 +404,10 @@ class LiteFatTrainer:
 
         total_batches = len(self.train_loader)
         num_batches = max(1, total_batches)
+        total_train_steps = max(1, int(self.cfg.epochs) * num_batches)
+        use_dann = bool(getattr(self.cfg, "use_dann", False))
+        dann_max_alpha = float(getattr(self.cfg, "dann_max_alpha", 0.20))
+        use_sample_weights = bool(getattr(self.cfg, "use_manifest_sample_weights", True))
         accum_steps = max(1, int(getattr(self.cfg, "grad_accum_steps", 1)))
         valid_steps = 0
         opt_steps = 0
@@ -393,13 +429,22 @@ class LiteFatTrainer:
             if accum_count == 0:
                 current_accum_target = min(accum_steps, max(1, total_batches - batch_idx))
 
-            batch_frames, batch_landmarks, batch_labels, batch_lengths = self._unpack_batch(batch)
+            if use_dann:
+                progress = min(1.0, max(0.0, float((epoch - 1) * num_batches + batch_idx) / float(total_train_steps)))
+                dann_alpha = dann_max_alpha * (2.0 / (1.0 + math.exp(-10.0 * progress)) - 1.0)
+                self.model.set_dann_alpha(dann_alpha)
+            else:
+                self.model.set_dann_alpha(0.0)
+
+            batch_frames, batch_landmarks, batch_labels, batch_lengths, batch_weights, batch_domains = self._unpack_batch(batch)
             batch_landmarks = batch_landmarks.to(self.device, non_blocking=True)
             batch_labels = batch_labels.to(self.device, non_blocking=True)
             if batch_frames is not None:
                 batch_frames = batch_frames.to(self.device, non_blocking=True)
             if batch_lengths is not None:
                 batch_lengths = batch_lengths.to(self.device, non_blocking=True)
+            batch_weights = batch_weights.to(self.device, non_blocking=True) if (use_sample_weights and batch_weights is not None) else None
+            batch_domains = batch_domains.to(self.device, non_blocking=True) if (use_dann and batch_domains is not None) else None
 
             with torch.amp.autocast(device_type=self.device.type, enabled=self.scaler.is_enabled()):
                 out_dict = self.model(
@@ -412,6 +457,8 @@ class LiteFatTrainer:
                     out_dict,
                     batch_labels,
                     lengths=batch_lengths,
+                    sample_weights=batch_weights,
+                    domain_targets=batch_domains,
                     return_dict=True,
                 )
 
@@ -419,7 +466,7 @@ class LiteFatTrainer:
                 self.logger.warning(
                     f"Epoch {epoch:02d} | Batch {batch_idx + 1}/{num_batches}: Loss không hữu hạn ({loss.item()}). Bỏ qua bước cập nhật."
                 )
-                del out_dict, loss, loss_details, batch_frames, batch_landmarks, batch_labels, batch_lengths
+                del out_dict, loss, loss_details, batch_frames, batch_landmarks, batch_labels, batch_lengths, batch_weights, batch_domains
                 continue
 
             loss_to_backward = loss if current_accum_target == 1 else (loss / float(current_accum_target))
@@ -441,7 +488,7 @@ class LiteFatTrainer:
             all_pred_logits.append(clip_logits_np)
 
             del out_dict, loss, loss_details, loss_to_backward
-            del batch_frames, batch_landmarks, batch_labels, batch_lengths
+            del batch_frames, batch_landmarks, batch_labels, batch_lengths, batch_weights, batch_domains
 
             if accum_count >= current_accum_target:
                 self._step_optimizer()
@@ -512,7 +559,7 @@ class LiteFatTrainer:
 
         try:
             for batch_idx, batch in enumerate(pbar):
-                batch_frames, batch_landmarks, batch_labels, batch_lengths = self._unpack_batch(batch)
+                batch_frames, batch_landmarks, batch_labels, batch_lengths, _, _ = self._unpack_batch(batch)
                 batch_landmarks = batch_landmarks.to(self.device, non_blocking=True)
                 batch_labels = batch_labels.to(self.device, non_blocking=True)
                 if batch_frames is not None:
@@ -594,7 +641,7 @@ class LiteFatTrainer:
         """Ghi toàn bộ chỉ số KSS & loss vào TensorBoard."""
         self.writer.add_scalar("Loss/Train", train_m["loss"], epoch)
         self.writer.add_scalar("Loss/Val", val_m["loss"], epoch)
-        for comp in ("loss_clip_reg", "loss_clip_cls", "loss_frame", "loss_window", "loss_smooth"):
+        for comp in ("loss_clip_reg", "loss_clip_cls", "loss_frame", "loss_window", "loss_smooth", "loss_domain"):
             if comp in train_m:
                 self.writer.add_scalar(f"Loss/{comp}", train_m[comp], epoch)
 
@@ -651,7 +698,7 @@ class LiteFatTrainer:
             )
             self.logger.info(
                 f"Epoch [{epoch:02d}/{self.cfg.epochs:02d}]\n"
-                f"  Train: Loss={train_m['loss']:.4f} | MAE={train_m['mae']:.4f} | RMSE={train_m['rmse']:.4f} | "
+                f"  Train: Loss={train_m['loss']:.4f} (Dom={train_m.get('loss_domain', 0.0):.3f}) | MAE={train_m['mae']:.4f} | RMSE={train_m['rmse']:.4f} | "
                 f"Within1={train_m['within_1_acc']*100:.1f}% | QWK={train_m['qwk']:.4f} | "
                 f"Pred=[{train_m['pred_min']:.2f}..{train_m['pred_max']:.2f}, {train_m['pred_mean']:.2f}±{train_m['pred_std']:.2f}]\n"
                 f"  Val  : Loss={val_m['loss']:.4f} | MAE={val_m['mae']:.4f} | RMSE={val_m['rmse']:.4f} | "

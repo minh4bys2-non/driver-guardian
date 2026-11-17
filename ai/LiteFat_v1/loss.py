@@ -42,6 +42,7 @@ class LiteFatLoss(nn.Module):
             frame_loss_weight: float = 0.3,
             window_loss_weight: float = 0.25,
             window_smooth_weight: float = 0.05,
+            dann_weight: float = 0.05,
             huber_beta: float = 0.5,
             ordinal_sigma: float = 0.85,
             label_smoothing: float = 0.05,
@@ -64,6 +65,7 @@ class LiteFatLoss(nn.Module):
         self.frame_loss_weight = float(frame_loss_weight)
         self.window_loss_weight = float(window_loss_weight)
         self.window_smooth_weight = float(window_smooth_weight)
+        self.dann_weight = float(dann_weight)
 
         self.huber_beta = float(huber_beta)
         self.ordinal_sigma = float(max(1e-3, ordinal_sigma))
@@ -137,6 +139,9 @@ class LiteFatLoss(nn.Module):
             "clip_logits": clip_logits,
             "window_kss": window_kss,
             "window_logits": window_logits,
+            "window_valid_mask": None,
+            "domain_logits": None,
+            "window_domain_logits": None,
         }
 
         if isinstance(predictions, dict):
@@ -146,6 +151,9 @@ class LiteFatLoss(nn.Module):
             out["clip_logits"] = predictions.get("clip_logits", out["clip_logits"])
             out["window_kss"] = predictions.get("window_kss", out["window_kss"])
             out["window_logits"] = predictions.get("window_logits", out["window_logits"])
+            out["window_valid_mask"] = predictions.get("window_valid_mask", out["window_valid_mask"])
+            out["domain_logits"] = predictions.get("domain_logits", out["domain_logits"])
+            out["window_domain_logits"] = predictions.get("window_domain_logits", out["window_domain_logits"])
         elif isinstance(predictions, (tuple, list)):
             items = list(predictions)
             if items and isinstance(items[-1], dict):
@@ -358,6 +366,7 @@ class LiteFatLoss(nn.Module):
             clip_target_cls: torch.Tensor,
             lengths: Optional[torch.Tensor],
             sample_weights: Optional[torch.Tensor],
+            window_valid_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Sliding-Window Causal & Smoothness Loss cho chuỗi dài > 60s:
@@ -373,7 +382,9 @@ class LiteFatLoss(nn.Module):
         B, W_num = ref.shape[:2]
         dev = ref.device
 
-        if lengths is not None:
+        if window_valid_mask is not None and window_valid_mask.shape == (B, W_num):
+            win_valid = window_valid_mask.to(dev).bool()
+        elif lengths is not None:
             lens = lengths.to(dev).long()
             win_starts = torch.arange(W_num, device=dev) * self.stride_size
             win_valid = lens.unsqueeze(1) > win_starts.unsqueeze(0)
@@ -455,6 +466,7 @@ class LiteFatLoss(nn.Module):
             window_kss: Optional[torch.Tensor] = None,
             window_logits: Optional[torch.Tensor] = None,
             sample_weights: Optional[torch.Tensor] = None,
+            domain_targets: Optional[torch.Tensor] = None,
             return_dict: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, float]]]:
         """
@@ -471,6 +483,7 @@ class LiteFatLoss(nn.Module):
             window_kss: Điểm KSS từng cửa sổ trượt [B, W_num] (tùy chọn).
             window_logits: Logits từng cửa sổ trượt [B, W_num, 9] (tùy chọn).
             sample_weights: Trọng số cân bằng mẫu [B] từ manifest (tùy chọn).
+            domain_targets: Nhãn miền [B] (0=UL-DD, 1=UTA-RLDD) dùng cho DANN (tùy chọn).
             return_dict: True để trả kèm dict các thành phần loss chi tiết.
         """
         unpacked = self._unpack_predictions(
@@ -488,6 +501,9 @@ class LiteFatLoss(nn.Module):
         c_logits = unpacked["clip_logits"]
         w_kss = unpacked["window_kss"]
         w_logits = unpacked["window_logits"]
+        w_valid_mask = unpacked.get("window_valid_mask")
+        d_logits = unpacked.get("domain_logits")
+        w_d_logits = unpacked.get("window_domain_logits")
 
         ref_tensor = next(t for t in (c_kss, c_logits, f_kss, f_logits, w_kss, w_logits) if t is not None)
         dev = ref_tensor.device
@@ -560,10 +576,66 @@ class LiteFatLoss(nn.Module):
                     clip_target_cls=clip_target_cls,
                     lengths=lengths,
                     sample_weights=sample_weights,
+                    window_valid_mask=w_valid_mask,
                 )
             else:
                 loss_window = torch.tensor(0.0, device=dev, dtype=torch.float32)
                 loss_smooth = torch.tensor(0.0, device=dev, dtype=torch.float32)
+
+            # 5. Regime-Conditioned Domain-Adversarial Loss (DANN)
+            loss_domain = torch.tensor(0.0, device=dev, dtype=torch.float32)
+            if self.dann_weight > 0 and domain_targets is not None and (
+                d_logits is not None or w_d_logits is not None
+            ):
+                dom_tgt = domain_targets.to(dev).long().view(-1)
+                dom_valid = dom_tgt >= 0
+                if dom_valid.any():
+                    loss_d_clip = None
+                    if d_logits is not None:
+                        per_sample_d_clip = F.cross_entropy(
+                            d_logits.float(),
+                            dom_tgt.clamp(min=0),
+                            reduction="none",
+                        )
+                        loss_d_clip = self._weighted_mean(
+                            per_sample_d_clip,
+                            sample_weights=sample_weights,
+                            valid_mask=dom_valid,
+                        )
+
+                    loss_d_win = None
+                    if w_d_logits is not None and w_d_logits.size(1) > 0:
+                        B_w, W_w, C_w = w_d_logits.shape
+                        if w_valid_mask is not None and w_valid_mask.shape == (B_w, W_w):
+                            win_v = w_valid_mask.to(dev).bool()
+                        elif lengths is not None:
+                            lens_w = lengths.to(dev).long()
+                            ws_w = torch.arange(W_w, device=dev) * self.stride_size
+                            win_v = lens_w.unsqueeze(1) > ws_w.unsqueeze(0)
+                            win_v[:, 0] = win_v[:, 0] | (lens_w > 0)
+                        else:
+                            win_v = torch.ones((B_w, W_w), dtype=torch.bool, device=dev)
+
+                        tgt_w_dom = dom_tgt.clamp(min=0).unsqueeze(1).expand(B_w, W_w)
+                        per_win_d = F.cross_entropy(
+                            w_d_logits.float().reshape(-1, C_w),
+                            tgt_w_dom.reshape(-1),
+                            reduction="none",
+                        ).reshape(B_w, W_w)
+                        per_sample_d_win = (per_win_d * win_v.float()).sum(dim=1) / win_v.float().sum(dim=1).clamp(min=1.0)
+                        active_d_win = win_v.any(dim=1) & dom_valid
+                        loss_d_win = self._weighted_mean(
+                            per_sample_d_win,
+                            sample_weights=sample_weights,
+                            valid_mask=active_d_win,
+                        )
+
+                    if loss_d_clip is not None and loss_d_win is not None:
+                        loss_domain = 0.5 * loss_d_clip + 0.5 * loss_d_win
+                    elif loss_d_clip is not None:
+                        loss_domain = loss_d_clip
+                    elif loss_d_win is not None:
+                        loss_domain = loss_d_win
 
             total_loss = (
                 self.clip_reg_weight * loss_clip_reg
@@ -571,6 +643,7 @@ class LiteFatLoss(nn.Module):
                 + self.frame_loss_weight * loss_frame
                 + self.window_loss_weight * loss_window
                 + self.window_smooth_weight * loss_smooth
+                + self.dann_weight * loss_domain
             )
 
         if return_dict:
@@ -581,6 +654,7 @@ class LiteFatLoss(nn.Module):
                 "loss_frame": float(loss_frame.detach().item()),
                 "loss_window": float(loss_window.detach().item()),
                 "loss_smooth": float(loss_smooth.detach().item()),
+                "loss_domain": float(loss_domain.detach().item()),
             }
             return total_loss, details
 

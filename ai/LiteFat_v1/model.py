@@ -30,7 +30,7 @@ class MaskedBatchNorm2d(nn.Module):
             self,
             num_features: int,
             eps: float = 1e-5,
-            momentum: float = 0.05,
+            momentum: float = 0.01,
             affine: bool = True,
     ):
         super().__init__()
@@ -104,7 +104,7 @@ class KinematicFeatureExtractor(nn.Module):
             left_eye_idx: int = 36,
             right_eye_idx: int = 45,
             eps: float = 1e-2,
-            static_shape_ratio: float = 0.60,
+            static_shape_ratio: float = 0.20,
             fps: float = 10.0,
             num_nodes: int = 68,
     ):
@@ -118,7 +118,7 @@ class KinematicFeatureExtractor(nn.Module):
         self.num_nodes = int(num_nodes)
 
         # Chuẩn hóa phân phối riêng cho 6 kênh [x, y, dx, dy, d2x, d2y] chỉ tính trên frame hợp lệ
-        self.channel_norm = MaskedBatchNorm2d(6, momentum=0.05, affine=True)
+        self.channel_norm = MaskedBatchNorm2d(6, momentum=0.01, affine=True)
 
     @staticmethod
     def build_temporal_mask(
@@ -140,14 +140,24 @@ class KinematicFeatureExtractor(nn.Module):
             frame_activity = x[:, :2].abs().sum(dim=(1, 3), keepdim=True) if x.dim() == 4 and x.size(1) == 2 else x.abs().sum(dim=(-2, -1), keepdim=True)
             return (frame_activity > eps).float().view(B, 1, T, 1)
 
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+            self,
+            x: torch.Tensor,
+            mask: Optional[torch.Tensor] = None,
+            kin_state: Optional[Dict[str, torch.Tensor]] = None,
+            return_state: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
         """
         Input : (B, 2, T, V=68) - Tọa độ [0, 1] trong hệ tọa độ khung ảnh.
         mask  : (B, 1, T, 1)    - Float mask (1.0 = valid, 0.0 = padded/missing).
+        kin_state: Trạng thái chuẩn hóa nhân quả truyền từ cửa sổ trước (dùng cho streaming/mobile).
         Output: (B, 6, T, V=68) - [x_norm, y_norm, dx_norm, dy_norm, d2x_norm, d2y_norm].
         """
         if x.size(1) != 2:
-            return x * mask if mask is not None else x
+            out_passthru = x * mask if mask is not None else x
+            if return_state:
+                return out_passthru, (kin_state if kin_state is not None else {})
+            return out_passthru
 
         B, _, T, V = x.shape
 
@@ -156,61 +166,99 @@ class KinematicFeatureExtractor(nn.Module):
         p_right_eye = x[:, :, :, self.right_eye_idx: self.right_eye_idx + 1]  # (B, 2, T, 1)
         raw_iod = torch.norm(p_right_eye - p_left_eye, p=2, dim=1, keepdim=True).clamp(min=self.eps)  # (B, 1, T, 1)
 
-        # Ổn định IOD theo từng clip: kết hợp IOD tức thời với trung bình IOD của các frame hợp lệ
-        # Khi tài xế quay đầu sang ngang (yaw), khoảng cách 2D co lại nhưng không làm nổ mẫu số
+        # Ổn định IOD nhân quả: lưu baseline_iod từ cửa sổ đầu và cập nhật EMA chậm theo luồng streaming
         if mask is not None:
             v_mask = mask.clamp(min=0.0, max=1.0)
-            clip_iod = (raw_iod * v_mask).sum(dim=2, keepdim=True) / v_mask.sum(dim=2, keepdim=True).clamp(min=1.0)
+            v_sum = v_mask.sum(dim=2, keepdim=True)
+            has_valid = v_sum > 0.5
+            cur_clip_iod = (raw_iod * v_mask).sum(dim=2, keepdim=True) / v_sum.clamp(min=1.0)
         else:
-            clip_iod = raw_iod.mean(dim=2, keepdim=True)
-        clip_iod = clip_iod.clamp(min=self.eps)
-        iod_scale = torch.maximum(0.5 * raw_iod + 0.5 * clip_iod, 0.65 * clip_iod).clamp(min=self.eps)
+            has_valid = torch.ones((B, 1, 1, 1), dtype=torch.bool, device=x.device)
+            cur_clip_iod = raw_iod.mean(dim=2, keepdim=True)
+        cur_clip_iod = cur_clip_iod.clamp(min=self.eps)
+
+        if kin_state is not None and "baseline_iod" in kin_state:
+            ref_iod = kin_state["baseline_iod"].to(device=x.device, dtype=raw_iod.dtype).clamp(min=self.eps)
+            next_iod = torch.where(has_valid, 0.90 * ref_iod + 0.10 * cur_clip_iod, ref_iod)
+        else:
+            ref_iod = cur_clip_iod
+            next_iod = cur_clip_iod
+
+        iod_scale = torch.maximum(0.5 * raw_iod + 0.5 * ref_iod, 0.65 * ref_iod).clamp(min=self.eps)
 
         # 2. Tọa độ chuẩn hóa theo Tâm Mũi (pos_norm) dùng cho biến dạng động lực học
         nose_pos = x[:, :, :, self.nose_idx: self.nose_idx + 1]  # (B, 2, T, 1)
         pos_norm = (x - nose_pos) / iod_scale                    # (B, 2, T, V)
         pos_norm = torch.clamp(pos_norm, min=-8.0, max=8.0)
 
-        # 3. Chuẩn hóa hình thái đa cơ quan độc lập (Organ-Centered Local Coordinates):
-        # Mắt trái (36..41) & Lông mày trái (17..21): Gốc tại trung điểm khóe mắt trái (36 & 39)
+        # 3. Chuẩn hóa hình thái đa cơ quan độc lập & tỷ lệ nội cơ quan (Intra-Organ Aspect Ratio):
         c_left_eye = 0.5 * (x[:, :, :, 36:37] + x[:, :, :, 39:40])
-        # Mắt phải (42..47) & Lông mày phải (22..26): Gốc tại trung điểm khóe mắt phải (42 & 45)
         c_right_eye = 0.5 * (x[:, :, :, 42:43] + x[:, :, :, 45:46])
-        # Miệng (48..67): Gốc tại trung điểm 2 khóe miệng (48 & 54)
         c_mouth = 0.5 * (x[:, :, :, 48:49] + x[:, :, :, 54:55])
 
+        w_left_eye = torch.norm(x[:, :, :, 39:40] - x[:, :, :, 36:37], p=2, dim=1, keepdim=True)
+        w_right_eye = torch.norm(x[:, :, :, 45:46] - x[:, :, :, 42:43], p=2, dim=1, keepdim=True)
+        w_mouth = torch.norm(x[:, :, :, 54:55] - x[:, :, :, 48:49], p=2, dim=1, keepdim=True)
+
+        scale_left_eye = torch.maximum(w_left_eye, 0.22 * iod_scale).clamp(min=self.eps)
+        scale_right_eye = torch.maximum(w_right_eye, 0.22 * iod_scale).clamp(min=self.eps)
+        scale_mouth = torch.maximum(w_mouth, 0.32 * iod_scale).clamp(min=self.eps)
+
         pos_feat = pos_norm.clone()
-        # Vùng mắt & lông mày trái
+        # Lông mày trái & phải (quy chiếu về tâm khóe mắt theo iod_scale)
         pos_feat[:, :, :, 17:22] = (x[:, :, :, 17:22] - c_left_eye) / iod_scale
-        pos_feat[:, :, :, 36:42] = (x[:, :, :, 36:42] - c_left_eye) / iod_scale
-        # Vùng mắt & lông mày phải
         pos_feat[:, :, :, 22:27] = (x[:, :, :, 22:27] - c_right_eye) / iod_scale
-        pos_feat[:, :, :, 42:48] = (x[:, :, :, 42:48] - c_right_eye) / iod_scale
-        # Vùng miệng
-        pos_feat[:, :, :, 48:68] = (x[:, :, :, 48:68] - c_mouth) / iod_scale
 
-        # Giảm thiểu shortcut hình thái tĩnh trên mắt, lông mày, miệng nếu static_shape_ratio < 1.0
-        if self.static_shape_ratio < 0.999:
-            organ_indices = list(range(17, 27)) + list(range(36, 68))
-            pos_org = pos_feat[:, :, :, organ_indices]
-            if mask is not None:
-                denom_org = mask.sum(dim=2, keepdim=True).clamp(min=1.0)
-                org_mean = (pos_org * mask).sum(dim=2, keepdim=True) / denom_org
-            else:
-                org_mean = pos_org.mean(dim=2, keepdim=True)
-            pos_feat[:, :, :, organ_indices] = (pos_org - org_mean) + self.static_shape_ratio * org_mean
+        # Mắt trái (36..41): trục ngang theo iod_scale, trục dọc theo bề rộng hốc mắt (bảo toàn EAR)
+        rel_le = x[:, :, :, 36:42] - c_left_eye
+        pos_feat[:, 0:1, :, 36:42] = rel_le[:, 0:1] / iod_scale
+        pos_feat[:, 1:2, :, 36:42] = rel_le[:, 1:2] / (scale_left_eye * 0.35)
 
-        # Vùng Hàm (0..16) & Mũi (27..35): Trừ trung bình thời gian để bắt gật đầu/quay đầu mà không học thuộc lòng xương sọ
+        # Mắt phải (42..47): trục ngang theo iod_scale, trục dọc theo bề rộng hốc mắt (bảo toàn EAR)
+        rel_re = x[:, :, :, 42:48] - c_right_eye
+        pos_feat[:, 0:1, :, 42:48] = rel_re[:, 0:1] / iod_scale
+        pos_feat[:, 1:2, :, 42:48] = rel_re[:, 1:2] / (scale_right_eye * 0.35)
+
+        # Miệng (48..67): trục ngang theo iod_scale, trục dọc theo bề rộng miệng (bảo toàn MAR)
+        rel_mo = x[:, :, :, 48:68] - c_mouth
+        pos_feat[:, 0:1, :, 48:68] = rel_mo[:, 0:1] / iod_scale
+        pos_feat[:, 1:2, :, 48:68] = rel_mo[:, 1:2] / (scale_mouth * 0.45)
+
+        # Baseline nhân quả cho cơ quan (mắt, lông mày, miệng) và khung đầu (hàm, mũi)
+        organ_indices = list(range(17, 27)) + list(range(36, 68))
+        pos_org = pos_feat[:, :, :, organ_indices]
+        if mask is not None:
+            denom_org = mask.sum(dim=2, keepdim=True).clamp(min=1.0)
+            cur_org_mean = (pos_org * mask).sum(dim=2, keepdim=True) / denom_org
+        else:
+            cur_org_mean = pos_org.mean(dim=2, keepdim=True)
+
         jaw_nose_indices = list(range(0, 17)) + list(range(27, 36))
         pos_jn = pos_norm[:, :, :, jaw_nose_indices]
         if mask is not None:
             denom_jn = mask.sum(dim=2, keepdim=True).clamp(min=1.0)
-            jn_mean = (pos_jn * mask).sum(dim=2, keepdim=True) / denom_jn
+            cur_jn_mean = (pos_jn * mask).sum(dim=2, keepdim=True) / denom_jn
         else:
-            jn_mean = pos_jn.mean(dim=2, keepdim=True)
-        pos_feat[:, :, :, jaw_nose_indices] = (pos_jn - jn_mean) + 0.25 * pos_jn
-        # Khuếch đại biên độ vùng mắt (36..47) và miệng (48..67) để cân bằng phương sai với viền hàm/mũi
-        pos_feat[:, :, :, 36:68] = pos_feat[:, :, :, 36:68] * 2.0
+            cur_jn_mean = pos_jn.mean(dim=2, keepdim=True)
+
+        if kin_state is not None and "baseline_org_mean" in kin_state and "baseline_jn_mean" in kin_state:
+            ref_org_mean = kin_state["baseline_org_mean"].to(device=x.device, dtype=pos_org.dtype)
+            ref_jn_mean = kin_state["baseline_jn_mean"].to(device=x.device, dtype=pos_jn.dtype)
+            next_org_mean = torch.where(has_valid, 0.90 * ref_org_mean + 0.10 * cur_org_mean, ref_org_mean)
+            next_jn_mean = torch.where(has_valid, 0.90 * ref_jn_mean + 0.10 * cur_jn_mean, ref_jn_mean)
+        else:
+            ref_org_mean = cur_org_mean
+            ref_jn_mean = cur_jn_mean
+            next_org_mean = cur_org_mean
+            next_jn_mean = cur_jn_mean
+
+        if self.static_shape_ratio < 0.999:
+            pos_feat[:, :, :, organ_indices] = (pos_org - ref_org_mean) + self.static_shape_ratio * ref_org_mean
+
+        pos_feat[:, :, :, jaw_nose_indices] = (pos_jn - ref_jn_mean) + 0.20 * pos_jn
+        # Khuếch đại nhẹ vùng mắt (36..47) và miệng (48..67)
+        pos_feat[:, :, :, 36:48] = pos_feat[:, :, :, 36:48] * 1.8
+        pos_feat[:, :, :, 48:68] = pos_feat[:, :, :, 48:68] * 1.4
         pos_feat = torch.clamp(pos_feat, min=-8.0, max=8.0)
 
         # 4. Tính Vận tốc (dx, dy) và Gia tốc (d2x, d2y) chuẩn hóa giải tích
@@ -248,8 +296,8 @@ class KinematicFeatureExtractor(nn.Module):
             vel_norm = F.pad(vel_local, (0, 0, 1, 0), mode="constant", value=0.0)  # (B, 2, T, V)
             vel_norm = torch.clamp(vel_norm, min=-4.0, max=4.0)
 
-        # 5. Cân bằng năng lượng động học từng clip (Instance Kinematic Normalization)
-        # Giúp đồng bộ thang đo giữa UL-DD (camera 60fps tĩnh) và SUST/VBDDD (camera cabin rung)
+        # 5. Chuẩn hóa năng lượng động học bảo toàn biên độ sinh lý (Soft-Ceiling Kinematic Normalization)
+        # Không chia nén ngược vận tốc chớp mắt/gật đầu bình thường; chỉ kẹp mềm khi có giật cực đoan
         if mask is not None:
             m_valid = mask.clamp(min=0.0, max=1.0)
             n_valid = m_valid.sum(dim=(2, 3), keepdim=True).clamp(min=1.0) * float(V)
@@ -259,18 +307,26 @@ class KinematicFeatureExtractor(nn.Module):
             vel_rms = torch.sqrt(vel_norm.pow(2).mean(dim=(2, 3), keepdim=True) + 1e-6)
             acc_rms = torch.sqrt(acc_norm.pow(2).mean(dim=(2, 3), keepdim=True) + 1e-6)
 
-        # Chuẩn hóa mềm đưa RMS về dải tự nhiên theo tần số lấy mẫu FPS (quy chiếu gốc 20 FPS ~0.035 IOD/frame)
         fps_ratio = 20.0 / self.fps
-        vel_scale = torch.clamp(vel_rms, min=0.012 * fps_ratio, max=0.10 * fps_ratio) / (0.035 * fps_ratio)
-        acc_scale = torch.clamp(acc_rms, min=0.010 * fps_ratio, max=0.08 * fps_ratio) / (0.025 * fps_ratio)
-        vel_norm = vel_norm / vel_scale
-        acc_norm = acc_norm / acc_scale
+        vel_ref = 0.012 * fps_ratio
+        acc_ref = 0.010 * fps_ratio
+        vel_ceil = (vel_rms / (0.060 * fps_ratio)).clamp(min=1.0)
+        acc_ceil = (acc_rms / (0.050 * fps_ratio)).clamp(min=1.0)
+        vel_norm = (vel_norm / (vel_ref * vel_ceil)) * 0.35
+        acc_norm = (acc_norm / (acc_ref * acc_ceil)) * 0.35
 
         out = torch.cat([pos_feat, vel_norm, acc_norm], dim=1)  # (B, 6, T, V)
         out = torch.nan_to_num(out, nan=0.0, posinf=4.0, neginf=-4.0)
 
         # 6. Chuẩn hóa kênh MaskedBatchNorm2d(6) chỉ tính trên các khung hình hợp lệ
         out = self.channel_norm(out, mask=mask)
+        if return_state:
+            new_kin_state = {
+                "baseline_iod": next_iod.detach(),
+                "baseline_org_mean": next_org_mean.detach(),
+                "baseline_jn_mean": next_jn_mean.detach(),
+            }
+            return out, new_kin_state
         return out
 
 
@@ -377,7 +433,7 @@ class MultimodalFusionModule(nn.Module):
             left_eye_idx: int = 36,
             right_eye_idx: int = 45,
             eps: float = 1e-2,
-            static_shape_ratio: float = 0.60,
+            static_shape_ratio: float = 0.20,
             fps: float = 10.0,
     ):
         super().__init__()
@@ -398,8 +454,8 @@ class MultimodalFusionModule(nn.Module):
             num_nodes=num_nodes,
         )
 
-        # Giữ lại w để tương thích backward compatibility với checkpoint cũ
-        self.w = nn.Parameter(torch.ones(num_features, 1) / float(num_features))
+        # Giữ lại w (đóng băng) để tương thích backward compatibility với checkpoint cũ
+        self.w = nn.Parameter(torch.ones(num_features, 1) / float(num_features), requires_grad=False)
 
         # Phép chiếu động học đa kênh 6D -> D
         self.kin_proj = nn.Sequential(
@@ -437,14 +493,18 @@ class MultimodalFusionModule(nn.Module):
             coords: torch.Tensor,
             d: Optional[torch.Tensor] = None,
             mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+            kin_state: Optional[Dict[str, torch.Tensor]] = None,
+            return_kin_state: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
         """
         Args:
             coords: Chuỗi tọa độ mốc [B, T, N, 2] (hoặc [B, T, N, 3] từ cache cũ).
             d: Vector ngữ cảnh thị giác [B, T, D] hoặc None (Landmark-Only).
             mask: Temporal float mask [B, 1, T, 1].
+            kin_state: Trạng thái baseline nhân quả truyền giữa các cửa sổ trượt.
+            return_kin_state: True để trả kèm next_kin_state cho streaming/mobile.
         Returns:
-            X: Tensor đặc trưng đồ thị [B, D, N, T].
+            X: Tensor đặc trưng đồ thị [B, D, N, T] (hoặc tuple (X, next_kin_state)).
         """
         if coords.dim() == 4:
             if coords.size(-1) >= 2:
@@ -473,7 +533,12 @@ class MultimodalFusionModule(nn.Module):
                 temporal_mask = valid_mask
 
             x_in = coords_32.permute(0, 3, 1, 2).contiguous()  # [B, 2, T, N]
-            feat_kin = self.kinematic(x_in, mask=temporal_mask)  # [B, 6, T, N]
+            feat_kin, next_kin_state = self.kinematic(
+                x_in,
+                mask=temporal_mask,
+                kin_state=kin_state,
+                return_state=True,
+            )  # [B, 6, T, N]
             C_kin = feat_kin.permute(0, 2, 3, 1).contiguous()  # [B, T, N, 6]
 
             # Chiếu đa kênh 6D -> D và cộng nhúng vị trí giải phẫu
@@ -495,7 +560,10 @@ class MultimodalFusionModule(nn.Module):
             # Đưa về chuẩn đồ thị STGL: [B, D, N, T]
             X = H.permute(0, 3, 2, 1).contiguous()
 
-        return X.to(orig_dtype)
+        out_x = X.to(orig_dtype)
+        if return_kin_state:
+            return out_x, next_kin_state
+        return out_x
 
 
 class SelfAdaptiveAdjacency(nn.Module):
@@ -699,8 +767,10 @@ class STGLBlock(nn.Module):
             kernel_size: int = 2,
             dilation: int = 1,
             dropout: float = 0.2,
+            use_residual_out: bool = True,
     ):
         super().__init__()
+        self.use_residual_out = bool(use_residual_out)
         self.gated_tcn = GatedDilatedCausalTCN(
             in_channels=residual_channels,
             dilation_channels=dilation_channels,
@@ -715,8 +785,12 @@ class STGLBlock(nn.Module):
         )
         # Skip connection lấy từ h_gcn để truyền gradient trực tiếp qua GCN
         self.skip_conv = nn.Conv2d(residual_channels, skip_channels, kernel_size=(1, 1))
-        self.bn = MaskedBatchNorm2d(residual_channels, momentum=0.05)
+        self.bn = MaskedBatchNorm2d(residual_channels, momentum=0.01)
         self.res_scale = nn.Parameter(torch.ones(1))
+        if not self.use_residual_out:
+            self.bn.bn.weight.requires_grad_(False)
+            self.bn.bn.bias.requires_grad_(False)
+            self.res_scale.requires_grad_(False)
 
     def forward(
             self,
@@ -732,7 +806,10 @@ class STGLBlock(nn.Module):
         if t_mask is not None:
             h_gcn = h_gcn * t_mask.to(dtype=h_gcn.dtype)
         skip = self.skip_conv(h_gcn)
-        x_res = self.bn(self.res_scale * h_gcn + residual, mask=t_mask)
+        if self.use_residual_out:
+            x_res = self.bn(self.res_scale * h_gcn + residual, mask=t_mask)
+        else:
+            x_res = residual
         if t_mask is not None:
             skip = skip * t_mask.to(dtype=skip.dtype)
         return x_res, skip
@@ -1017,6 +1094,85 @@ class HybridKSSHead(nn.Module):
         return clip_kss.to(orig_dtype), clip_logits
 
 
+class GradientReversalFn(torch.autograd.Function):
+    """Lớp đảo ngược gradient (Gradient Reversal Layer) cho Domain-Adversarial Training."""
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, alpha: float) -> torch.Tensor:
+        ctx.alpha = float(alpha)
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        return -ctx.alpha * grad_output, None
+
+
+class GradientReversalLayer(nn.Module):
+    """Module bọc GradientReversalFn hỗ trợ điều chỉnh hệ số lambda/alpha."""
+
+    def __init__(self, alpha: float = 1.0):
+        super().__init__()
+        self.alpha = float(alpha)
+
+    def forward(self, x: torch.Tensor, alpha: Optional[float] = None) -> torch.Tensor:
+        eff_alpha = self.alpha if alpha is None else float(alpha)
+        return GradientReversalFn.apply(x, eff_alpha)
+
+
+class RegimeConditionedDomainDiscriminator(nn.Module):
+    """
+    Bộ phân biệt miền có điều kiện theo 3 vùng trạng thái KSS (Alert / Mid / Drowsy):
+      - Chỉ kích hoạt trong lúc huấn luyện (zero overhead khi suy luận trên mobile).
+      - Ghép đặc trưng cửa sổ/clip sau GRL với phân phối 3 vùng p_regime (detached)
+        để tránh co cụm các mức KSS trung gian khi phân phối nhãn giữa các domain lệch nhau.
+    """
+
+    def __init__(
+            self,
+            in_dim: int = 256,
+            num_regimes: int = 3,
+            hidden_dim: int = 64,
+            num_domains: int = 2,
+            dropout: float = 0.2,
+    ):
+        super().__init__()
+        self.in_dim = int(in_dim)
+        self.num_regimes = int(num_regimes)
+        self.num_domains = int(num_domains)
+        self.grl = GradientReversalLayer(alpha=0.0)
+        self.net = nn.Sequential(
+            nn.LayerNorm(self.in_dim + self.num_regimes),
+            nn.Linear(self.in_dim + self.num_regimes, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, self.num_domains),
+        )
+
+    @staticmethod
+    def logits_to_regime_probs(logits: torch.Tensor) -> torch.Tensor:
+        """Quy đổi logits 9 mức KSS [1..9] sang xác suất 3 vùng: Alert (1-4), Mid (5-6), Drowsy (7-9)."""
+        probs = F.softmax(logits.detach().float(), dim=-1)
+        p_alert = probs[..., :4].sum(dim=-1, keepdim=True)
+        p_mid = probs[..., 4:6].sum(dim=-1, keepdim=True)
+        p_drowsy = probs[..., 6:].sum(dim=-1, keepdim=True)
+        return torch.cat([p_alert, p_mid, p_drowsy], dim=-1)
+
+    def forward(
+            self,
+            feat: torch.Tensor,
+            kss_logits: torch.Tensor,
+            alpha: Optional[float] = None,
+    ) -> torch.Tensor:
+        dev = feat.device
+        dev_type = dev.type if dev.type in ("cuda", "cpu") else "cpu"
+        with torch.amp.autocast(dev_type, enabled=False):
+            feat_rev = self.grl(feat.float(), alpha=alpha)
+            regime_probs = self.logits_to_regime_probs(kss_logits).to(dev)
+            cond_in = torch.cat([feat_rev, regime_probs], dim=-1)
+            domain_logits = self.net(cond_in)
+        return domain_logits
+
+
 class LiteFatV1(nn.Module):
     """
     Mô hình LiteFat_v1 Dự đoán Điểm Buồn ngủ KSS (thang 1-9):
@@ -1051,7 +1207,9 @@ class LiteFatV1(nn.Module):
             freeze_backbone: bool = False,
             vertical_pairs: Optional[List[Tuple[int, int]]] = None,
             cross_region_pairs: Optional[List[Tuple[int, int]]] = None,
-            static_shape_ratio: float = 0.60,
+            static_shape_ratio: float = 0.20,
+            use_dann: bool = False,
+            num_domains: int = 2,
     ):
         super().__init__()
         self.num_nodes = num_nodes
@@ -1070,6 +1228,9 @@ class LiteFatV1(nn.Module):
         self.layers_per_block = layers_per_block
         self.kernel_size = kernel_size
         self.static_shape_ratio = float(static_shape_ratio)
+        self.use_dann = bool(use_dann)
+        self.num_domains = int(max(2, num_domains))
+        self.dann_alpha = 0.0
 
         # 1. MobileNetV3-Small trích xuất ngữ cảnh thị giác từ ảnh mặt
         self.context_encoder = MobileNetV3ContextEncoder(
@@ -1102,6 +1263,8 @@ class LiteFatV1(nn.Module):
 
         # 4. Các khối Không gian - Thời gian (STGL Blocks) mở rộng dilation 1, 2, 4, 8 cho cửa sổ 60s
         self.stgl_blocks = nn.ModuleList()
+        total_stgl_layers = num_blocks * layers_per_block
+        layer_global_idx = 0
         for _ in range(num_blocks):
             dilation = 1
             for _ in range(layers_per_block):
@@ -1113,9 +1276,11 @@ class LiteFatV1(nn.Module):
                         kernel_size=kernel_size,
                         dilation=dilation,
                         dropout=dropout,
+                        use_residual_out=(layer_global_idx < total_stgl_layers - 1),
                     )
                 )
                 dilation *= 2
+                layer_global_idx += 1
 
         # Chiếu đặc trưng đầu ra đồ thị
         self.end_conv_1 = nn.Conv2d(skip_channels, end_channels, kernel_size=(1, 1))
@@ -1126,10 +1291,10 @@ class LiteFatV1(nn.Module):
             nn.ReLU(),
             nn.Conv2d(64, 1, kernel_size=(1, 1)),
         )
-        # Prior giải phẫu thiên vị vùng mắt (36..47) và vùng miệng (48..67)
+        # Prior giải phẫu ưu tiên vùng mắt (36..47: 12 đỉnh) hơn vùng miệng (48..67: 20 đỉnh)
         node_prior = torch.zeros(1, 1, num_nodes, 1)
-        node_prior[:, :, 36:48, :] = 1.0  # Mắt
-        node_prior[:, :, 48:68, :] = 1.0  # Miệng
+        node_prior[:, :, 36:48, :] = 1.50  # Mắt
+        node_prior[:, :, 48:68, :] = 0.75  # Miệng
         self.register_buffer("node_prior_bias", node_prior)
 
         # Attentive Temporal Pooling: Tự học trọng số chú ý từ vector đặc trưng khung hình (end_channels)
@@ -1157,6 +1322,16 @@ class LiteFatV1(nn.Module):
             dropout=dropout,
         )
 
+        # 7. Nhánh Domain-Adversarial Training có điều kiện theo 3 vùng trạng thái (chỉ chạy khi train)
+        self.domain_discriminator = RegimeConditionedDomainDiscriminator(
+            in_dim=end_channels,
+            num_regimes=3,
+            hidden_dim=64,
+            num_domains=self.num_domains,
+            dropout=min(0.3, dropout),
+        )
+        self.set_dann_enabled(self.use_dann)
+
     @property
     def end_conv_2(self) -> nn.Conv2d:
         """Alias tương thích ngược trỏ tới tầng phân loại frame của kss_head."""
@@ -1172,10 +1347,11 @@ class LiteFatV1(nn.Module):
             total_frames: int,
             window_size: int,
             stride_size: int,
+            min_tail_frames: int = 50,
     ) -> List[Tuple[int, int]]:
         """
-        Tạo danh sách các khoảng cửa sổ (start, end) với độ dài window_size và bước trượt stride_size.
-        Đảm bảo khoảng cách giữa các cửa sổ liên tiếp luôn đúng bằng stride_size để vùng chồng lấp khớp chuẩn.
+        Tạo danh sách các khoảng cửa sổ (start, end) cố định kích thước `window_size`
+        (tương thích cơ chế Ring Buffer trên điện thoại di động) với bước trượt `stride_size`.
         """
         if total_frames <= window_size:
             return [(0, total_frames)]
@@ -1183,10 +1359,18 @@ class LiteFatV1(nn.Module):
         starts = list(range(0, max(1, total_frames - window_size + 1), stride_size))
         if not starts:
             starts = [0]
-        while starts[-1] + window_size < total_frames:
-            starts.append(starts[-1] + stride_size)
 
-        return [(s, min(total_frames, s + window_size)) for s in starts]
+        rem = total_frames - (starts[-1] + window_size)
+        if rem > 0:
+            last_start = total_frames - window_size
+            if rem >= int(max(1, min_tail_frames)):
+                if last_start > starts[-1]:
+                    starts.append(last_start)
+            else:
+                if len(starts) == 1 or last_start > starts[-2]:
+                    starts[-1] = last_start
+
+        return [(s, s + window_size) for s in starts]
 
     @staticmethod
     def _normalize_landmarks_shape(landmarks: torch.Tensor) -> torch.Tensor:
@@ -1359,6 +1543,7 @@ class LiteFatV1(nn.Module):
             prev_state: Optional[Dict[str, torch.Tensor]] = None,
             overlap_size: Optional[int] = None,
             stride_size: Optional[int] = None,
+            kin_state: Optional[Dict[str, torch.Tensor]] = None,
             return_details: bool = False,
     ) -> Union[Tuple[torch.Tensor, torch.Tensor], Dict[str, Any]]:
         """
@@ -1399,6 +1584,14 @@ class LiteFatV1(nn.Module):
             attn_frame_logits=attn_frame_logits,
         )
 
+        win_domain_logits = None
+        if self.use_dann and self.training:
+            win_domain_logits = self.domain_discriminator(
+                memory_feat,
+                clip_logits,
+                alpha=self.dann_alpha,
+            )
+
         if return_details:
             overlap_tail_feat = self._extract_overlap_tail(
                 frame_feat=frame_feat,
@@ -1412,12 +1605,17 @@ class LiteFatV1(nn.Module):
                 "overlap_tail_feat": overlap_tail_feat,
                 "window_feat": pooled_window_feat,
             }
+            if kin_state is not None:
+                new_state["kin_state"] = kin_state
+            elif prev_state is not None and "kin_state" in prev_state:
+                new_state["kin_state"] = prev_state["kin_state"]
             return {
                 "frame_kss": frame_kss,
                 "clip_kss": clip_kss,
                 "frame_logits": frame_logits,
                 "clip_logits": clip_logits,
                 "attn_frame_logits": attn_frame_logits,
+                "domain_logits": win_domain_logits,
                 "state": new_state,
             }
 
@@ -1435,7 +1633,7 @@ class LiteFatV1(nn.Module):
     ) -> Dict[str, Any]:
         """
         Chạy cơ chế cửa sổ trượt (mặc định 60s = 600 frames, stride 30s = 300 frames @ 10 FPS)
-        với tích lũy đặc trưng kép phía trước cho các mẫu có độ dài lớn hơn 60s.
+        với tích lũy đặc trưng kép phía trước và baseline động học nhân quả (streaming-safe).
         """
         lm_norm = self._normalize_landmarks_shape(landmarks)
         B, T, _, _ = lm_norm.shape
@@ -1443,7 +1641,6 @@ class LiteFatV1(nn.Module):
 
         win_size = self.window_size if window_size is None else int(max(1, window_size))
         str_size = self.stride_size if stride_size is None else int(max(1, stride_size))
-        ov_size = max(0, win_size - str_size)
 
         d_full = None
         if video_frames is not None and video_frames.numel() > 0:
@@ -1462,11 +1659,13 @@ class LiteFatV1(nn.Module):
         written_mask = torch.zeros((B, T), dtype=torch.bool, device=dev)
 
         state = prev_state
+        kin_state = prev_state.get("kin_state") if prev_state is not None else None
         window_memories: List[torch.Tensor] = []
         window_kss_list: List[torch.Tensor] = []
         window_logits_list: List[torch.Tensor] = []
         window_attn_logits_list: List[torch.Tensor] = []
         window_valid_list: List[torch.Tensor] = []
+        window_domain_logits_list: List[torch.Tensor] = []
 
         for w_idx, (s, e_valid) in enumerate(ranges):
             sub_len_span = e_valid - s
@@ -1490,13 +1689,30 @@ class LiteFatV1(nn.Module):
             else:
                 sub_mask = None
 
-            X_sub = self.fusion(sub_landmarks, d=sub_d, mask=sub_mask)
+            X_sub, next_kin_state = self.fusion(
+                sub_landmarks,
+                d=sub_d,
+                mask=sub_mask,
+                kin_state=kin_state,
+                return_kin_state=True,
+            )
+            kin_state = next_kin_state
+
+            if w_idx + 1 < len(ranges):
+                next_s = ranges[w_idx + 1][0]
+                tail_stride = max(1, next_s - s)
+                tail_overlap = max(0, e_valid - next_s)
+            else:
+                tail_stride = str_size
+                tail_overlap = max(0, win_size - str_size)
+
             win_out = self.forward_stgl_from_fused(
                 X_sub,
                 lengths=sub_lengths,
                 prev_state=state,
-                overlap_size=ov_size,
-                stride_size=str_size,
+                overlap_size=tail_overlap,
+                stride_size=tail_stride,
+                kin_state=kin_state,
                 return_details=True,
             )
             state = win_out["state"]
@@ -1513,6 +1729,10 @@ class LiteFatV1(nn.Module):
                 local_valid = torch.ones((B, sub_len_span), dtype=torch.bool, device=dev)
 
             if w_idx == 0:
+                if s > 0:
+                    full_frame_kss[:, :s] = w_frame_kss[:, :1]
+                    full_frame_logits[:, :s, :] = w_frame_logits[:, :1, :]
+                    written_mask[:, :s] = True
                 full_frame_kss[:, s:e_valid] = w_frame_kss
                 full_frame_logits[:, s:e_valid, :] = w_frame_logits
                 written_mask[:, s:e_valid] = True
@@ -1535,6 +1755,8 @@ class LiteFatV1(nn.Module):
             window_logits_list.append(win_out["clip_logits"])
             window_attn_logits_list.append(win_out["attn_frame_logits"])
             window_valid_list.append(active_mask)
+            if win_out.get("domain_logits") is not None:
+                window_domain_logits_list.append(win_out["domain_logits"])
 
         window_states = torch.stack(window_memories, dim=1)  # [B, W_num, D]
         window_kss = torch.stack(window_kss_list, dim=1)  # [B, W_num]
@@ -1557,6 +1779,17 @@ class LiteFatV1(nn.Module):
             attn_frame_logits=final_attn_logits,
         )
 
+        clip_domain_logits = None
+        window_domain_logits = None
+        if self.use_dann and self.training:
+            clip_domain_logits = self.domain_discriminator(
+                final_feat,
+                clip_logits,
+                alpha=self.dann_alpha,
+            )
+            if window_domain_logits_list:
+                window_domain_logits = torch.stack(window_domain_logits_list, dim=1)
+
         orig_dtype = lm_norm.dtype
         return {
             "frame_kss": full_frame_kss.to(orig_dtype),
@@ -1565,6 +1798,9 @@ class LiteFatV1(nn.Module):
             "clip_logits": clip_logits,
             "window_kss": window_kss,
             "window_logits": window_logits,
+            "window_valid_mask": window_valid_mask,
+            "domain_logits": clip_domain_logits,
+            "window_domain_logits": window_domain_logits,
             "state": state,
         }
 
@@ -1636,13 +1872,21 @@ class LiteFatV1(nn.Module):
                     lengths=lengths,
                 )
 
-            X = self.fusion(lm_norm, d=d, mask=mask)
+            in_kin_state = prev_state.get("kin_state") if prev_state is not None else None
+            X, next_kin_state = self.fusion(
+                lm_norm,
+                d=d,
+                mask=mask,
+                kin_state=in_kin_state,
+                return_kin_state=True,
+            )
             win_out = self.forward_stgl_from_fused(
                 X,
                 lengths=lengths,
                 prev_state=prev_state,
                 overlap_size=ov_frames,
                 stride_size=str_frames,
+                kin_state=next_kin_state,
                 return_details=True,
             )
             out_dict = {
@@ -1652,6 +1896,17 @@ class LiteFatV1(nn.Module):
                 "clip_logits": win_out["clip_logits"],
                 "window_kss": win_out["clip_kss"].unsqueeze(1),
                 "window_logits": win_out["clip_logits"].unsqueeze(1),
+                "window_valid_mask": (
+                    (lengths.to(lm_norm.device) > 0).unsqueeze(1)
+                    if lengths is not None
+                    else torch.ones((lm_norm.size(0), 1), dtype=torch.bool, device=lm_norm.device)
+                ),
+                "domain_logits": win_out.get("domain_logits"),
+                "window_domain_logits": (
+                    win_out["domain_logits"].unsqueeze(1)
+                    if win_out.get("domain_logits") is not None
+                    else None
+                ),
                 "state": win_out["state"],
             }
 
@@ -1742,6 +1997,29 @@ class LiteFatV1(nn.Module):
             self.freeze_backbone(freeze=True, freeze_projector=False)
         else:
             self.unfreeze_backbone(unfreeze_last_n_blocks=unfreeze_last_n_blocks)
+
+    def set_visual_context_enabled(self, enabled: bool) -> None:
+        """Đóng băng hoặc mở khóa toàn bộ nhánh thị giác (MobileNetV3 + Projector + FiLM)."""
+        flag = bool(enabled)
+        if not flag:
+            self.context_encoder.freeze_backbone(freeze=True, freeze_projector=True)
+        else:
+            for param in self.context_encoder.projector.parameters():
+                param.requires_grad = True
+        for param in self.fusion.film_scale.parameters():
+            param.requires_grad = flag
+        for param in self.fusion.film_shift.parameters():
+            param.requires_grad = flag
+
+    def set_dann_enabled(self, enabled: bool) -> None:
+        """Bật/tắt nhánh phân biệt miền có điều kiện (Regime-Conditioned DANN)."""
+        self.use_dann = bool(enabled)
+        for param in self.domain_discriminator.parameters():
+            param.requires_grad = self.use_dann
+
+    def set_dann_alpha(self, alpha: float) -> None:
+        """Cập nhật hệ số đảo dấu gradient GRL (lambda) theo lịch trình Ganin."""
+        self.dann_alpha = float(max(0.0, alpha))
 
     @property
     def is_backbone_frozen(self) -> bool:

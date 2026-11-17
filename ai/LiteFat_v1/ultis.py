@@ -326,10 +326,11 @@ class ModelEMA:
             if k not in self.shadow:
                 continue
             target = v.detach().to(self.shadow[k].device)
-            if k in self.param_keys and v.dtype.is_floating_point:
+            if v.dtype.is_floating_point:
+                # Làm mượt EMA cho cả tham số và floating-point buffers (BatchNorm running_mean/running_var)
                 self.shadow[k].lerp_(target, 1.0 - eff_decay)
             else:
-                # Buffers (BatchNorm running_mean/running_var, num_batches_tracked, ...) sao chép trực tiếp
+                # Các buffer số nguyên (num_batches_tracked, ...) sao chép trực tiếp
                 self.shadow[k].copy_(target)
 
     def state_dict(self) -> Dict[str, Any]:
@@ -744,7 +745,21 @@ def load_checkpoint(
 
     # 1. Nạp trọng số mô hình
     if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-        model.load_state_dict(checkpoint["model_state_dict"], strict=strict)
+        try:
+            model.load_state_dict(checkpoint["model_state_dict"], strict=strict)
+        except RuntimeError as e:
+            if strict:
+                incompat = model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+                non_aux_missing = [k for k in incompat.missing_keys if not k.startswith("domain_discriminator.")]
+                if non_aux_missing or incompat.unexpected_keys:
+                    raise e
+                if logger is not None:
+                    logger.warning(
+                        f"Checkpoint cũ không chứa nhánh phụ trợ ({incompat.missing_keys}); "
+                        "đã nạp tương thích với strict=False."
+                    )
+            else:
+                raise
     elif isinstance(checkpoint, dict) and all(isinstance(v, torch.Tensor) for v in checkpoint.values()):
         model.load_state_dict(checkpoint, strict=strict)
         checkpoint = {"model_state_dict": checkpoint, "epoch": 0}

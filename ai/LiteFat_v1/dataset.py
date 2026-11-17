@@ -1024,6 +1024,7 @@ class LiteFatDataset(Dataset):
             "session_id": sample["session_id"],
             "condition": sample["condition"],
             "dataset": sample["dataset"],
+            "domain_id": (0 if str(sample.get("dataset", "")).upper().startswith("UL") else 1),
             "path": str(sample["path"]),
             "orig_path": sample["orig_path"],
             "split": self.split,
@@ -1440,6 +1441,8 @@ def build_litefat_dataloaders(
                     float(max(1, ds_label_counts[(ds_name, lbl)]))
                     * math.sqrt(float(max(1, sub_label_counts[(ds_name, sub, lbl)])))
                 )
+                if use_manifest_sample_weights:
+                    w *= max(1e-6, float(s.get("sample_weight", 1.0)))
                 raw_weights.append(w)
                 ds_totals[ds_name] += w
 

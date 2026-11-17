@@ -61,7 +61,7 @@ class TrainConfig:
 
     # Tham số cửa sổ trượt của kiến trúc LiteFatV1 và LiteFatLoss
     window_sec: float = 60.0
-    stride_sec: float = 50.0
+    stride_sec: float = 30.0
 
     # =================================================================
     # 4. TĂNG CƯỜNG DỮ LIỆU ĐA PHƯƠNG THỨC (DATA AUGMENTATION)
@@ -95,7 +95,7 @@ class TrainConfig:
     kernel_size: int = 3
     dropout: float = 0.3
     pretrained_backbone: bool = True
-    static_shape_ratio: float = 0.60
+    static_shape_ratio: float = 0.20
 
     vertical_pairs: List[Tuple[int, int]] = field(default_factory=lambda: [
         (37, 41), (38, 40), (43, 47), (44, 46),
@@ -154,6 +154,13 @@ class TrainConfig:
     topk_mid_ratio: float = 0.70
     topk_drowsy_ratio: float = 0.45
     smooth_margin: float = 1.0
+
+    # =================================================================
+    # 8. THAM SỐ DOMAIN-ADVERSARIAL TRAINING (REGIME-CONDITIONED DANN)
+    # =================================================================
+    use_dann: bool = True
+    dann_weight: float = 0.05
+    dann_max_alpha: float = 0.20
 
     def to_dict(self) -> Dict[str, Any]:
         """Chuyển cấu hình thành từ điển thuần JSON-serializable."""

@@ -1441,8 +1441,6 @@ def build_litefat_dataloaders(
                     float(max(1, ds_label_counts[(ds_name, lbl)]))
                     * math.sqrt(float(max(1, sub_label_counts[(ds_name, sub, lbl)])))
                 )
-                if use_manifest_sample_weights:
-                    w *= max(1e-6, float(s.get("sample_weight", 1.0)))
                 raw_weights.append(w)
                 ds_totals[ds_name] += w
 

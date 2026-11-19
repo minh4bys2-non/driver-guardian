@@ -375,19 +375,22 @@ class LiteFatTrainer:
         """Thực thi một epoch huấn luyện cho LiteFatV1 (hỗ trợ tích lũy gradient)."""
         self.model.train()
 
-        # Đóng/mở khóa backbone MobileNetV3 theo epoch
-        if epoch <= self.cfg.freeze_backbone_epochs:
-            self.model.set_backbone_trainable(False)
-            for g in self.optimizer.param_groups:
-                if g.get("name") == "backbone":
-                    g["lr"] = 0.0
+        # Đóng/mở khóa backbone MobileNetV3 theo epoch (chỉ áp dụng khi bật ngữ cảnh thị giác)
+        if self.cfg.use_visual_context:
+            if epoch <= self.cfg.freeze_backbone_epochs:
+                self.model.set_backbone_trainable(False)
+                for g in self.optimizer.param_groups:
+                    if g.get("name") == "backbone":
+                        g["lr"] = 0.0
+            else:
+                self.model.set_backbone_trainable(True, unfreeze_last_n_blocks=self.cfg.unfreeze_last_n_blocks)
+                base_lr_ref = self.optimizer.param_groups[0]["lr"]
+                base_ratio = base_lr_ref / max(1e-9, self.cfg.lr)
+                for g in self.optimizer.param_groups:
+                    if g.get("name") == "backbone":
+                        g["lr"] = self.cfg.backbone_lr * base_ratio
         else:
-            self.model.set_backbone_trainable(True, unfreeze_last_n_blocks=self.cfg.unfreeze_last_n_blocks)
-            base_lr_ref = self.optimizer.param_groups[0]["lr"]
-            base_ratio = base_lr_ref / max(1e-9, self.cfg.lr)
-            for g in self.optimizer.param_groups:
-                if g.get("name") == "backbone":
-                    g["lr"] = self.cfg.backbone_lr * base_ratio
+            self.model.set_backbone_trainable(False)
 
         total_loss = 0.0
         comp_sums: Dict[str, float] = {
@@ -407,7 +410,10 @@ class LiteFatTrainer:
         total_train_steps = max(1, int(self.cfg.epochs) * num_batches)
         use_dann = bool(getattr(self.cfg, "use_dann", False))
         dann_max_alpha = float(getattr(self.cfg, "dann_max_alpha", 0.20))
-        use_sample_weights = bool(getattr(self.cfg, "use_manifest_sample_weights", True))
+        # Khi đã bật subject_balanced_sampling thì sampler đã cân bằng lớp/miền, tránh nhân chồng trọng số loss
+        use_sample_weights = bool(getattr(self.cfg, "use_manifest_sample_weights", True)) and (
+            not bool(getattr(self.cfg, "subject_balanced_sampling", False))
+        )
         accum_steps = max(1, int(getattr(self.cfg, "grad_accum_steps", 1)))
         valid_steps = 0
         opt_steps = 0

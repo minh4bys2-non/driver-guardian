@@ -306,7 +306,7 @@ def atomic_save(obj: Any, path: Union[str, Path]) -> None:
 class ModelEMA:
     """Theo dõi trọng số mô hình bằng Exponential Moving Average (EMA) có warmup và đồng bộ buffer."""
 
-    def __init__(self, model: nn.Module, decay: float = 0.995):
+    def __init__(self, model: nn.Module, decay: float = 0.990):
         self.decay = float(decay)
         self.num_updates = 0
         self.param_keys: Set[str] = {k for k, _ in model.named_parameters()}
@@ -316,7 +316,7 @@ class ModelEMA:
 
     def _effective_decay(self) -> float:
         """Warmup decay để tránh giữ trọng số khởi tạo ngẫu nhiên quá lâu khi số step/epoch ít."""
-        return min(self.decay, float(1 + self.num_updates) / float(10 + self.num_updates))
+        return min(self.decay, float(1 + self.num_updates) / float(5 + self.num_updates))
 
     @torch.no_grad()
     def update(self, model: nn.Module) -> None:

@@ -61,7 +61,7 @@ class TrainConfig:
 
     # Tham số cửa sổ trượt của kiến trúc LiteFatV1 và LiteFatLoss
     window_sec: float = 60.0
-    stride_sec: float = 30.0
+    stride_sec: float = 45.0
 
     # =================================================================
     # 4. TĂNG CƯỜNG DỮ LIỆU ĐA PHƯƠNG THỨC (DATA AUGMENTATION)
@@ -95,7 +95,7 @@ class TrainConfig:
     kernel_size: int = 3
     dropout: float = 0.3
     pretrained_backbone: bool = True
-    static_shape_ratio: float = 0.20
+    static_shape_ratio: float = 0.55
 
     vertical_pairs: List[Tuple[int, int]] = field(default_factory=lambda: [
         (37, 41), (38, 40), (43, 47), (44, 46),
@@ -108,7 +108,7 @@ class TrainConfig:
     # =================================================================
     # 6. THAM SỐ HUẤN LUYỆN, TỐI ƯU HÓA & CHECKPOINT
     # =================================================================
-    epochs: int = 30
+    epochs: int = 40
     batch_size: int = 2
     grad_accum_steps: int = 8
     num_workers: int = 0
@@ -119,9 +119,9 @@ class TrainConfig:
     use_manifest_sample_weights: bool = True
     drop_single_class_subjects: bool = False
 
-    ema_decay: float = 0.995
+    ema_decay: float = 0.990
     use_ema_eval: bool = True
-    early_stop_patience: int = 8
+    early_stop_patience: int = 10
 
     lr: float = 3e-4
     backbone_lr: float = 3e-5
@@ -159,8 +159,8 @@ class TrainConfig:
     # 8. THAM SỐ DOMAIN-ADVERSARIAL TRAINING (REGIME-CONDITIONED DANN)
     # =================================================================
     use_dann: bool = True
-    dann_weight: float = 0.05
-    dann_max_alpha: float = 0.20
+    dann_weight: float = 0.02
+    dann_max_alpha: float = 0.15
 
     def to_dict(self) -> Dict[str, Any]:
         """Chuyển cấu hình thành từ điển thuần JSON-serializable."""

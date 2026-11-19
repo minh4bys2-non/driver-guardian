@@ -104,7 +104,7 @@ class KinematicFeatureExtractor(nn.Module):
             left_eye_idx: int = 36,
             right_eye_idx: int = 45,
             eps: float = 1e-2,
-            static_shape_ratio: float = 0.20,
+            static_shape_ratio: float = 0.55,
             fps: float = 10.0,
             num_nodes: int = 68,
     ):
@@ -241,16 +241,11 @@ class KinematicFeatureExtractor(nn.Module):
         else:
             cur_jn_mean = pos_jn.mean(dim=2, keepdim=True)
 
-        if kin_state is not None and "baseline_org_mean" in kin_state and "baseline_jn_mean" in kin_state:
-            ref_org_mean = kin_state["baseline_org_mean"].to(device=x.device, dtype=pos_org.dtype)
-            ref_jn_mean = kin_state["baseline_jn_mean"].to(device=x.device, dtype=pos_jn.dtype)
-            next_org_mean = torch.where(has_valid, 0.90 * ref_org_mean + 0.10 * cur_org_mean, ref_org_mean)
-            next_jn_mean = torch.where(has_valid, 0.90 * ref_jn_mean + 0.10 * cur_jn_mean, ref_jn_mean)
-        else:
-            ref_org_mean = cur_org_mean
-            ref_jn_mean = cur_jn_mean
-            next_org_mean = cur_org_mean
-            next_jn_mean = cur_jn_mean
+        # Dùng baseline cục bộ trên từng cửa sổ 60s để tránh tích lũy độ lệch DC liên cửa sổ khi đổi tư thế
+        ref_org_mean = cur_org_mean
+        ref_jn_mean = cur_jn_mean
+        next_org_mean = cur_org_mean
+        next_jn_mean = cur_jn_mean
 
         if self.static_shape_ratio < 0.999:
             pos_feat[:, :, :, organ_indices] = (pos_org - ref_org_mean) + self.static_shape_ratio * ref_org_mean
@@ -307,13 +302,12 @@ class KinematicFeatureExtractor(nn.Module):
             vel_rms = torch.sqrt(vel_norm.pow(2).mean(dim=(2, 3), keepdim=True) + 1e-6)
             acc_rms = torch.sqrt(acc_norm.pow(2).mean(dim=(2, 3), keepdim=True) + 1e-6)
 
+        # Hybrid Instance-Soft Kinematic Normalization: đồng bộ thang vận tốc giữa UL-DD và UTA-RLDD
         fps_ratio = 20.0 / self.fps
-        vel_ref = 0.012 * fps_ratio
-        acc_ref = 0.010 * fps_ratio
-        vel_ceil = (vel_rms / (0.060 * fps_ratio)).clamp(min=1.0)
-        acc_ceil = (acc_rms / (0.050 * fps_ratio)).clamp(min=1.0)
-        vel_norm = (vel_norm / (vel_ref * vel_ceil)) * 0.35
-        acc_norm = (acc_norm / (acc_ref * acc_ceil)) * 0.35
+        vel_scale = torch.clamp(vel_rms, min=0.012 * fps_ratio, max=0.10 * fps_ratio) / (0.030 * fps_ratio)
+        acc_scale = torch.clamp(acc_rms, min=0.010 * fps_ratio, max=0.08 * fps_ratio) / (0.022 * fps_ratio)
+        vel_norm = (vel_norm / vel_scale) * 0.50
+        acc_norm = (acc_norm / acc_scale) * 0.50
 
         out = torch.cat([pos_feat, vel_norm, acc_norm], dim=1)  # (B, 6, T, V)
         out = torch.nan_to_num(out, nan=0.0, posinf=4.0, neginf=-4.0)
@@ -433,7 +427,7 @@ class MultimodalFusionModule(nn.Module):
             left_eye_idx: int = 36,
             right_eye_idx: int = 45,
             eps: float = 1e-2,
-            static_shape_ratio: float = 0.20,
+            static_shape_ratio: float = 0.55,
             fps: float = 10.0,
     ):
         super().__init__()
@@ -921,18 +915,15 @@ class CrossWindowFeatureAccumulator(nn.Module):
 
         with torch.amp.autocast(dev_type, enabled=False):
             w_32 = window_feat.float()
-            if prev_memory is None:
-                h_new = self.out_norm(w_32)
-            else:
-                p_32 = prev_memory.float()
-                z = self.input_norm(w_32)
-                h_prev = self.state_norm(p_32)
-                h_gru = self.gru_cell(z, h_prev)
-                alpha = self.mem_gate(torch.cat([z, h_prev, h_gru], dim=-1))
-                h_new = self.out_norm(alpha * h_gru + (1.0 - alpha) * w_32)
-                if active_mask is not None:
-                    mask_col = active_mask.view(-1, 1).bool().to(dev)
-                    h_new = torch.where(mask_col, h_new, p_32)
+            p_32 = prev_memory.float() if prev_memory is not None else torch.zeros_like(w_32)
+            z = self.input_norm(w_32)
+            h_prev = self.state_norm(p_32) if prev_memory is not None else p_32
+            h_gru = self.gru_cell(z, h_prev)
+            alpha = self.mem_gate(torch.cat([z, h_prev, h_gru], dim=-1))
+            h_new = self.out_norm(alpha * h_gru + (1.0 - alpha) * w_32)
+            if prev_memory is not None and active_mask is not None:
+                mask_col = active_mask.view(-1, 1).bool().to(dev)
+                h_new = torch.where(mask_col, h_new, p_32)
 
         return h_new.to(orig_dtype)
 
@@ -968,7 +959,7 @@ class CrossWindowFeatureAccumulator(nn.Module):
             w_idx = torch.arange(W_num, device=dev, dtype=ws_32.dtype).unsqueeze(0)
             recency_bias = torch.where(
                 valid_w_counts > 1.0,
-                -0.5 + (w_idx / (valid_w_counts - 1.0).clamp(min=1.0)),
+                -0.2 + 0.4 * (w_idx / (valid_w_counts - 1.0).clamp(min=1.0)),
                 torch.zeros((B, W_num), device=dev, dtype=ws_32.dtype),
             )
             scores = self.window_attn_gate(ws_32).squeeze(-1) + recency_bias
@@ -977,7 +968,7 @@ class CrossWindowFeatureAccumulator(nn.Module):
             attn_w = attn_w / attn_w.sum(dim=1, keepdim=True).clamp(min=1e-6)
             attn_state = (ws_32 * attn_w.unsqueeze(-1)).sum(dim=1)
 
-            final_state = 0.65 * last_state + 0.35 * attn_state
+            final_state = 0.45 * last_state + 0.55 * attn_state
 
         return final_state.to(orig_dtype)
 
@@ -1198,7 +1189,7 @@ class LiteFatV1(nn.Module):
             kss_max: float = 9.0,
             fps: int = 10,
             window_sec: float = 60.0,
-            stride_sec: float = 30.0,
+            stride_sec: float = 45.0,
             num_blocks: int = 3,
             layers_per_block: int = 4,
             kernel_size: int = 3,
@@ -1207,7 +1198,7 @@ class LiteFatV1(nn.Module):
             freeze_backbone: bool = False,
             vertical_pairs: Optional[List[Tuple[int, int]]] = None,
             cross_region_pairs: Optional[List[Tuple[int, int]]] = None,
-            static_shape_ratio: float = 0.20,
+            static_shape_ratio: float = 0.55,
             use_dann: bool = False,
             num_domains: int = 2,
     ):

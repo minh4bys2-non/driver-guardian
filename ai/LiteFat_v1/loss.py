@@ -42,7 +42,7 @@ class LiteFatLoss(nn.Module):
             frame_loss_weight: float = 0.3,
             window_loss_weight: float = 0.25,
             window_smooth_weight: float = 0.05,
-            dann_weight: float = 0.05,
+            dann_weight: float = 0.02,
             huber_beta: float = 0.5,
             ordinal_sigma: float = 0.85,
             label_smoothing: float = 0.05,
@@ -52,7 +52,7 @@ class LiteFatLoss(nn.Module):
             topk_drowsy_ratio: float = 0.45,
             fps: int = 10,
             window_sec: float = 60.0,
-            stride_sec: float = 30.0,
+            stride_sec: float = 45.0,
             smooth_margin: float = 1.0,
     ):
         super().__init__()

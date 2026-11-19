@@ -93,9 +93,9 @@ class TrainConfig:
     num_blocks: int = 3
     layers_per_block: int = 4
     kernel_size: int = 3
-    dropout: float = 0.3
+    dropout: float = 0.35
     pretrained_backbone: bool = True
-    static_shape_ratio: float = 0.55
+    static_shape_ratio: float = 0.35
 
     vertical_pairs: List[Tuple[int, int]] = field(default_factory=lambda: [
         (37, 41), (38, 40), (43, 47), (44, 46),
@@ -125,7 +125,7 @@ class TrainConfig:
 
     lr: float = 3e-4
     backbone_lr: float = 3e-5
-    weight_decay: float = 2e-3
+    weight_decay: float = 3e-3
     freeze_backbone_epochs: int = 5
     unfreeze_last_n_blocks: int = 3
     warmup_epochs: int = 2
@@ -145,9 +145,11 @@ class TrainConfig:
     frame_loss_weight: float = 0.3
     window_loss_weight: float = 0.25
     window_smooth_weight: float = 0.05
+    boundary_margin_weight: float = 0.15
 
     huber_beta: float = 0.5
     ordinal_sigma: float = 0.85
+    uta_ordinal_sigma: float = 1.25
     label_smoothing: float = 0.05
     alert_kss_threshold: float = 4.0
     mid_kss_threshold: float = 6.0

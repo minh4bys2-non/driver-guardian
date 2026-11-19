@@ -104,7 +104,7 @@ class KinematicFeatureExtractor(nn.Module):
             left_eye_idx: int = 36,
             right_eye_idx: int = 45,
             eps: float = 1e-2,
-            static_shape_ratio: float = 0.55,
+            static_shape_ratio: float = 0.35,
             fps: float = 10.0,
             num_nodes: int = 68,
     ):
@@ -200,24 +200,57 @@ class KinematicFeatureExtractor(nn.Module):
         w_right_eye = torch.norm(x[:, :, :, 45:46] - x[:, :, :, 42:43], p=2, dim=1, keepdim=True)
         w_mouth = torch.norm(x[:, :, :, 54:55] - x[:, :, :, 48:49], p=2, dim=1, keepdim=True)
 
+        # Biên độ mở mắt dọc chuẩn hóa theo phân vị cao P85 (Open-Eye Upper-Quantile Calibration)
+        le_vert = 0.5 * (
+            torch.abs(x[:, 1:2, :, 37:38] - x[:, 1:2, :, 41:42])
+            + torch.abs(x[:, 1:2, :, 38:39] - x[:, 1:2, :, 40:41])
+        )
+        re_vert = 0.5 * (
+            torch.abs(x[:, 1:2, :, 43:44] - x[:, 1:2, :, 47:48])
+            + torch.abs(x[:, 1:2, :, 44:45] - x[:, 1:2, :, 46:47])
+        )
+        raw_eye_open = 0.5 * (le_vert + re_vert)  # (B, 1, T, 1)
+        eye_open_2d = raw_eye_open.view(B, T)
+        if mask is not None:
+            valid_open_2d = eye_open_2d.masked_fill(mask[:, 0, :, 0] <= 0.5, float("nan"))
+            cur_eye_p85 = torch.nanquantile(valid_open_2d, 0.85, dim=1)
+            cur_eye_p85 = torch.where(torch.isnan(cur_eye_p85), 0.12 * ref_iod.view(B), cur_eye_p85)
+        else:
+            cur_eye_p85 = torch.quantile(eye_open_2d, 0.85, dim=1)
+        cur_eye_p85 = torch.clamp(cur_eye_p85.view(B, 1, 1, 1), min=0.045 * ref_iod, max=0.45 * ref_iod)
+
+        if kin_state is not None and "baseline_eye_open" in kin_state:
+            ref_eye_open = kin_state["baseline_eye_open"].to(device=x.device, dtype=raw_eye_open.dtype)
+            next_eye_open = torch.where(has_valid, 0.85 * ref_eye_open + 0.15 * cur_eye_p85, ref_eye_open)
+            eff_eye_open = torch.maximum(0.75 * ref_eye_open + 0.25 * cur_eye_p85, 0.045 * ref_iod)
+        else:
+            eff_eye_open = cur_eye_p85
+            next_eye_open = cur_eye_p85
+
         scale_left_eye = torch.maximum(w_left_eye, 0.22 * iod_scale).clamp(min=self.eps)
         scale_right_eye = torch.maximum(w_right_eye, 0.22 * iod_scale).clamp(min=self.eps)
         scale_mouth = torch.maximum(w_mouth, 0.32 * iod_scale).clamp(min=self.eps)
+        eye_y_scale_l = torch.maximum(
+            0.65 * eff_eye_open + 0.35 * (0.32 * scale_left_eye), 0.045 * iod_scale
+        ).clamp(min=self.eps)
+        eye_y_scale_r = torch.maximum(
+            0.65 * eff_eye_open + 0.35 * (0.32 * scale_right_eye), 0.045 * iod_scale
+        ).clamp(min=self.eps)
 
         pos_feat = pos_norm.clone()
         # Lông mày trái & phải (quy chiếu về tâm khóe mắt theo iod_scale)
         pos_feat[:, :, :, 17:22] = (x[:, :, :, 17:22] - c_left_eye) / iod_scale
         pos_feat[:, :, :, 22:27] = (x[:, :, :, 22:27] - c_right_eye) / iod_scale
 
-        # Mắt trái (36..41): trục ngang theo iod_scale, trục dọc theo bề rộng hốc mắt (bảo toàn EAR)
+        # Mắt trái (36..41): trục ngang theo iod_scale, trục dọc theo biên độ mở mắt P85 của tài xế
         rel_le = x[:, :, :, 36:42] - c_left_eye
         pos_feat[:, 0:1, :, 36:42] = rel_le[:, 0:1] / iod_scale
-        pos_feat[:, 1:2, :, 36:42] = rel_le[:, 1:2] / (scale_left_eye * 0.35)
+        pos_feat[:, 1:2, :, 36:42] = rel_le[:, 1:2] / eye_y_scale_l
 
-        # Mắt phải (42..47): trục ngang theo iod_scale, trục dọc theo bề rộng hốc mắt (bảo toàn EAR)
+        # Mắt phải (42..47): trục ngang theo iod_scale, trục dọc theo biên độ mở mắt P85 của tài xế
         rel_re = x[:, :, :, 42:48] - c_right_eye
         pos_feat[:, 0:1, :, 42:48] = rel_re[:, 0:1] / iod_scale
-        pos_feat[:, 1:2, :, 42:48] = rel_re[:, 1:2] / (scale_right_eye * 0.35)
+        pos_feat[:, 1:2, :, 42:48] = rel_re[:, 1:2] / eye_y_scale_r
 
         # Miệng (48..67): trục ngang theo iod_scale, trục dọc theo bề rộng miệng (bảo toàn MAR)
         rel_mo = x[:, :, :, 48:68] - c_mouth
@@ -241,14 +274,25 @@ class KinematicFeatureExtractor(nn.Module):
         else:
             cur_jn_mean = pos_jn.mean(dim=2, keepdim=True)
 
-        # Dùng baseline cục bộ trên từng cửa sổ 60s để tránh tích lũy độ lệch DC liên cửa sổ khi đổi tư thế
-        ref_org_mean = cur_org_mean
-        ref_jn_mean = cur_jn_mean
-        next_org_mean = cur_org_mean
-        next_jn_mean = cur_jn_mean
+        # Neo baseline nhân quả từ cửa sổ đầu tiên để bảo toàn độ sụp mi lũy tiến qua các cửa sổ
+        if kin_state is not None and "baseline_org_mean" in kin_state and "baseline_jn_mean" in kin_state:
+            prev_org = kin_state["baseline_org_mean"].to(device=x.device, dtype=pos_org.dtype)
+            prev_jn = kin_state["baseline_jn_mean"].to(device=x.device, dtype=pos_jn.dtype)
+            ref_org_mean = 0.65 * prev_org + 0.35 * cur_org_mean
+            ref_jn_mean = 0.50 * prev_jn + 0.50 * cur_jn_mean
+            next_org_mean = torch.where(has_valid, 0.85 * prev_org + 0.15 * cur_org_mean, prev_org)
+            next_jn_mean = torch.where(has_valid, 0.85 * prev_jn + 0.15 * cur_jn_mean, prev_jn)
+        else:
+            ref_org_mean = cur_org_mean
+            ref_jn_mean = cur_jn_mean
+            next_org_mean = cur_org_mean
+            next_jn_mean = cur_jn_mean
 
         if self.static_shape_ratio < 0.999:
-            pos_feat[:, :, :, organ_indices] = (pos_org - ref_org_mean) + self.static_shape_ratio * ref_org_mean
+            axis_ratio = torch.tensor(
+                [0.15, self.static_shape_ratio], device=x.device, dtype=pos_org.dtype
+            ).view(1, 2, 1, 1)
+            pos_feat[:, :, :, organ_indices] = (pos_org - ref_org_mean) + axis_ratio * ref_org_mean
 
         pos_feat[:, :, :, jaw_nose_indices] = (pos_jn - ref_jn_mean) + 0.20 * pos_jn
         # Khuếch đại nhẹ vùng mắt (36..47) và miệng (48..67)
@@ -302,10 +346,10 @@ class KinematicFeatureExtractor(nn.Module):
             vel_rms = torch.sqrt(vel_norm.pow(2).mean(dim=(2, 3), keepdim=True) + 1e-6)
             acc_rms = torch.sqrt(acc_norm.pow(2).mean(dim=(2, 3), keepdim=True) + 1e-6)
 
-        # Hybrid Instance-Soft Kinematic Normalization: đồng bộ thang vận tốc giữa UL-DD và UTA-RLDD
-        fps_ratio = 20.0 / self.fps
-        vel_scale = torch.clamp(vel_rms, min=0.012 * fps_ratio, max=0.10 * fps_ratio) / (0.030 * fps_ratio)
-        acc_scale = torch.clamp(acc_rms, min=0.010 * fps_ratio, max=0.08 * fps_ratio) / (0.022 * fps_ratio)
+        # Hybrid Instance-Soft Kinematic Normalization: đồng bộ thang vận tốc thực tế ở 10 FPS
+        dt_scale = 10.0 / self.fps
+        vel_scale = torch.clamp(vel_rms, min=0.004 * dt_scale, max=0.040 * dt_scale) / (0.012 * dt_scale)
+        acc_scale = torch.clamp(acc_rms, min=0.003 * dt_scale, max=0.035 * dt_scale) / (0.009 * dt_scale)
         vel_norm = (vel_norm / vel_scale) * 0.50
         acc_norm = (acc_norm / acc_scale) * 0.50
 
@@ -319,6 +363,7 @@ class KinematicFeatureExtractor(nn.Module):
                 "baseline_iod": next_iod.detach(),
                 "baseline_org_mean": next_org_mean.detach(),
                 "baseline_jn_mean": next_jn_mean.detach(),
+                "baseline_eye_open": next_eye_open.detach(),
             }
             return out, new_kin_state
         return out
@@ -427,7 +472,7 @@ class MultimodalFusionModule(nn.Module):
             left_eye_idx: int = 36,
             right_eye_idx: int = 45,
             eps: float = 1e-2,
-            static_shape_ratio: float = 0.55,
+            static_shape_ratio: float = 0.35,
             fps: float = 10.0,
     ):
         super().__init__()
@@ -489,7 +534,8 @@ class MultimodalFusionModule(nn.Module):
             mask: Optional[torch.Tensor] = None,
             kin_state: Optional[Dict[str, torch.Tensor]] = None,
             return_kin_state: bool = False,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
+            return_mask: bool = False,
+    ) -> Union[torch.Tensor, Tuple[Any, ...]]:
         """
         Args:
             coords: Chuỗi tọa độ mốc [B, T, N, 2] (hoặc [B, T, N, 3] từ cache cũ).
@@ -497,8 +543,9 @@ class MultimodalFusionModule(nn.Module):
             mask: Temporal float mask [B, 1, T, 1].
             kin_state: Trạng thái baseline nhân quả truyền giữa các cửa sổ trượt.
             return_kin_state: True để trả kèm next_kin_state cho streaming/mobile.
+            return_mask: True để trả kèm mặt nạ frame hợp lệ [B, T] (kết hợp lengths & ~is_missing).
         Returns:
-            X: Tensor đặc trưng đồ thị [B, D, N, T] (hoặc tuple (X, next_kin_state)).
+            X: Tensor đặc trưng đồ thị [B, D, N, T] (hoặc tuple (X, next_kin_state[, frame_valid_mask])).
         """
         if coords.dim() == 4:
             if coords.size(-1) >= 2:
@@ -555,8 +602,13 @@ class MultimodalFusionModule(nn.Module):
             X = H.permute(0, 3, 2, 1).contiguous()
 
         out_x = X.to(orig_dtype)
+        frame_valid_mask = temporal_mask[:, 0, :, 0] > 0.5
+        if return_kin_state and return_mask:
+            return out_x, next_kin_state, frame_valid_mask
         if return_kin_state:
             return out_x, next_kin_state
+        if return_mask:
+            return out_x, frame_valid_mask
         return out_x
 
 
@@ -1198,7 +1250,7 @@ class LiteFatV1(nn.Module):
             freeze_backbone: bool = False,
             vertical_pairs: Optional[List[Tuple[int, int]]] = None,
             cross_region_pairs: Optional[List[Tuple[int, int]]] = None,
-            static_shape_ratio: float = 0.55,
+            static_shape_ratio: float = 0.35,
             use_dann: bool = False,
             num_domains: int = 2,
     ):
@@ -1404,6 +1456,7 @@ class LiteFatV1(nn.Module):
             self,
             X: torch.Tensor,
             lengths: Optional[torch.Tensor] = None,
+            frame_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Chạy đồ thị STGL và Attentive Spatial Node Pooling cho 1 cửa sổ."""
         A_adp = self.adaptive_adj()
@@ -1411,7 +1464,13 @@ class LiteFatV1(nn.Module):
 
         B, _, _, T = X.shape
         t_mask = None
-        if lengths is not None:
+        if frame_mask is not None:
+            t_mask = frame_mask.to(device=X.device).float().view(B, 1, 1, T)
+            if lengths is not None:
+                t_idx = torch.arange(T, device=X.device).unsqueeze(0)
+                len_mask = (t_idx < lengths.to(X.device).unsqueeze(1)).float().view(B, 1, 1, T)
+                t_mask = t_mask * len_mask
+        elif lengths is not None:
             t_idx = torch.arange(T, device=X.device).unsqueeze(0)  # [1, T]
             t_mask = (t_idx < lengths.to(X.device).unsqueeze(1)).float().view(B, 1, 1, T)
 
@@ -1436,17 +1495,30 @@ class LiteFatV1(nn.Module):
             frame_feat: torch.Tensor,
             frame_logits: torch.Tensor,
             lengths: Optional[torch.Tensor] = None,
+            frame_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Gom tụ đặc trưng thời gian đa nhánh (Attn + Top-K + Mean) cho 1 cửa sổ."""
         B, T, _ = frame_feat.shape
         feat_norm = self.temp_norm(frame_feat)
         temp_scores = self.temporal_gate(feat_norm) * self.temp_scale  # [B, T, 1]
 
-        if lengths is not None:
-            valid_bool = (
-                torch.arange(T, device=frame_logits.device).unsqueeze(0)
-                < lengths.to(frame_logits.device).unsqueeze(1)
-            ).unsqueeze(-1)
+        if lengths is not None or frame_mask is not None:
+            if lengths is not None:
+                len_bool = (
+                    torch.arange(T, device=frame_logits.device).unsqueeze(0)
+                    < lengths.to(frame_logits.device).unsqueeze(1)
+                ).unsqueeze(-1)
+            else:
+                len_bool = torch.ones((B, T, 1), dtype=torch.bool, device=frame_logits.device)
+
+            if frame_mask is not None:
+                fm_bool = frame_mask.to(frame_logits.device).bool().view(B, T, 1)
+                raw_valid_bool = len_bool & fm_bool
+                has_any_valid = raw_valid_bool.any(dim=1, keepdim=True)
+                valid_bool = torch.where(has_any_valid, raw_valid_bool, len_bool)
+            else:
+                valid_bool = len_bool
+
             valid_mask = valid_bool.type_as(frame_logits)
             denom = valid_mask.sum(dim=1).clamp(min=1.0)
 
@@ -1458,7 +1530,8 @@ class LiteFatV1(nn.Module):
             feat_attn = (frame_feat * temp_weights).sum(dim=1)
 
             scores_2d = masked_scores.squeeze(-1)  # [B, T]
-            k_per = (lengths.float() * 0.25).round().clamp(min=1.0).long()  # [B]
+            valid_counts = valid_bool.squeeze(-1).long().sum(dim=1)
+            k_per = (valid_counts.float() * 0.25).round().clamp(min=1.0).long()  # [B]
             ranks = scores_2d.argsort(dim=1, descending=True).argsort(dim=1)  # [B, T]
             topk_mask = (ranks < k_per.unsqueeze(1)) & valid_bool.squeeze(-1)  # [B, T]
             feat_topk = (
@@ -1469,7 +1542,9 @@ class LiteFatV1(nn.Module):
             pooled_window_feat = 0.50 * feat_attn + 0.30 * feat_topk + 0.20 * feat_mean
             attn_frame_logits = (frame_logits * temp_weights).sum(dim=1)
 
-            active_col = (lengths > 0).to(frame_logits.device).view(B, 1)
+            active_col = (
+                (lengths > 0) if lengths is not None else valid_bool.squeeze(-1).any(dim=1)
+            ).to(frame_logits.device).view(B, 1)
             pooled_window_feat = pooled_window_feat * active_col.type_as(pooled_window_feat)
             attn_frame_logits = attn_frame_logits * active_col.type_as(attn_frame_logits)
         else:
@@ -1535,6 +1610,7 @@ class LiteFatV1(nn.Module):
             overlap_size: Optional[int] = None,
             stride_size: Optional[int] = None,
             kin_state: Optional[Dict[str, torch.Tensor]] = None,
+            frame_mask: Optional[torch.Tensor] = None,
             return_details: bool = False,
     ) -> Union[Tuple[torch.Tensor, torch.Tensor], Dict[str, Any]]:
         """
@@ -1544,7 +1620,9 @@ class LiteFatV1(nn.Module):
         eff_stride = self.stride_size if stride_size is None else int(max(1, stride_size))
         eff_overlap = self.overlap_size if overlap_size is None else int(max(0, overlap_size))
 
-        pooled_node_feat, frame_feat = self._extract_window_frame_features(X, lengths=lengths)
+        pooled_node_feat, frame_feat = self._extract_window_frame_features(
+            X, lengths=lengths, frame_mask=frame_mask
+        )
 
         prev_tail = prev_state.get("overlap_tail_feat") if prev_state is not None else None
         if prev_tail is not None:
@@ -1560,6 +1638,7 @@ class LiteFatV1(nn.Module):
             frame_feat,
             frame_logits,
             lengths=lengths,
+            frame_mask=frame_mask,
         )
 
         prev_mem = prev_state.get("memory_feat") if prev_state is not None else None
@@ -1647,6 +1726,7 @@ class LiteFatV1(nn.Module):
 
         full_frame_kss = lm_norm.new_full((B, T), self.kss_min, dtype=torch.float32)
         full_frame_logits = lm_norm.new_zeros((B, T, self.num_classes), dtype=torch.float32)
+        full_frame_valid_mask = torch.zeros((B, T), dtype=torch.bool, device=dev)
         written_mask = torch.zeros((B, T), dtype=torch.bool, device=dev)
 
         state = prev_state
@@ -1680,12 +1760,13 @@ class LiteFatV1(nn.Module):
             else:
                 sub_mask = None
 
-            X_sub, next_kin_state = self.fusion(
+            X_sub, next_kin_state, sub_frame_mask = self.fusion(
                 sub_landmarks,
                 d=sub_d,
                 mask=sub_mask,
                 kin_state=kin_state,
                 return_kin_state=True,
+                return_mask=True,
             )
             kin_state = next_kin_state
 
@@ -1704,6 +1785,7 @@ class LiteFatV1(nn.Module):
                 overlap_size=tail_overlap,
                 stride_size=tail_stride,
                 kin_state=kin_state,
+                frame_mask=sub_frame_mask,
                 return_details=True,
             )
             state = win_out["state"]
@@ -1723,9 +1805,11 @@ class LiteFatV1(nn.Module):
                 if s > 0:
                     full_frame_kss[:, :s] = w_frame_kss[:, :1]
                     full_frame_logits[:, :s, :] = w_frame_logits[:, :1, :]
+                    full_frame_valid_mask[:, :s] = sub_frame_mask[:, :1]
                     written_mask[:, :s] = True
                 full_frame_kss[:, s:e_valid] = w_frame_kss
                 full_frame_logits[:, s:e_valid, :] = w_frame_logits
+                full_frame_valid_mask[:, s:e_valid] = sub_frame_mask
                 written_mask[:, s:e_valid] = True
             else:
                 update_mask = local_valid | (~written_mask[:, s:e_valid])
@@ -1738,6 +1822,11 @@ class LiteFatV1(nn.Module):
                     update_mask.unsqueeze(-1),
                     w_frame_logits,
                     full_frame_logits[:, s:e_valid, :],
+                )
+                full_frame_valid_mask[:, s:e_valid] = torch.where(
+                    update_mask,
+                    sub_frame_mask,
+                    full_frame_valid_mask[:, s:e_valid],
                 )
                 written_mask[:, s:e_valid] = True
 
@@ -1790,6 +1879,7 @@ class LiteFatV1(nn.Module):
             "window_kss": window_kss,
             "window_logits": window_logits,
             "window_valid_mask": window_valid_mask,
+            "frame_valid_mask": full_frame_valid_mask,
             "domain_logits": clip_domain_logits,
             "window_domain_logits": window_domain_logits,
             "state": state,
@@ -1864,12 +1954,13 @@ class LiteFatV1(nn.Module):
                 )
 
             in_kin_state = prev_state.get("kin_state") if prev_state is not None else None
-            X, next_kin_state = self.fusion(
+            X, next_kin_state, frame_valid_mask = self.fusion(
                 lm_norm,
                 d=d,
                 mask=mask,
                 kin_state=in_kin_state,
                 return_kin_state=True,
+                return_mask=True,
             )
             win_out = self.forward_stgl_from_fused(
                 X,
@@ -1878,6 +1969,7 @@ class LiteFatV1(nn.Module):
                 overlap_size=ov_frames,
                 stride_size=str_frames,
                 kin_state=next_kin_state,
+                frame_mask=frame_valid_mask,
                 return_details=True,
             )
             out_dict = {
@@ -1892,6 +1984,7 @@ class LiteFatV1(nn.Module):
                     if lengths is not None
                     else torch.ones((lm_norm.size(0), 1), dtype=torch.bool, device=lm_norm.device)
                 ),
+                "frame_valid_mask": frame_valid_mask,
                 "domain_logits": win_out.get("domain_logits"),
                 "window_domain_logits": (
                     win_out["domain_logits"].unsqueeze(1)

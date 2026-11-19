@@ -42,6 +42,8 @@ class LiteFatLoss(nn.Module):
             frame_loss_weight: float = 0.3,
             window_loss_weight: float = 0.25,
             window_smooth_weight: float = 0.05,
+            boundary_margin_weight: float = 0.15,
+            uta_ordinal_sigma: float = 1.25,
             dann_weight: float = 0.02,
             huber_beta: float = 0.5,
             ordinal_sigma: float = 0.85,
@@ -65,10 +67,12 @@ class LiteFatLoss(nn.Module):
         self.frame_loss_weight = float(frame_loss_weight)
         self.window_loss_weight = float(window_loss_weight)
         self.window_smooth_weight = float(window_smooth_weight)
+        self.boundary_margin_weight = float(boundary_margin_weight)
         self.dann_weight = float(dann_weight)
 
         self.huber_beta = float(huber_beta)
         self.ordinal_sigma = float(max(1e-3, ordinal_sigma))
+        self.uta_ordinal_sigma = float(max(1e-3, uta_ordinal_sigma))
         self.label_smoothing = float(label_smoothing)
         self.alert_kss_threshold = float(alert_kss_threshold)
         self.mid_kss_threshold = float(mid_kss_threshold)
@@ -114,13 +118,41 @@ class LiteFatLoss(nn.Module):
             logits: torch.Tensor,
             target_kss: torch.Tensor,
             target_cls: torch.Tensor,
+            domain_targets: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Kết hợp 65% Ordinal Gaussian Soft-Label CE + 35% CrossEntropy chuẩn."""
+        """Kết hợp Ordinal Gaussian Soft-Label CE + CrossEntropy (tách biệt độ mịn cho UL-DD vs UTA-RLDD)."""
         ord_ce = self._ordinal_soft_cross_entropy(logits, target_kss)
         flat_logits = logits.float().reshape(-1, self.num_classes)
         flat_cls = target_cls.reshape(-1)
         std_ce = self.ce_raw(flat_logits, flat_cls).reshape(target_cls.shape)
-        return 0.65 * ord_ce + 0.35 * std_ce
+        loss_ul = 0.65 * ord_ce + 0.35 * std_ce
+        if domain_targets is None:
+            return loss_ul
+
+        dom = domain_targets.to(logits.device).long().view(-1)
+        while dom.dim() < target_cls.dim():
+            dom = dom.unsqueeze(-1)
+        is_uta = (dom == 1).expand_as(target_cls)
+        if not is_uta.any():
+            return loss_ul
+
+        # Với UTA-RLDD (chỉ có nhãn gộp {2,6,8}): dùng Gaussian rộng + NLL 3 vùng Regime
+        view_shape = [1] * (logits.dim() - 1) + [self.num_classes]
+        levels = self.kss_levels.view(*view_shape).to(logits.device)
+        dist_sq = (levels - target_kss.float().unsqueeze(-1)).pow(2)
+        soft_uta = F.softmax(-dist_sq / (2.0 * (self.uta_ordinal_sigma ** 2)), dim=-1)
+        log_probs = F.log_softmax(logits.float(), dim=-1)
+        ord_uta = -(soft_uta * log_probs).sum(dim=-1)
+
+        probs = log_probs.exp()
+        p_alert = probs[..., :4].sum(dim=-1).clamp(min=1e-6)
+        p_mid = probs[..., 4:6].sum(dim=-1).clamp(min=1e-6)
+        p_drowsy = probs[..., 6:].sum(dim=-1).clamp(min=1e-6)
+        reg_probs = torch.stack([p_alert, p_mid, p_drowsy], dim=-1)
+        reg_idx = torch.where(target_kss >= 6.5, 2, torch.where(target_kss >= 4.5, 1, 0)).long()
+        reg_ce = -torch.log(torch.gather(reg_probs, dim=-1, index=reg_idx.unsqueeze(-1)).squeeze(-1))
+        loss_uta = 0.70 * ord_uta + 0.30 * reg_ce
+        return torch.where(is_uta, loss_uta, loss_ul)
 
     def _unpack_predictions(
             self,
@@ -140,6 +172,7 @@ class LiteFatLoss(nn.Module):
             "window_kss": window_kss,
             "window_logits": window_logits,
             "window_valid_mask": None,
+            "frame_valid_mask": None,
             "domain_logits": None,
             "window_domain_logits": None,
         }
@@ -152,6 +185,7 @@ class LiteFatLoss(nn.Module):
             out["window_kss"] = predictions.get("window_kss", out["window_kss"])
             out["window_logits"] = predictions.get("window_logits", out["window_logits"])
             out["window_valid_mask"] = predictions.get("window_valid_mask", out["window_valid_mask"])
+            out["frame_valid_mask"] = predictions.get("frame_valid_mask", out["frame_valid_mask"])
             out["domain_logits"] = predictions.get("domain_logits", out["domain_logits"])
             out["window_domain_logits"] = predictions.get("window_domain_logits", out["window_domain_logits"])
         elif isinstance(predictions, (tuple, list)):
@@ -258,6 +292,8 @@ class LiteFatLoss(nn.Module):
             frame_target_cls: Optional[torch.Tensor],
             lengths: Optional[torch.Tensor],
             sample_weights: Optional[torch.Tensor],
+            frame_valid_mask: Optional[torch.Tensor] = None,
+            domain_targets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Causal Time-Weighted Top-K MIL Frame Loss cho KSS 1..9:
@@ -289,6 +325,13 @@ class LiteFatLoss(nn.Module):
             ramp = (0.5 + 0.5 * torch.linspace(0.0, 1.0, T, device=dev, dtype=torch.float32)).unsqueeze(0).expand(B, T)
             weight_matrix = ramp.clone()
 
+        if frame_valid_mask is not None and frame_valid_mask.shape == (B, T):
+            fvm = frame_valid_mask.to(dev).bool()
+            combined_valid = valid_mask & fvm
+            has_any_valid = combined_valid.any(dim=1, keepdim=True)
+            valid_mask = torch.where(has_any_valid, combined_valid, valid_mask)
+            weight_matrix = ramp * valid_mask.float()
+
         # Điểm xu hướng buồn ngủ của từng frame dùng để xếp hạng MIL Top-K
         if frame_kss is not None:
             drowsy_scores = frame_kss.float()
@@ -311,12 +354,13 @@ class LiteFatLoss(nn.Module):
                 ratio = self.topk_drowsy_ratio
 
             if ratio < 0.999:
-                k_b = max(1, min(t_len, int(round(t_len * ratio))))
-                if k_b < t_len:
+                n_valid_b = int(valid_mask[b, :t_len].sum().item())
+                k_b = max(1, min(n_valid_b, int(round(max(1, n_valid_b) * ratio))))
+                if k_b < n_valid_b:
                     _, topk_idx = torch.topk(drowsy_scores[b, :t_len], k=k_b, dim=0)
                     sample_mask = torch.zeros(T, dtype=torch.bool, device=dev)
                     sample_mask[topk_idx] = True
-                    mil_mask[b] = sample_mask
+                    mil_mask[b] = sample_mask & valid_mask[b]
 
         weight_matrix = weight_matrix * mil_mask.float()
         norm_weights = weight_matrix / weight_matrix.sum(dim=1, keepdim=True).clamp(min=1e-6)
@@ -343,7 +387,9 @@ class LiteFatLoss(nn.Module):
 
         loss_cls_per = None
         if frame_logits is not None:
-            loss_cls_per = self._classification_ordinal_loss(frame_logits, tgt_f_kss, tgt_f_cls)
+            loss_cls_per = self._classification_ordinal_loss(
+                frame_logits, tgt_f_kss, tgt_f_cls, domain_targets=domain_targets
+            )
 
         if loss_reg_per is not None and loss_cls_per is not None:
             per_frame_loss = 0.65 * loss_reg_per + 0.35 * loss_cls_per
@@ -367,6 +413,7 @@ class LiteFatLoss(nn.Module):
             lengths: Optional[torch.Tensor],
             sample_weights: Optional[torch.Tensor],
             window_valid_mask: Optional[torch.Tensor] = None,
+            domain_targets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Sliding-Window Causal & Smoothness Loss cho chuỗi dài > 60s:
@@ -416,7 +463,9 @@ class LiteFatLoss(nn.Module):
 
         win_cls = None
         if window_logits is not None:
-            win_cls = self._classification_ordinal_loss(window_logits, tgt_w_kss, tgt_w_cls)
+            win_cls = self._classification_ordinal_loss(
+                window_logits, tgt_w_kss, tgt_w_cls, domain_targets=domain_targets
+            )
 
         if win_reg is not None and win_cls is not None:
             per_win_loss = 0.65 * win_reg + 0.35 * win_cls
@@ -502,6 +551,7 @@ class LiteFatLoss(nn.Module):
         w_kss = unpacked["window_kss"]
         w_logits = unpacked["window_logits"]
         w_valid_mask = unpacked.get("window_valid_mask")
+        f_valid_mask = unpacked.get("frame_valid_mask")
         d_logits = unpacked.get("domain_logits")
         w_d_logits = unpacked.get("window_domain_logits")
 
@@ -543,9 +593,25 @@ class LiteFatLoss(nn.Module):
             else:
                 loss_clip_reg = torch.tensor(0.0, device=dev, dtype=torch.float32)
 
+            # 1b. Drowsy Boundary Margin Penalty quanh ngưỡng phân loại nhị phân KSS = 6.5
+            if c_kss is not None and self.boundary_margin_weight > 0:
+                c_kss_32 = c_kss.float()
+                is_drowsy_tgt = clip_target_kss >= 6.5
+                is_non_drowsy_tgt = clip_target_kss <= 6.0
+                margin_err = torch.where(
+                    is_drowsy_tgt,
+                    F.relu(6.65 - c_kss_32),
+                    torch.where(is_non_drowsy_tgt, F.relu(c_kss_32 - 6.35), torch.zeros_like(c_kss_32)),
+                )
+                loss_boundary = self._weighted_mean(margin_err.pow(2), sample_weights=sample_weights)
+            else:
+                loss_boundary = torch.tensor(0.0, device=dev, dtype=torch.float32)
+
             # 2. Clip Ordinal Gaussian Soft-Label + CrossEntropy Loss
             if c_logits is not None and self.clip_cls_weight > 0:
-                cls_loss_vec = self._classification_ordinal_loss(c_logits, clip_target_kss, clip_target_cls)
+                cls_loss_vec = self._classification_ordinal_loss(
+                    c_logits, clip_target_kss, clip_target_cls, domain_targets=domain_targets
+                )
                 loss_clip_cls = self._weighted_mean(cls_loss_vec, sample_weights=sample_weights)
             else:
                 loss_clip_cls = torch.tensor(0.0, device=dev, dtype=torch.float32)
@@ -561,6 +627,8 @@ class LiteFatLoss(nn.Module):
                     frame_target_cls=frame_target_cls,
                     lengths=lengths,
                     sample_weights=sample_weights,
+                    frame_valid_mask=f_valid_mask,
+                    domain_targets=domain_targets,
                 )
             else:
                 loss_frame = torch.tensor(0.0, device=dev, dtype=torch.float32)
@@ -577,6 +645,7 @@ class LiteFatLoss(nn.Module):
                     lengths=lengths,
                     sample_weights=sample_weights,
                     window_valid_mask=w_valid_mask,
+                    domain_targets=domain_targets,
                 )
             else:
                 loss_window = torch.tensor(0.0, device=dev, dtype=torch.float32)
@@ -639,6 +708,7 @@ class LiteFatLoss(nn.Module):
 
             total_loss = (
                 self.clip_reg_weight * loss_clip_reg
+                + self.boundary_margin_weight * loss_boundary
                 + self.clip_cls_weight * loss_clip_cls
                 + self.frame_loss_weight * loss_frame
                 + self.window_loss_weight * loss_window
@@ -650,6 +720,7 @@ class LiteFatLoss(nn.Module):
             details = {
                 "loss_total": float(total_loss.detach().item()),
                 "loss_clip_reg": float(loss_clip_reg.detach().item()),
+                "loss_boundary": float(loss_boundary.detach().item()),
                 "loss_clip_cls": float(loss_clip_cls.detach().item()),
                 "loss_frame": float(loss_frame.detach().item()),
                 "loss_window": float(loss_window.detach().item()),

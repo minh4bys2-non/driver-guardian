@@ -197,6 +197,8 @@ class LiteFatTrainer:
             frame_loss_weight=self.cfg.frame_loss_weight,
             window_loss_weight=self.cfg.window_loss_weight,
             window_smooth_weight=self.cfg.window_smooth_weight,
+            boundary_margin_weight=float(getattr(self.cfg, "boundary_margin_weight", 0.15)),
+            uta_ordinal_sigma=float(getattr(self.cfg, "uta_ordinal_sigma", 1.25)),
             dann_weight=float(getattr(self.cfg, "dann_weight", 0.05)),
             huber_beta=self.cfg.huber_beta,
             ordinal_sigma=self.cfg.ordinal_sigma,
@@ -314,6 +316,7 @@ class LiteFatTrainer:
         self.best_val_score = info["best_val_score"]
         self.best_val_mae = info["best_val_mae"]
         self.best_val_f1 = info["best_val_f1"]
+        self.early_stop_counter = int(info.get("early_stop_counter", 0))
         if info.get("scheduler") is not None:
             self.scheduler = info["scheduler"]
         if isinstance(info.get("history"), list):
@@ -395,6 +398,7 @@ class LiteFatTrainer:
         total_loss = 0.0
         comp_sums: Dict[str, float] = {
             "loss_clip_reg": 0.0,
+            "loss_boundary": 0.0,
             "loss_clip_cls": 0.0,
             "loss_frame": 0.0,
             "loss_window": 0.0,
@@ -647,7 +651,7 @@ class LiteFatTrainer:
         """Ghi toàn bộ chỉ số KSS & loss vào TensorBoard."""
         self.writer.add_scalar("Loss/Train", train_m["loss"], epoch)
         self.writer.add_scalar("Loss/Val", val_m["loss"], epoch)
-        for comp in ("loss_clip_reg", "loss_clip_cls", "loss_frame", "loss_window", "loss_smooth", "loss_domain"):
+        for comp in ("loss_clip_reg", "loss_boundary", "loss_clip_cls", "loss_frame", "loss_window", "loss_smooth", "loss_domain"):
             if comp in train_m:
                 self.writer.add_scalar(f"Loss/{comp}", train_m[comp], epoch)
 
@@ -748,6 +752,7 @@ class LiteFatTrainer:
                 "best_val_score": self.best_val_score,
                 "best_val_mae": self.best_val_mae,
                 "best_val_f1": self.best_val_f1,
+                "early_stop_counter": self.early_stop_counter,
                 "val_metrics": val_m,
                 "train_metrics": train_m,
                 "history": self.history,

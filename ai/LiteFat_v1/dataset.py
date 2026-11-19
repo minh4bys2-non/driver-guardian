@@ -918,6 +918,10 @@ class LiteFatDataset(Dataset):
     def _compute_window_span(self, duration_sec: float) -> Tuple[float, float]:
         """Xác định (start_sec, win_sec) thống nhất cho cả đọc video trực tiếp và đọc cache."""
         if self.window_sec is None:
+            if self.split == "train" and duration_sec > 90.0:
+                max_jitter = min(25.0, max(0.0, duration_sec - 65.0))
+                start_sec = random.uniform(0.0, max_jitter) if max_jitter > 0.0 else 0.0
+                return start_sec, duration_sec - start_sec
             return 0.0, duration_sec
 
         if self.split != "train":
@@ -997,6 +1001,12 @@ class LiteFatDataset(Dataset):
         if (self.window_sec is None or (self.split != "train" and self.eval_window_mode == "full")) and abs(
             self.time_interval - cache_dt
         ) < 1e-5:
+            if self.split == "train" and self.window_sec is None:
+                min_keep = int(round(65.0 / cache_dt))
+                max_offset = min(int(round(25.0 / cache_dt)), max(0, T_cache - min_keep))
+                if max_offset > 0:
+                    start_pos = random.randint(0, max_offset)
+                    return np.arange(start_pos, T_cache, dtype=int)
             return np.arange(T_cache, dtype=int)
 
         start_sec, win_sec = self._compute_window_span(duration_sec)
@@ -1424,12 +1434,15 @@ def build_litefat_dataloaders(
         if subject_balanced_sampling:
             ds_label_counts: Counter = Counter()
             sub_label_counts: Counter = Counter()
+            ds_reg_classes: Dict[Tuple[str, int], set] = defaultdict(set)
             for s in train_ds.samples:
                 ds_name = str(s.get("dataset", "unknown"))
                 sub = str(s.get("subject_id", "unknown"))
                 lbl = int(s.get("label", 1))
+                reg = 0 if lbl <= 4 else (1 if lbl <= 6 else 2)
                 ds_label_counts[(ds_name, lbl)] += 1
                 sub_label_counts[(ds_name, sub, lbl)] += 1
+                ds_reg_classes[(ds_name, reg)].add(lbl)
 
             raw_weights: List[float] = []
             ds_totals: Counter = Counter()
@@ -1437,15 +1450,28 @@ def build_litefat_dataloaders(
                 ds_name = str(s.get("dataset", "unknown"))
                 sub = str(s.get("subject_id", "unknown"))
                 lbl = int(s.get("label", 1))
+                reg = 0 if lbl <= 4 else (1 if lbl <= 6 else 2)
+                n_cls_in_reg = max(1, len(ds_reg_classes[(ds_name, reg)]))
                 w = 1.0 / (
                     float(max(1, ds_label_counts[(ds_name, lbl)]))
+                    * float(n_cls_in_reg)
                     * math.sqrt(float(max(1, sub_label_counts[(ds_name, sub, lbl)])))
                 )
                 raw_weights.append(w)
                 ds_totals[ds_name] += w
 
+            present_ds = list(ds_totals.keys())
+            ds_quota: Dict[str, float] = {}
+            if len(present_ds) == 2 and any(d.upper().startswith("UL") for d in present_ds):
+                for d in present_ds:
+                    ds_quota[d] = 0.60 if d.upper().startswith("UL") else 0.40
+            else:
+                for d in present_ds:
+                    ds_quota[d] = 1.0 / float(max(1, len(present_ds)))
+
             sample_weights = [
-                w / max(1e-12, float(ds_totals[str(s.get("dataset", "unknown"))]))
+                ds_quota[str(s.get("dataset", "unknown"))]
+                * (w / max(1e-12, float(ds_totals[str(s.get("dataset", "unknown"))])))
                 for s, w in zip(train_ds.samples, raw_weights)
             ]
             train_sampler = torch.utils.data.WeightedRandomSampler(

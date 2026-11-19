@@ -821,6 +821,7 @@ def load_checkpoint(
     best_val_score = float(checkpoint.get("best_val_score", -1.0))
     best_val_mae = float(checkpoint.get("best_val_mae", float("inf")))
     best_val_f1 = float(checkpoint.get("best_val_f1", -1.0))
+    early_stop_counter = int(checkpoint.get("early_stop_counter", 0))
 
     if best_epoch < 0 and save_dir is not None:
         best_json_path = Path(save_dir) / "best_metrics.json"
@@ -870,6 +871,7 @@ def load_checkpoint(
         "best_val_score": best_val_score,
         "best_val_mae": best_val_mae,
         "best_val_f1": best_val_f1,
+        "early_stop_counter": early_stop_counter,
         "scheduler": scheduler,
         "history": checkpoint.get("history", []),
         "checkpoint": checkpoint,

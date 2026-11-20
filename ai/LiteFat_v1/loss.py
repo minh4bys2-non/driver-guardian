@@ -42,9 +42,9 @@ class LiteFatLoss(nn.Module):
             frame_loss_weight: float = 0.3,
             window_loss_weight: float = 0.25,
             window_smooth_weight: float = 0.05,
-            boundary_margin_weight: float = 0.05,
+            boundary_margin_weight: float = 0.15,
             uta_ordinal_sigma: float = 1.25,
-            dann_weight: float = 0.05,
+            dann_weight: float = 0.15,
             huber_beta: float = 0.5,
             ordinal_sigma: float = 0.85,
             label_smoothing: float = 0.05,
@@ -56,8 +56,14 @@ class LiteFatLoss(nn.Module):
             window_sec: float = 60.0,
             stride_sec: float = 45.0,
             smooth_margin: float = 1.0,
+            uta_reg_mode: str = "point",
+            uta_interval_center_weight: float = 0.50,
+            boundary_drowsy_min: float = 6.70,
+            boundary_nondrowsy_max: float = 6.20,
     ):
         super().__init__()
+        if uta_reg_mode not in ("point", "interval", "interval_fixed"):
+            raise ValueError(f"uta_reg_mode không hợp lệ: {uta_reg_mode!r}. Chỉ nhận 'point', 'interval', hoặc 'interval_fixed'.")
         self.num_classes = int(num_classes)
         self.kss_min = float(kss_min)
         self.kss_max = float(kss_max)
@@ -69,6 +75,10 @@ class LiteFatLoss(nn.Module):
         self.window_smooth_weight = float(window_smooth_weight)
         self.boundary_margin_weight = float(boundary_margin_weight)
         self.dann_weight = float(dann_weight)
+        self.uta_reg_mode = str(uta_reg_mode)
+        self.uta_interval_center_weight = float(uta_interval_center_weight)
+        self.boundary_drowsy_min = float(boundary_drowsy_min)
+        self.boundary_nondrowsy_max = float(boundary_nondrowsy_max)
 
         self.huber_beta = float(huber_beta)
         self.ordinal_sigma = float(max(1e-3, ordinal_sigma))
@@ -142,10 +152,11 @@ class LiteFatLoss(nn.Module):
         dist_sq = (levels - target_kss.float().unsqueeze(-1)).pow(2)
         log_scores = -dist_sq / (2.0 * (self.uta_ordinal_sigma ** 2))
         t_exp = target_kss.float().unsqueeze(-1)
+        mid_upper = 6.0 if self.uta_reg_mode == "point" else 6.5
         regime_support = torch.where(
             t_exp >= 6.5,
             levels >= 6.5,
-            torch.where(t_exp >= 4.5, (levels >= 4.0) & (levels <= 6.5), levels <= 4.5),
+            torch.where(t_exp >= 4.5, (levels >= 4.0) & (levels <= mid_upper), levels <= 4.5),
         )
         log_scores = log_scores.masked_fill(~regime_support, -1e4)
         soft_uta = F.softmax(log_scores, dim=-1)
@@ -183,7 +194,7 @@ class LiteFatLoss(nn.Module):
         else:
             loss_ul = smooth_l1
 
-        if domain_targets is None:
+        if domain_targets is None or self.uta_reg_mode == "point":
             return loss_ul
 
         dom = domain_targets.to(p.device).long().view(-1)
@@ -193,16 +204,25 @@ class LiteFatLoss(nn.Module):
         if not is_uta.any():
             return loss_ul
 
-        lo = torch.where(t >= 6.5, 6.8, torch.where(t >= 4.5, 4.5, 1.0))
-        hi = torch.where(t >= 6.5, 9.0, torch.where(t >= 4.5, 6.2, 4.0))
-        center = torch.where(t >= 6.5, 7.8, torch.where(t >= 4.5, 5.4, 2.5))
+        if self.uta_reg_mode == "interval":
+            lo = torch.where(t >= 6.5, 6.8, torch.where(t >= 4.5, 4.5, 1.0))
+            hi = torch.where(t >= 6.5, 9.0, torch.where(t >= 4.5, 6.2, 4.0))
+            center = torch.where(t >= 6.5, 7.8, torch.where(t >= 4.5, 5.4, 2.5))
+            center_weight = 0.15
+        else:
+            # interval_fixed: dùng đúng nhãn thật {2, 6, 8} làm tâm và khớp biên vùng [1,4] / [4.5,6.5] / [6.5,9]
+            lo = torch.where(t >= 6.5, 6.5, torch.where(t >= 4.5, 4.5, 1.0))
+            hi = torch.where(t >= 6.5, 9.0, torch.where(t >= 4.5, 6.5, 4.0))
+            center = t
+            center_weight = self.uta_interval_center_weight
+
         dist_out = F.relu(lo - p) + F.relu(p - hi)
         out_l1 = F.smooth_l1_loss(dist_out, torch.zeros_like(dist_out), beta=self.huber_beta, reduction="none")
         center_l1 = F.smooth_l1_loss(p, center, beta=self.huber_beta, reduction="none")
         if include_mse:
-            loss_uta = (0.75 * out_l1 + 0.25 * dist_out.pow(2)) + 0.15 * center_l1
+            loss_uta = (0.75 * out_l1 + 0.25 * dist_out.pow(2)) + center_weight * center_l1
         else:
-            loss_uta = out_l1 + 0.15 * center_l1
+            loss_uta = out_l1 + center_weight * center_l1
         return torch.where(is_uta, loss_uta, loss_ul)
 
     def _unpack_predictions(
@@ -655,8 +675,8 @@ class LiteFatLoss(nn.Module):
                 is_non_drowsy_tgt = clip_target_kss <= 6.0
                 margin_err = torch.where(
                     is_drowsy_tgt,
-                    F.relu(6.65 - c_kss_32),
-                    torch.where(is_non_drowsy_tgt, F.relu(c_kss_32 - 6.30), torch.zeros_like(c_kss_32)),
+                    F.relu(self.boundary_drowsy_min - c_kss_32),
+                    torch.where(is_non_drowsy_tgt, F.relu(c_kss_32 - self.boundary_nondrowsy_max), torch.zeros_like(c_kss_32)),
                 )
                 loss_bnd_clip = self._weighted_mean(margin_err.pow(2), sample_weights=sample_weights)
 
@@ -676,8 +696,8 @@ class LiteFatLoss(nn.Module):
                     tgt_w_b = clip_target_kss.unsqueeze(1).expand(B_bw, W_bw)
                     margin_err_w = torch.where(
                         tgt_w_b >= 6.5,
-                        F.relu(6.65 - w_kss_32),
-                        torch.where(tgt_w_b <= 6.0, F.relu(w_kss_32 - 6.30), torch.zeros_like(w_kss_32)),
+                        F.relu(self.boundary_drowsy_min - w_kss_32),
+                        torch.where(tgt_w_b <= 6.0, F.relu(w_kss_32 - self.boundary_nondrowsy_max), torch.zeros_like(w_kss_32)),
                     )
                     per_sample_bnd_w = (margin_err_w.pow(2) * win_v_b.float()).sum(dim=1) / win_v_b.float().sum(dim=1).clamp(min=1.0)
                     loss_bnd_win = self._weighted_mean(

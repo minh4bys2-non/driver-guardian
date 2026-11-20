@@ -7,9 +7,13 @@
 # =====================================================================
 from __future__ import annotations
 
+import csv
+import datetime
 import json
 import math
 import multiprocessing as mp
+import subprocess
+import sys
 
 try:
     mp.set_start_method("fork", force=True)
@@ -39,10 +43,12 @@ from model import LiteFatV1
 from ultis import (
     ModelEMA,
     atomic_save,
+    binary_auc,
     compute_kss_metrics,
     configure_logging,
     load_checkpoint,
     load_pretrained_weights,
+    quadratic_weighted_kappa,
     seed_everything,
 )
 
@@ -72,6 +78,7 @@ class LiteFatTrainer:
         self.save_dir.mkdir(parents=True, exist_ok=True)
         self.logger = configure_logging(self.save_dir)
         self.cfg.save_json(self.save_dir / "config.json")
+        self._write_run_meta()
 
         log_path = Path(self.cfg.log_dir)
         log_path.mkdir(parents=True, exist_ok=True)
@@ -136,6 +143,8 @@ class LiteFatTrainer:
                 eval_window_mode=self.cfg.eval_window_mode,
                 drop_single_class_subjects=self.cfg.drop_single_class_subjects,
                 visual_frame_stride=self.cfg.visual_frame_stride,
+                sampler_uta_quota=float(getattr(self.cfg, "sampler_uta_quota", 0.40)),
+                sampler_weight_exponents=tuple(getattr(self.cfg, "sampler_weight_exponents", (1.0, 1.0, 0.5))),
             )
 
         if hasattr(self.train_loader, "dataset") and hasattr(self.train_loader.dataset, "return_meta"):
@@ -174,6 +183,9 @@ class LiteFatTrainer:
             cross_region_pairs=self.cfg.cross_region_pairs,
             static_shape_ratio=self.cfg.static_shape_ratio,
             use_dann=use_dann,
+            eye_vel_smooth=bool(getattr(self.cfg, "eye_vel_smooth", False)),
+            eye_y_scale_mode=str(getattr(self.cfg, "eye_y_scale_mode", "v6")),
+            window_attn_weighted_logits=bool(getattr(self.cfg, "window_attn_weighted_logits", False)),
         ).to(self.device)
         self.model.set_visual_context_enabled(self.cfg.use_visual_context)
         self.model.set_dann_enabled(use_dann)
@@ -197,9 +209,9 @@ class LiteFatTrainer:
             frame_loss_weight=self.cfg.frame_loss_weight,
             window_loss_weight=self.cfg.window_loss_weight,
             window_smooth_weight=self.cfg.window_smooth_weight,
-            boundary_margin_weight=float(getattr(self.cfg, "boundary_margin_weight", 0.05)),
+            boundary_margin_weight=float(getattr(self.cfg, "boundary_margin_weight", 0.15)),
             uta_ordinal_sigma=float(getattr(self.cfg, "uta_ordinal_sigma", 1.25)),
-            dann_weight=float(getattr(self.cfg, "dann_weight", 0.05)),
+            dann_weight=float(getattr(self.cfg, "dann_weight", 0.15)),
             huber_beta=self.cfg.huber_beta,
             ordinal_sigma=self.cfg.ordinal_sigma,
             label_smoothing=self.cfg.label_smoothing,
@@ -211,6 +223,10 @@ class LiteFatTrainer:
             window_sec=self.cfg.window_sec,
             stride_sec=self.cfg.stride_sec,
             smooth_margin=self.cfg.smooth_margin,
+            uta_reg_mode=str(getattr(self.cfg, "uta_reg_mode", "point")),
+            uta_interval_center_weight=float(getattr(self.cfg, "uta_interval_center_weight", 0.50)),
+            boundary_drowsy_min=float(getattr(self.cfg, "boundary_drowsy_min", 6.70)),
+            boundary_nondrowsy_max=float(getattr(self.cfg, "boundary_nondrowsy_max", 6.20)),
         ).to(self.device)
 
         # Biến theo dõi thực nghiệm
@@ -447,7 +463,7 @@ class LiteFatTrainer:
         num_batches = max(1, total_batches)
         total_train_steps = max(1, int(self.cfg.epochs) * num_batches)
         use_dann = bool(getattr(self.cfg, "use_dann", False))
-        dann_max_alpha = float(getattr(self.cfg, "dann_max_alpha", 0.15))
+        dann_max_alpha = float(getattr(self.cfg, "dann_max_alpha", 0.25))
         # Khi đã bật subject_balanced_sampling thì sampler đã cân bằng lớp/miền, tránh nhân chồng trọng số loss
         use_sample_weights = bool(getattr(self.cfg, "use_manifest_sample_weights", True)) and (
             not bool(getattr(self.cfg, "subject_balanced_sampling", False))
@@ -912,11 +928,210 @@ class LiteFatTrainer:
             "checkpoint": str(ckpt_target),
             "test_metrics": test_metrics,
             "per_subject_test": per_sub_test,
+            "bootstrap_ci_95": self._compute_bootstrap_ci(
+                targets_np=test_targets,
+                pred_kss_np=test_pred_kss,
+                logits_np=test_logits,
+                samples=test_samples,
+            ),
         }
         with open(self.save_dir / "test_metrics.json", "w", encoding="utf-8") as f:
             json.dump(output_payload, f, indent=2)
 
+        self._save_predictions_csv(
+            self.save_dir / "test_predictions.csv",
+            samples=test_samples,
+            targets_np=test_targets,
+            pred_kss_np=test_pred_kss,
+            logits_np=test_logits,
+        )
+
+        if self.val_loader is not None and len(getattr(self.val_loader, "dataset", [])) > 0:
+            _, val_targets, val_pred_kss, val_logits = self._evaluate_epoch(
+                self.val_loader,
+                split_name="val",
+                return_raw=True,
+                use_ema=False,
+            )
+            val_samples = getattr(self.val_loader.dataset, "samples", [])
+            self._save_predictions_csv(
+                self.save_dir / "val_predictions.csv",
+                samples=val_samples,
+                targets_np=val_targets,
+                pred_kss_np=val_pred_kss,
+                logits_np=val_logits,
+            )
+
+        ov_ci = output_payload["bootstrap_ci_95"].get("overall", {})
+        if ov_ci:
+            mae_ci = ov_ci.get("mae") or [0.0, 0.0]
+            qwk_ci = ov_ci.get("qwk") or [0.0, 0.0]
+            auc_ci = ov_ci.get("auc") or [0.0, 0.0]
+            self.logger.info(
+                f"[TEST Bootstrap 95% CI] MAE=[{mae_ci[0]:.3f}, {mae_ci[1]:.3f}] | "
+                f"QWK=[{qwk_ci[0]:.3f}, {qwk_ci[1]:.3f}] | AUC=[{auc_ci[0]:.3f}, {auc_ci[1]:.3f}]"
+            )
+
         return test_metrics
+
+    def _write_run_meta(self) -> None:
+        """Ghi lại metadata truy vết môi trường, git commit và các cờ ablation vào run_meta.json."""
+        repo_dir = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
+        git_commit = None
+        git_dirty_stat = None
+        try:
+            res_hash = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=str(repo_dir),
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            if res_hash.returncode == 0:
+                git_commit = res_hash.stdout.strip()
+            res_stat = subprocess.run(
+                ["git", "diff", "--stat"],
+                cwd=str(repo_dir),
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            if res_stat.returncode == 0:
+                git_dirty_stat = res_stat.stdout.strip()
+        except Exception:
+            pass
+
+        ablation_keys = (
+            "uta_reg_mode",
+            "uta_interval_center_weight",
+            "boundary_drowsy_min",
+            "boundary_nondrowsy_max",
+            "sampler_uta_quota",
+            "sampler_weight_exponents",
+            "eye_vel_smooth",
+            "eye_y_scale_mode",
+            "window_attn_weighted_logits",
+            "boundary_margin_weight",
+            "dann_weight",
+            "dann_max_alpha",
+            "static_shape_ratio",
+        )
+        meta = {
+            "timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "git_commit": git_commit,
+            "git_dirty_stat": git_dirty_stat,
+            "python_version": sys.version.split()[0],
+            "torch_version": torch.__version__,
+            "cuda_available": bool(torch.cuda.is_available()),
+            "device_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
+            "seed": int(self.cfg.seed),
+            "ablation_flags": {k: getattr(self.cfg, k, None) for k in ablation_keys},
+        }
+        with open(self.save_dir / "run_meta.json", "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2, ensure_ascii=False)
+
+    def _logits_to_drowsy_prob(self, pred_kss_np: np.ndarray, logits_np: np.ndarray) -> np.ndarray:
+        """Tính xác suất buồn ngủ (KSS >= 7) từ logits hoặc fallback tuyến tính từ pred_kss."""
+        if logits_np is not None and len(logits_np) == len(pred_kss_np) and logits_np.ndim == 2 and logits_np.shape[1] >= 2:
+            x = logits_np.astype(np.float64)
+            x = x - np.max(x, axis=-1, keepdims=True)
+            exp_x = np.exp(x)
+            probs = exp_x / np.sum(exp_x, axis=-1, keepdims=True).clip(min=1e-12)
+            start_idx = max(0, min(probs.shape[1] - 1, int(round(7.0 - self.cfg.kss_min))))
+            return probs[:, start_idx:].sum(axis=-1)
+        span = max(1e-6, float(self.cfg.kss_max - self.cfg.kss_min))
+        return np.clip((pred_kss_np.astype(np.float64) - self.cfg.kss_min) / span, 0.0, 1.0)
+
+    def _save_predictions_csv(
+            self,
+            out_path: Path,
+            samples: List[Dict[str, Any]],
+            targets_np: np.ndarray,
+            pred_kss_np: np.ndarray,
+            logits_np: np.ndarray,
+    ) -> None:
+        """Lưu dự đoán từng mẫu ra tệp CSV phục vụ chẩn đoán sai số."""
+        drowsy_probs = self._logits_to_drowsy_prob(pred_kss_np, logits_np)
+        min_int = int(round(self.cfg.kss_min))
+        max_int = int(round(self.cfg.kss_max))
+        with open(out_path, "w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "index", "key", "dataset", "subject_id", "video_id",
+                "target_kss", "pred_kss", "abs_err", "pred_kss_int", "drowsy_prob",
+            ])
+            for i in range(len(targets_np)):
+                s = samples[i] if i < len(samples) else {}
+                t_val = float(targets_np[i])
+                p_val = float(pred_kss_np[i])
+                p_int = int(np.clip(np.rint(p_val), min_int, max_int))
+                writer.writerow([
+                    i,
+                    str(s.get("key", "")),
+                    str(s.get("dataset", "")),
+                    str(s.get("subject_id", "")),
+                    str(s.get("video_id", "")),
+                    f"{t_val:.4f}",
+                    f"{p_val:.4f}",
+                    f"{abs(p_val - t_val):.4f}",
+                    p_int,
+                    f"{float(drowsy_probs[i]):.6f}",
+                ])
+
+    def _compute_bootstrap_ci(
+            self,
+            targets_np: np.ndarray,
+            pred_kss_np: np.ndarray,
+            logits_np: np.ndarray,
+            samples: List[Dict[str, Any]],
+            n_boot: int = 1000,
+    ) -> Dict[str, Any]:
+        """Tính Bootstrap 95% CI (MAE, QWK, AUC) trên tổng thể và từng bộ dữ liệu."""
+        n = len(targets_np)
+        if n == 0:
+            return {}
+        drowsy_probs = self._logits_to_drowsy_prob(pred_kss_np, logits_np)
+        min_int = int(round(self.cfg.kss_min))
+        max_int = int(round(self.cfg.kss_max))
+        rng = np.random.default_rng(int(self.cfg.seed))
+
+        def _boot_slice(mask: np.ndarray) -> Dict[str, Any]:
+            y = targets_np[mask]
+            p = pred_kss_np[mask]
+            pr = drowsy_probs[mask]
+            m_n = len(y)
+            if m_n == 0:
+                return {}
+            maes: List[float] = []
+            qwks: List[float] = []
+            aucs: List[float] = []
+            for _ in range(n_boot):
+                idx = rng.integers(0, m_n, size=m_n)
+                yb = y[idx]
+                pb = p[idx]
+                prb = pr[idx]
+                maes.append(float(np.mean(np.abs(pb - yb))))
+                qwks.append(quadratic_weighted_kappa(yb, pb, min_rating=min_int, max_rating=max_int))
+                ybin = (yb >= 7.0).astype(int)
+                if len(np.unique(ybin)) > 1:
+                    aucs.append(binary_auc(ybin, prb))
+            return {
+                "n": int(m_n),
+                "n_boot": int(n_boot),
+                "mae": [float(x) for x in np.percentile(maes, [2.5, 97.5])],
+                "qwk": [float(x) for x in np.percentile(qwks, [2.5, 97.5])],
+                "auc": [float(x) for x in np.percentile(aucs, [2.5, 97.5])] if aucs else None,
+            }
+
+        res: Dict[str, Any] = {
+            "overall": _boot_slice(np.ones(n, dtype=bool)),
+            "per_dataset": {},
+        }
+        if len(samples) == n:
+            ds_arr = np.array([str(s.get("dataset", "unknown")) for s in samples])
+            for d_name in np.unique(ds_arr):
+                res["per_dataset"][str(d_name)] = _boot_slice(ds_arr == d_name)
+        return res
 
 
 def main() -> None:

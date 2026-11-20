@@ -1372,6 +1372,8 @@ def build_litefat_dataloaders(
         eval_window_mode: str = "center",
         drop_single_class_subjects: bool = False,
         visual_frame_stride: int = 1,
+        sampler_uta_quota: float = 0.40,
+        sampler_weight_exponents: Tuple[float, float, float] = (1.0, 1.0, 0.5),
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """Khởi tạo bộ 3 DataLoader (train, val, test) cho mô hình LiteFat_v1 (KSS 1-9 @ 10 FPS)."""
     shared_extractor = (
@@ -1444,6 +1446,11 @@ def build_litefat_dataloaders(
                 sub_label_counts[(ds_name, sub, lbl)] += 1
                 ds_reg_classes[(ds_name, reg)].add(lbl)
 
+            exp_ds_lbl, exp_reg_cls, exp_sub_lbl = (
+                float(sampler_weight_exponents[0]),
+                float(sampler_weight_exponents[1]),
+                float(sampler_weight_exponents[2]),
+            )
             raw_weights: List[float] = []
             ds_totals: Counter = Counter()
             for s in train_ds.samples:
@@ -1453,18 +1460,20 @@ def build_litefat_dataloaders(
                 reg = 0 if lbl <= 4 else (1 if lbl <= 6 else 2)
                 n_cls_in_reg = max(1, len(ds_reg_classes[(ds_name, reg)]))
                 w = 1.0 / (
-                    (float(max(1, ds_label_counts[(ds_name, lbl)])) ** 0.70)
-                    * (float(n_cls_in_reg) ** 0.50)
-                    * (float(max(1, sub_label_counts[(ds_name, sub, lbl)])) ** 0.50)
+                    (float(max(1, ds_label_counts[(ds_name, lbl)])) ** exp_ds_lbl)
+                    * (float(n_cls_in_reg) ** exp_reg_cls)
+                    * (float(max(1, sub_label_counts[(ds_name, sub, lbl)])) ** exp_sub_lbl)
                 )
                 raw_weights.append(w)
                 ds_totals[ds_name] += w
 
             present_ds = list(ds_totals.keys())
             ds_quota: Dict[str, float] = {}
+            uta_quota = min(0.95, max(0.05, float(sampler_uta_quota)))
+            ul_quota = 1.0 - uta_quota
             if len(present_ds) == 2 and any(d.upper().startswith("UL") for d in present_ds):
                 for d in present_ds:
-                    ds_quota[d] = 0.65 if d.upper().startswith("UL") else 0.35
+                    ds_quota[d] = ul_quota if d.upper().startswith("UL") else uta_quota
             else:
                 for d in present_ds:
                     ds_quota[d] = 1.0 / float(max(1, len(present_ds)))

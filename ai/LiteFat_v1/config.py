@@ -32,8 +32,8 @@ class TrainConfig:
     use_cache: bool = False
     selected_datasets: Optional[List[str]] = None
 
-    checkpoint_dir: str = "./checkpoints/LiteFat_v1_novisual7"
-    log_dir: str = "./checkpoints/LiteFat_v1_novisual7/logs"
+    checkpoint_dir: str = "./checkpoints/LiteFat_v1_novisual8"
+    log_dir: str = "./checkpoints/LiteFat_v1_novisual8/logs"
 
     # =================================================================
     # 2. CHẾ ĐỘ ĐA PHƯƠNG THỨC & TRÍCH XUẤT PIPNET
@@ -108,7 +108,7 @@ class TrainConfig:
     # =================================================================
     # 6. THAM SỐ HUẤN LUYỆN, TỐI ƯU HÓA & CHECKPOINT
     # =================================================================
-    epochs: int = 45
+    epochs: int = 60
     batch_size: int = 2
     grad_accum_steps: int = 8
     num_workers: int = 0
@@ -121,7 +121,7 @@ class TrainConfig:
 
     ema_decay: float = 0.990
     use_ema_eval: bool = True
-    early_stop_patience: int = 10
+    early_stop_patience: int = 12
 
     lr: float = 3e-4
     backbone_lr: float = 3e-5
@@ -145,7 +145,7 @@ class TrainConfig:
     frame_loss_weight: float = 0.3
     window_loss_weight: float = 0.25
     window_smooth_weight: float = 0.05
-    boundary_margin_weight: float = 0.05
+    boundary_margin_weight: float = 0.15
 
     huber_beta: float = 0.5
     ordinal_sigma: float = 0.85
@@ -161,8 +161,21 @@ class TrainConfig:
     # 8. THAM SỐ DOMAIN-ADVERSARIAL TRAINING (REGIME-CONDITIONED DANN)
     # =================================================================
     use_dann: bool = True
-    dann_weight: float = 0.05
-    dann_max_alpha: float = 0.15
+    dann_weight: float = 0.15
+    dann_max_alpha: float = 0.25
+
+    # =================================================================
+    # 9. CỜ ABLATION & TÁI HIỆN HÀNH VI GIỮA CÁC PHIÊN BẢN (Mặc định = v6)
+    # =================================================================
+    uta_reg_mode: str = "point"  # "point" (v6) | "interval" (v7) | "interval_fixed"
+    uta_interval_center_weight: float = 0.50  # Chỉ dùng khi uta_reg_mode="interval_fixed"
+    boundary_drowsy_min: float = 6.70  # v6: 6.70 | v7: 6.65
+    boundary_nondrowsy_max: float = 6.20  # v6: 6.20 | v7: 6.30
+    sampler_uta_quota: float = 0.40  # v6: 0.40 | v7: 0.35
+    sampler_weight_exponents: Tuple[float, float, float] = (1.0, 1.0, 0.5)  # v6: (1.0, 1.0, 0.5) | v7: (0.70, 0.50, 0.50)
+    eye_vel_smooth: bool = False  # v6: False | v7: True
+    eye_y_scale_mode: str = "v6"  # "v6" | "v7"
+    window_attn_weighted_logits: bool = False  # v6: False (trung bình đều) | v7: True (theo trọng số aggregator)
 
     def to_dict(self) -> Dict[str, Any]:
         """Chuyển cấu hình thành từ điển thuần JSON-serializable."""
@@ -191,5 +204,8 @@ class TrainConfig:
         for pairs_key in ("vertical_pairs", "cross_region_pairs"):
             if pairs_key in filtered and isinstance(filtered[pairs_key], list):
                 filtered[pairs_key] = [(int(p[0]), int(p[1])) for p in filtered[pairs_key]]
+
+        if "sampler_weight_exponents" in filtered and isinstance(filtered["sampler_weight_exponents"], list):
+            filtered["sampler_weight_exponents"] = tuple(float(x) for x in filtered["sampler_weight_exponents"])
 
         return cls(**filtered)

@@ -107,8 +107,12 @@ class KinematicFeatureExtractor(nn.Module):
             static_shape_ratio: float = 0.15,
             fps: float = 10.0,
             num_nodes: int = 68,
+            eye_vel_smooth: bool = False,
+            eye_y_scale_mode: str = "v6",
     ):
         super().__init__()
+        if eye_y_scale_mode not in ("v6", "v7"):
+            raise ValueError(f"eye_y_scale_mode không hợp lệ: {eye_y_scale_mode!r}. Chỉ nhận 'v6' hoặc 'v7'.")
         self.nose_idx = nose_idx
         self.left_eye_idx = left_eye_idx
         self.right_eye_idx = right_eye_idx
@@ -116,6 +120,8 @@ class KinematicFeatureExtractor(nn.Module):
         self.static_shape_ratio = float(static_shape_ratio)
         self.fps = float(max(fps, 1.0))
         self.num_nodes = int(num_nodes)
+        self.eye_vel_smooth = bool(eye_vel_smooth)
+        self.eye_y_scale_mode = str(eye_y_scale_mode)
 
         # Chuẩn hóa phân phối riêng cho 6 kênh [x, y, dx, dy, d2x, d2y] chỉ tính trên frame hợp lệ
         self.channel_norm = MaskedBatchNorm2d(6, momentum=0.01, affine=True)
@@ -230,8 +236,16 @@ class KinematicFeatureExtractor(nn.Module):
         scale_left_eye = torch.maximum(w_left_eye, 0.22 * iod_scale).clamp(min=self.eps)
         scale_right_eye = torch.maximum(w_right_eye, 0.22 * iod_scale).clamp(min=self.eps)
         scale_mouth = torch.maximum(w_mouth, 0.32 * iod_scale).clamp(min=self.eps)
-        eye_y_scale_l = torch.maximum(eff_eye_open, 0.14 * scale_left_eye).clamp(min=self.eps)
-        eye_y_scale_r = torch.maximum(eff_eye_open, 0.14 * scale_right_eye).clamp(min=self.eps)
+        if self.eye_y_scale_mode == "v7":
+            eye_y_scale_l = torch.maximum(eff_eye_open, 0.14 * scale_left_eye).clamp(min=self.eps)
+            eye_y_scale_r = torch.maximum(eff_eye_open, 0.14 * scale_right_eye).clamp(min=self.eps)
+        else:
+            eye_y_scale_l = torch.maximum(
+                0.65 * eff_eye_open + 0.35 * (0.32 * scale_left_eye), 0.045 * iod_scale
+            ).clamp(min=self.eps)
+            eye_y_scale_r = torch.maximum(
+                0.65 * eff_eye_open + 0.35 * (0.32 * scale_right_eye), 0.045 * iod_scale
+            ).clamp(min=self.eps)
 
         pos_feat = pos_norm.clone()
         # Lông mày trái & phải (quy chiếu về tâm khóe mắt theo iod_scale)
@@ -327,8 +341,8 @@ class KinematicFeatureExtractor(nn.Module):
                 pair_valid = mask[:, :, 1:, :] * mask[:, :, :-1, :]
                 vel_local = vel_local * pair_valid
 
-            # Lọc mượt nhân quả 2-frame cho vận tốc mi mắt (36..47) nhằm giảm gai nhiễu chớp mắt nhanh
-            if vel_local.size(2) >= 2:
+            # Lọc mượt nhân quả 2-frame cho vận tốc mi mắt (36..47) khi bật cờ eye_vel_smooth
+            if self.eye_vel_smooth and vel_local.size(2) >= 2:
                 eye_vel = vel_local[:, :, :, 36:48].clone()
                 if mask is not None:
                     prev_valid = pair_valid[:, :, :-1, :]
@@ -498,6 +512,8 @@ class MultimodalFusionModule(nn.Module):
             eps: float = 1e-2,
             static_shape_ratio: float = 0.15,
             fps: float = 10.0,
+            eye_vel_smooth: bool = False,
+            eye_y_scale_mode: str = "v6",
     ):
         super().__init__()
         self.left_eye_idx = left_eye_idx
@@ -515,6 +531,8 @@ class MultimodalFusionModule(nn.Module):
             static_shape_ratio=static_shape_ratio,
             fps=fps,
             num_nodes=num_nodes,
+            eye_vel_smooth=eye_vel_smooth,
+            eye_y_scale_mode=eye_y_scale_mode,
         )
 
         # Giữ lại w (đóng băng) để tương thích backward compatibility với checkpoint cũ
@@ -1300,6 +1318,9 @@ class LiteFatV1(nn.Module):
             static_shape_ratio: float = 0.15,
             use_dann: bool = False,
             num_domains: int = 2,
+            eye_vel_smooth: bool = False,
+            eye_y_scale_mode: str = "v6",
+            window_attn_weighted_logits: bool = False,
     ):
         super().__init__()
         self.num_nodes = num_nodes
@@ -1321,6 +1342,7 @@ class LiteFatV1(nn.Module):
         self.use_dann = bool(use_dann)
         self.num_domains = int(max(2, num_domains))
         self.dann_alpha = 0.0
+        self.window_attn_weighted_logits = bool(window_attn_weighted_logits)
 
         # 1. MobileNetV3-Small trích xuất ngữ cảnh thị giác từ ảnh mặt
         self.context_encoder = MobileNetV3ContextEncoder(
@@ -1338,6 +1360,8 @@ class LiteFatV1(nn.Module):
             num_nodes=num_nodes,
             static_shape_ratio=static_shape_ratio,
             fps=float(self.fps),
+            eye_vel_smooth=eye_vel_smooth,
+            eye_y_scale_mode=eye_y_scale_mode,
         )
 
         # 3. Ma trận kề giải phẫu + tự thích nghi
@@ -2030,15 +2054,26 @@ class LiteFatV1(nn.Module):
         window_attn_logits = torch.stack(window_attn_logits_list, dim=1)  # [B, W_num, num_classes]
         window_valid_mask = torch.stack(window_valid_list, dim=1)  # [B, W_num]
 
-        final_feat, win_comb_w = self.accumulator.aggregate_window_states(
-            window_states,
-            window_valid_mask=window_valid_mask,
-            return_weights=True,
-        )
-        w_norm = win_comb_w / win_comb_w.sum(dim=1, keepdim=True).clamp(min=1e-6)
-        final_attn_logits = (
-            (window_attn_logits.float() * w_norm.unsqueeze(-1)).sum(dim=1)
-        ).to(final_feat.dtype)
+        if self.window_attn_weighted_logits:
+            final_feat, win_comb_w = self.accumulator.aggregate_window_states(
+                window_states,
+                window_valid_mask=window_valid_mask,
+                return_weights=True,
+            )
+            w_norm = win_comb_w / win_comb_w.sum(dim=1, keepdim=True).clamp(min=1e-6)
+            final_attn_logits = (
+                (window_attn_logits.float() * w_norm.unsqueeze(-1)).sum(dim=1)
+            ).to(final_feat.dtype)
+        else:
+            final_feat = self.accumulator.aggregate_window_states(
+                window_states,
+                window_valid_mask=window_valid_mask,
+            )
+            valid_w_float = window_valid_mask.float().unsqueeze(-1)
+            final_attn_logits = (
+                (window_attn_logits.float() * valid_w_float).sum(dim=1)
+                / valid_w_float.sum(dim=1).clamp(min=1.0)
+            ).to(final_feat.dtype)
 
         clip_kss, clip_logits = self.kss_head.forward_clip(
             final_feat,

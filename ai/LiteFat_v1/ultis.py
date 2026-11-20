@@ -514,7 +514,7 @@ def compute_kss_metrics(
       - Hồi quy liên tục: mae, rmse, within_1_acc, within_05_acc, exact_acc, pearson_r, spearman_r.
       - Thứ tự & Phân nhóm: qwk (Quadratic Weighted Kappa), regime_acc, regime_macro_f1 (3 vùng 1..4 / 5..6 / 7..9).
       - Phát hiện buồn ngủ nhị phân (KSS >= drowsy_threshold): accuracy, precision, recall, specificity, f1, f2, auc.
-      - Điểm tổng hợp val_score = 0.40*(1 - mae/4) + 0.30*within_1_acc + 0.30*max(0, qwk).
+      - Điểm tổng hợp val_score = 0.30*(1 - mae/4) + 0.15*(1 - rmse/4.5) + 0.20*within_1_acc + 0.20*max(0, qwk) + 0.15*regime_macro_f1.
     """
     y_true = np.asarray(targets, dtype=np.float64).ravel()
     y_pred = np.asarray(pred_kss, dtype=np.float64).ravel()
@@ -599,9 +599,11 @@ def compute_kss_metrics(
     bin_m = compute_binary_metrics(y_bin_true, y_bin_pred, probs_arr)
 
     val_score = (
-        0.40 * max(0.0, 1.0 - mae / 4.0)
-        + 0.30 * within_1_acc
-        + 0.30 * max(0.0, qwk)
+        0.30 * max(0.0, 1.0 - mae / 4.0)
+        + 0.15 * max(0.0, 1.0 - rmse / 4.5)
+        + 0.20 * within_1_acc
+        + 0.20 * max(0.0, qwk)
+        + 0.15 * regime_macro_f1
     )
 
     metrics: Dict[str, float] = {
@@ -796,10 +798,29 @@ def load_checkpoint(
                     f"Tái lập lịch trình Cosine mượt từ Epoch {start_epoch} đến Epoch {target_epochs}."
                 )
             remaining_epochs = max(1, int(target_epochs) - start_epoch + 1)
+            ckpt_groups = checkpoint.get("optimizer_state_dict", {}).get("param_groups", [])
+            base_lr_ref = float(
+                (ckpt_groups[0].get("initial_lr") if ckpt_groups else None)
+                or optimizer.param_groups[0].get("initial_lr")
+                or getattr(cfg, "lr", 3e-4)
+            )
+            saved_lr_ref = float(
+                ckpt_groups[0].get("lr", optimizer.param_groups[0].get("lr", base_lr_ref))
+                if ckpt_groups
+                else optimizer.param_groups[0].get("lr", base_lr_ref)
+            )
+            raw_ratio = saved_lr_ref / max(1e-12, base_lr_ref)
+            start_ratio = min(1.0, max(0.02, raw_ratio))
+            peak_ratio = min(1.0, max(0.15, start_ratio))
 
             def resume_lr_lambda(ep_offset: int) -> float:
+                if remaining_epochs > 2 and start_ratio < peak_ratio:
+                    if ep_offset == 0:
+                        return start_ratio
+                    progress = float(ep_offset - 1) / float(max(1, remaining_epochs - 1))
+                    return peak_ratio * 0.5 * (1.0 + math.cos(math.pi * progress))
                 progress = float(ep_offset) / float(max(1, remaining_epochs))
-                return 0.5 * (1.0 + math.cos(math.pi * progress))
+                return peak_ratio * 0.5 * (1.0 + math.cos(math.pi * progress))
 
             scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=resume_lr_lambda)
         else:

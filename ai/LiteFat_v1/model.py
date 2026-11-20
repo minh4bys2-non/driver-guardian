@@ -104,7 +104,7 @@ class KinematicFeatureExtractor(nn.Module):
             left_eye_idx: int = 36,
             right_eye_idx: int = 45,
             eps: float = 1e-2,
-            static_shape_ratio: float = 0.35,
+            static_shape_ratio: float = 0.15,
             fps: float = 10.0,
             num_nodes: int = 68,
     ):
@@ -257,8 +257,8 @@ class KinematicFeatureExtractor(nn.Module):
         pos_feat[:, 0:1, :, 48:68] = rel_mo[:, 0:1] / iod_scale
         pos_feat[:, 1:2, :, 48:68] = rel_mo[:, 1:2] / (scale_mouth * 0.45)
 
-        # Baseline nhân quả cho cơ quan (mắt, lông mày, miệng) và khung đầu (hàm, mũi)
-        organ_indices = list(range(17, 27)) + list(range(36, 68))
+        # Baseline nhân quả cho lông mày & miệng (giữ nguyên hệ quy chiếu P85 của mắt 36..47 để bảo toàn 100% tín hiệu PERCLOS)
+        organ_indices = list(range(17, 27)) + list(range(48, 68))
         pos_org = pos_feat[:, :, :, organ_indices]
         if mask is not None:
             denom_org = mask.sum(dim=2, keepdim=True).clamp(min=1.0)
@@ -278,9 +278,13 @@ class KinematicFeatureExtractor(nn.Module):
         if kin_state is not None and "baseline_org_mean" in kin_state and "baseline_jn_mean" in kin_state:
             prev_org = kin_state["baseline_org_mean"].to(device=x.device, dtype=pos_org.dtype)
             prev_jn = kin_state["baseline_jn_mean"].to(device=x.device, dtype=pos_jn.dtype)
-            ref_org_mean = 0.65 * prev_org + 0.35 * cur_org_mean
+            if prev_org.shape[-1] == pos_org.shape[-1]:
+                ref_org_mean = 0.65 * prev_org + 0.35 * cur_org_mean
+                next_org_mean = torch.where(has_valid, 0.85 * prev_org + 0.15 * cur_org_mean, prev_org)
+            else:
+                ref_org_mean = cur_org_mean
+                next_org_mean = cur_org_mean
             ref_jn_mean = 0.50 * prev_jn + 0.50 * cur_jn_mean
-            next_org_mean = torch.where(has_valid, 0.85 * prev_org + 0.15 * cur_org_mean, prev_org)
             next_jn_mean = torch.where(has_valid, 0.85 * prev_jn + 0.15 * cur_jn_mean, prev_jn)
         else:
             ref_org_mean = cur_org_mean
@@ -290,23 +294,29 @@ class KinematicFeatureExtractor(nn.Module):
 
         if self.static_shape_ratio < 0.999:
             axis_ratio = torch.tensor(
-                [0.15, self.static_shape_ratio], device=x.device, dtype=pos_org.dtype
+                [0.05, self.static_shape_ratio], device=x.device, dtype=pos_org.dtype
             ).view(1, 2, 1, 1)
             pos_feat[:, :, :, organ_indices] = (pos_org - ref_org_mean) + axis_ratio * ref_org_mean
 
-        pos_feat[:, :, :, jaw_nose_indices] = (pos_jn - ref_jn_mean) + 0.20 * pos_jn
+        pos_feat[:, :, :, jaw_nose_indices] = (pos_jn - ref_jn_mean) + 0.05 * ref_jn_mean
         # Khuếch đại nhẹ vùng mắt (36..47) và miệng (48..67)
         pos_feat[:, :, :, 36:48] = pos_feat[:, :, :, 36:48] * 1.8
         pos_feat[:, :, :, 48:68] = pos_feat[:, :, :, 48:68] * 1.4
         pos_feat = torch.clamp(pos_feat, min=-8.0, max=8.0)
 
-        # 4. Tính Vận tốc (dx, dy) và Gia tốc (d2x, d2y) chuẩn hóa giải tích
+        # 4. Tính Vận tốc (dx, dy) và Gia tốc (d2x, d2y) chuẩn hóa giải tích trên tọa độ quy tâm cơ quan
         if T <= 1:
             vel_norm = torch.zeros_like(pos_norm)
             acc_norm = torch.zeros_like(pos_norm)
         else:
-            # Vận tốc biến dạng cục bộ giữa các khung hình liên tiếp
-            vel_local = torch.diff(pos_norm, n=1, dim=2)  # (B, 2, T-1, V)
+            # Quy tâm cục bộ cho lông mày/mắt (khóe mắt) & miệng (khóe miệng) để tách chớp mắt/ngáp khỏi xoay đầu
+            pos_vel_base = pos_norm.clone()
+            pos_vel_base[:, :, :, 17:22] = (x[:, :, :, 17:22] - c_left_eye) / iod_scale
+            pos_vel_base[:, :, :, 22:27] = (x[:, :, :, 22:27] - c_right_eye) / iod_scale
+            pos_vel_base[:, :, :, 36:42] = rel_le / iod_scale
+            pos_vel_base[:, :, :, 42:48] = rel_re / iod_scale
+            pos_vel_base[:, :, :, 48:68] = rel_mo / iod_scale
+            vel_local = torch.diff(pos_vel_base, n=1, dim=2)  # (B, 2, T-1, V)
 
             # Vận tốc tịnh tiến toàn đầu tại đỉnh tâm mũi (node 30):
             # Tính d(nose)/iod thay vì d(nose/iod) để triệt tiêu hoàn toàn lỗi nổ vận tốc do dao động mẫu số
@@ -336,7 +346,7 @@ class KinematicFeatureExtractor(nn.Module):
             vel_norm = torch.clamp(vel_norm, min=-4.0, max=4.0)
 
         # 5. Chuẩn hóa năng lượng động học bảo toàn biên độ sinh lý (Soft-Ceiling Kinematic Normalization)
-        # Không chia nén ngược vận tốc chớp mắt/gật đầu bình thường; chỉ kẹp mềm khi có giật cực đoan
+        # Chỉ nén mềm khi RMS vượt ngưỡng trần sinh lý; giữ nguyên tỷ lệ năng lượng chớp mắt/gật đầu bình thường
         if mask is not None:
             m_valid = mask.clamp(min=0.0, max=1.0)
             n_valid = m_valid.sum(dim=(2, 3), keepdim=True).clamp(min=1.0) * float(V)
@@ -346,12 +356,16 @@ class KinematicFeatureExtractor(nn.Module):
             vel_rms = torch.sqrt(vel_norm.pow(2).mean(dim=(2, 3), keepdim=True) + 1e-6)
             acc_rms = torch.sqrt(acc_norm.pow(2).mean(dim=(2, 3), keepdim=True) + 1e-6)
 
-        # Hybrid Instance-Soft Kinematic Normalization: đồng bộ thang vận tốc thực tế ở 10 FPS
+        # Hybrid Instance-Soft Kinematic Normalization: đưa tín hiệu về thang O(1) >> bn.eps
         dt_scale = 10.0 / self.fps
-        vel_scale = torch.clamp(vel_rms, min=0.004 * dt_scale, max=0.040 * dt_scale) / (0.012 * dt_scale)
-        acc_scale = torch.clamp(acc_rms, min=0.003 * dt_scale, max=0.035 * dt_scale) / (0.009 * dt_scale)
-        vel_norm = (vel_norm / vel_scale) * 0.50
-        acc_norm = (acc_norm / acc_scale) * 0.50
+        vel_ref = 0.012 * dt_scale
+        acc_ref = 0.009 * dt_scale
+        vel_ceil = 2.5 * vel_ref
+        acc_ceil = 2.5 * acc_ref
+        vel_denom = vel_ref * torch.pow(torch.clamp(vel_rms / vel_ceil, min=1.0), 0.7)
+        acc_denom = acc_ref * torch.pow(torch.clamp(acc_rms / acc_ceil, min=1.0), 0.7)
+        vel_norm = torch.clamp(vel_norm / vel_denom, min=-6.0, max=6.0)
+        acc_norm = torch.clamp(acc_norm / acc_denom, min=-6.0, max=6.0)
 
         out = torch.cat([pos_feat, vel_norm, acc_norm], dim=1)  # (B, 6, T, V)
         out = torch.nan_to_num(out, nan=0.0, posinf=4.0, neginf=-4.0)
@@ -472,7 +486,7 @@ class MultimodalFusionModule(nn.Module):
             left_eye_idx: int = 36,
             right_eye_idx: int = 45,
             eps: float = 1e-2,
-            static_shape_ratio: float = 0.35,
+            static_shape_ratio: float = 0.15,
             fps: float = 10.0,
     ):
         super().__init__()
@@ -915,6 +929,7 @@ class CrossWindowFeatureAccumulator(nn.Module):
             cur_frame_feat: torch.Tensor,
             prev_tail_feat: Optional[torch.Tensor],
             cur_lengths: Optional[torch.Tensor] = None,
+            prev_tail_lengths: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Dung hợp vùng khung hình chồng lấp giữa đầu cửa sổ hiện tại [B, T_w, D]
@@ -938,11 +953,19 @@ class CrossWindowFeatureAccumulator(nn.Module):
             gate = self.overlap_gate(gate_in)
             fused_ov = gate * cur_ov_32 + (1.0 - gate) * prev_ov_32
 
+            valid_ov = None
             if cur_lengths is not None:
                 valid_ov = (
                     torch.arange(L_ov, device=dev).unsqueeze(0)
                     < cur_lengths.to(dev).unsqueeze(1)
                 ).unsqueeze(-1).float()
+            if prev_tail_lengths is not None:
+                valid_prev = (
+                    torch.arange(L_ov, device=dev).unsqueeze(0)
+                    < prev_tail_lengths.to(dev).unsqueeze(1)
+                ).unsqueeze(-1).float()
+                valid_ov = valid_prev if valid_ov is None else (valid_ov * valid_prev)
+            if valid_ov is not None:
                 fused_ov = fused_ov * valid_ov + cur_ov_32 * (1.0 - valid_ov)
 
         fused_ov = fused_ov.to(orig_dtype)
@@ -1129,8 +1152,8 @@ class HybridKSSHead(nn.Module):
             kss_vals = self.kss_values.view(1, -1).to(dev)
             kss_exp = (probs * kss_vals).sum(dim=-1)
 
-            span = self.kss_max - self.kss_min
-            kss_reg = self.kss_min + span * torch.sigmoid(self.clip_reg_head(clip_feat.float()).squeeze(-1))
+            offset = 0.75 * torch.tanh(self.clip_reg_head(clip_feat.float()).squeeze(-1))
+            kss_reg = torch.clamp(kss_exp + offset, min=self.kss_min, max=self.kss_max)
             mix_w = torch.sigmoid(self.kss_mix_logit.float())
             clip_kss = torch.clamp(mix_w * kss_exp + (1.0 - mix_w) * kss_reg, min=self.kss_min, max=self.kss_max)
 
@@ -1250,7 +1273,7 @@ class LiteFatV1(nn.Module):
             freeze_backbone: bool = False,
             vertical_pairs: Optional[List[Tuple[int, int]]] = None,
             cross_region_pairs: Optional[List[Tuple[int, int]]] = None,
-            static_shape_ratio: float = 0.35,
+            static_shape_ratio: float = 0.15,
             use_dann: bool = False,
             num_domains: int = 2,
     ):
@@ -1567,48 +1590,93 @@ class LiteFatV1(nn.Module):
             self,
             frame_feat: torch.Tensor,
             lengths: Optional[torch.Tensor],
-            stride_size: int,
-            overlap_size: int,
+            stride_size: Union[int, torch.Tensor],
+            overlap_size: Union[int, torch.Tensor],
             prev_tail: Optional[torch.Tensor] = None,
-    ) -> Optional[torch.Tensor]:
-        """Trích xuất vùng đặc trưng khung hình chồng lấp (từ stride_size trở đi) cho cửa sổ kế tiếp."""
-        if overlap_size <= 0:
-            return None
-
+            prev_tail_len: Optional[torch.Tensor] = None,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Trích xuất vùng đặc trưng khung hình chồng lấp cho cửa sổ kế tiếp (hỗ trợ per-sample stride/overlap)."""
         B, T_w, D = frame_feat.shape
         dev = frame_feat.device
 
-        if T_w > stride_size:
-            raw_tail = frame_feat[:, stride_size:min(T_w, stride_size + overlap_size), :]
+        if isinstance(stride_size, torch.Tensor) or isinstance(overlap_size, torch.Tensor):
+            st_vec = (
+                stride_size.to(dev).long()
+                if isinstance(stride_size, torch.Tensor)
+                else torch.full((B,), int(stride_size), dtype=torch.long, device=dev)
+            )
+            ov_vec = (
+                overlap_size.to(dev).long()
+                if isinstance(overlap_size, torch.Tensor)
+                else torch.full((B,), int(overlap_size), dtype=torch.long, device=dev)
+            )
+            max_ov = int(ov_vec.max().item()) if ov_vec.numel() > 0 else 0
+            if max_ov <= 0:
+                return None, None
+
+            overlap_tail = frame_feat.new_zeros((B, max_ov, D))
+            tail_lens = torch.zeros((B,), dtype=torch.long, device=dev)
+            for b in range(B):
+                st_b = int(st_vec[b].item())
+                ov_b = int(ov_vec[b].item())
+                len_b = int(lengths[b].item()) if lengths is not None else T_w
+                if len_b > 0 and ov_b > 0 and T_w > st_b:
+                    end_b = min(T_w, len_b, st_b + ov_b)
+                    if end_b > st_b:
+                        n_cp = end_b - st_b
+                        overlap_tail[b, :n_cp, :] = frame_feat[b, st_b:end_b, :]
+                        tail_lens[b] = n_cp
+                elif len_b <= 0 and prev_tail is not None:
+                    copy_len = min(max_ov, prev_tail.size(1))
+                    overlap_tail[b, :copy_len, :] = prev_tail[b, :copy_len, :].to(overlap_tail.dtype)
+                    if prev_tail_len is not None:
+                        tail_lens[b] = min(copy_len, int(prev_tail_len[b].item()))
+                    else:
+                        tail_lens[b] = copy_len
+            return overlap_tail, tail_lens
+
+        ov_int = int(overlap_size)
+        st_int = int(stride_size)
+        if ov_int <= 0:
+            return None, None
+
+        if T_w > st_int:
+            raw_tail = frame_feat[:, st_int:min(T_w, st_int + ov_int), :]
             cur_len = raw_tail.size(1)
-            if cur_len < overlap_size:
-                overlap_tail = F.pad(raw_tail, (0, 0, 0, overlap_size - cur_len))
+            if cur_len < ov_int:
+                overlap_tail = F.pad(raw_tail, (0, 0, 0, ov_int - cur_len))
             else:
                 overlap_tail = raw_tail
 
             if lengths is not None:
-                valid_tail_len = (lengths.to(dev) - stride_size).clamp(min=0, max=overlap_size)
+                valid_tail_len = (lengths.to(dev) - st_int).clamp(min=0, max=ov_int)
                 tail_mask = (
-                    torch.arange(overlap_size, device=dev).unsqueeze(0)
+                    torch.arange(ov_int, device=dev).unsqueeze(0)
                     < valid_tail_len.unsqueeze(1)
                 ).unsqueeze(-1).type_as(overlap_tail)
                 overlap_tail = overlap_tail * tail_mask
+                tail_lens = valid_tail_len
+            else:
+                tail_lens = torch.full((B,), min(cur_len, ov_int), dtype=torch.long, device=dev)
         else:
-            overlap_tail = frame_feat.new_zeros((B, overlap_size, D))
+            overlap_tail = frame_feat.new_zeros((B, ov_int, D))
+            tail_lens = torch.zeros((B,), dtype=torch.long, device=dev)
 
-        if prev_tail is not None and lengths is not None and prev_tail.size(1) == overlap_size:
+        if prev_tail is not None and lengths is not None and prev_tail.size(1) == ov_int:
             active_col = (lengths.to(dev) > 0).view(B, 1, 1)
             overlap_tail = torch.where(active_col, overlap_tail, prev_tail.to(overlap_tail.dtype))
+            if prev_tail_len is not None:
+                tail_lens = torch.where(lengths.to(dev) > 0, tail_lens, prev_tail_len.to(dev))
 
-        return overlap_tail
+        return overlap_tail, tail_lens
 
     def forward_stgl_from_fused(
             self,
             X: torch.Tensor,
             lengths: Optional[torch.Tensor] = None,
             prev_state: Optional[Dict[str, torch.Tensor]] = None,
-            overlap_size: Optional[int] = None,
-            stride_size: Optional[int] = None,
+            overlap_size: Optional[Union[int, torch.Tensor]] = None,
+            stride_size: Optional[Union[int, torch.Tensor]] = None,
             kin_state: Optional[Dict[str, torch.Tensor]] = None,
             frame_mask: Optional[torch.Tensor] = None,
             return_details: bool = False,
@@ -1617,19 +1685,32 @@ class LiteFatV1(nn.Module):
         Chạy phần đồ thị STGL từ tensor đặc trưng X [B, D, N, T_w] cho 1 cửa sổ,
         hỗ trợ tích lũy kép từ prev_state (vùng chồng lấp khung hình + bộ nhớ Gated GRU).
         """
-        eff_stride = self.stride_size if stride_size is None else int(max(1, stride_size))
-        eff_overlap = self.overlap_size if overlap_size is None else int(max(0, overlap_size))
+        if stride_size is None:
+            eff_stride: Union[int, torch.Tensor] = self.stride_size
+        elif isinstance(stride_size, torch.Tensor):
+            eff_stride = stride_size.clamp(min=1)
+        else:
+            eff_stride = int(max(1, stride_size))
+
+        if overlap_size is None:
+            eff_overlap: Union[int, torch.Tensor] = self.overlap_size
+        elif isinstance(overlap_size, torch.Tensor):
+            eff_overlap = overlap_size.clamp(min=0)
+        else:
+            eff_overlap = int(max(0, overlap_size))
 
         pooled_node_feat, frame_feat = self._extract_window_frame_features(
             X, lengths=lengths, frame_mask=frame_mask
         )
 
         prev_tail = prev_state.get("overlap_tail_feat") if prev_state is not None else None
+        prev_tail_len = prev_state.get("overlap_tail_len") if prev_state is not None else None
         if prev_tail is not None:
             frame_feat = self.accumulator.fuse_overlap_frames(
                 frame_feat,
                 prev_tail,
                 cur_lengths=lengths,
+                prev_tail_lengths=prev_tail_len,
             )
             pooled_node_feat = frame_feat.permute(0, 2, 1).contiguous()
 
@@ -1663,16 +1744,18 @@ class LiteFatV1(nn.Module):
             )
 
         if return_details:
-            overlap_tail_feat = self._extract_overlap_tail(
+            overlap_tail_feat, overlap_tail_len = self._extract_overlap_tail(
                 frame_feat=frame_feat,
                 lengths=lengths,
                 stride_size=eff_stride,
                 overlap_size=eff_overlap,
                 prev_tail=prev_tail,
+                prev_tail_len=prev_tail_len,
             )
             new_state: Dict[str, Any] = {
                 "memory_feat": memory_feat,
                 "overlap_tail_feat": overlap_tail_feat,
+                "overlap_tail_len": overlap_tail_len,
                 "window_feat": pooled_window_feat,
             }
             if kin_state is not None:
@@ -1702,11 +1785,11 @@ class LiteFatV1(nn.Module):
             prev_state: Optional[Dict[str, torch.Tensor]] = None,
     ) -> Dict[str, Any]:
         """
-        Chạy cơ chế cửa sổ trượt (mặc định 60s = 600 frames, stride 30s = 300 frames @ 10 FPS)
-        với tích lũy đặc trưng kép phía trước và baseline động học nhân quả (streaming-safe).
+        Chạy cơ chế cửa sổ trượt (mặc định 60s = 600 frames, stride 45s = 450 frames @ 10 FPS)
+        riêng theo độ dài thực của từng mẫu trong batch (bất biến tuyệt đối với batch padding).
         """
         lm_norm = self._normalize_landmarks_shape(landmarks)
-        B, T, _, _ = lm_norm.shape
+        B, T, N_lm, C_lm = lm_norm.shape
         dev = lm_norm.device
 
         win_size = self.window_size if window_size is None else int(max(1, window_size))
@@ -1722,7 +1805,18 @@ class LiteFatV1(nn.Module):
                 lengths=lengths,
             )
 
-        ranges = self._build_sliding_window_ranges(T, win_size, str_size)
+        # Xây dựng danh sách cửa sổ trượt riêng cho từng mẫu theo độ dài thực L_b
+        if lengths is not None:
+            sample_lens = [max(0, min(T, int(lengths[b].item()))) for b in range(B)]
+            per_sample_ranges: List[List[Tuple[int, int]]] = [
+                self._build_sliding_window_ranges(L_b, win_size, str_size) if L_b > 0 else []
+                for L_b in sample_lens
+            ]
+        else:
+            shared_ranges = self._build_sliding_window_ranges(T, win_size, str_size)
+            per_sample_ranges = [shared_ranges for _ in range(B)]
+
+        max_windows = max(1, max((len(r) for r in per_sample_ranges), default=1))
 
         full_frame_kss = lm_norm.new_full((B, T), self.kss_min, dtype=torch.float32)
         full_frame_logits = lm_norm.new_zeros((B, T, self.num_classes), dtype=torch.float32)
@@ -1738,97 +1832,165 @@ class LiteFatV1(nn.Module):
         window_valid_list: List[torch.Tensor] = []
         window_domain_logits_list: List[torch.Tensor] = []
 
-        for w_idx, (s, e_valid) in enumerate(ranges):
-            sub_len_span = e_valid - s
-            sub_landmarks = lm_norm[:, s:e_valid]
-            sub_d = d_full[:, s:e_valid] if d_full is not None else None
+        for w_idx in range(max_windows):
+            win_spans: List[Tuple[int, int, bool]] = []
+            sub_len_span = 1
+            for b in range(B):
+                if w_idx < len(per_sample_ranges[b]):
+                    s_b, e_b = per_sample_ranges[b][w_idx]
+                    win_spans.append((s_b, e_b, True))
+                    sub_len_span = max(sub_len_span, e_b - s_b)
+                else:
+                    win_spans.append((0, 0, False))
 
-            if lengths is not None:
-                sub_lengths = (lengths.to(dev) - s).clamp(min=0, max=sub_len_span)
-                active_mask = sub_lengths > 0
-            else:
-                sub_lengths = None
-                active_mask = torch.ones((B,), dtype=torch.bool, device=dev)
+            active_mask = torch.tensor([sp[2] for sp in win_spans], dtype=torch.bool, device=dev)
+            sub_len_list = [(sp[1] - sp[0]) if sp[2] else 0 for sp in win_spans]
+            sub_lengths = torch.tensor(sub_len_list, dtype=torch.long, device=dev)
 
-            if mask is not None:
-                sub_mask = mask[:, :, s:e_valid, :]
-            elif sub_lengths is not None:
-                sub_mask = KinematicFeatureExtractor.build_temporal_mask(
-                    sub_landmarks.permute(0, 3, 1, 2),
-                    lengths=sub_lengths,
+            uniform_slice = (
+                all(sp[2] for sp in win_spans)
+                and len({(sp[0], sp[1]) for sp in win_spans}) == 1
+            )
+            if uniform_slice:
+                s0, e0, _ = win_spans[0]
+                sub_landmarks = lm_norm[:, s0:e0]
+                sub_d = d_full[:, s0:e0] if d_full is not None else None
+                sub_mask = (
+                    mask[:, :, s0:e0, :]
+                    if mask is not None
+                    else KinematicFeatureExtractor.build_temporal_mask(
+                        sub_landmarks.permute(0, 3, 1, 2),
+                        lengths=sub_lengths,
+                    )
                 )
             else:
-                sub_mask = None
+                sub_landmarks = lm_norm.new_ones((B, sub_len_span, N_lm, C_lm))
+                sub_d = d_full.new_zeros((B, sub_len_span, d_full.size(-1))) if d_full is not None else None
+                sub_mask = lm_norm.new_zeros((B, 1, sub_len_span, 1), dtype=torch.float32)
+                for b, (s_b, e_b, is_act) in enumerate(win_spans):
+                    if not is_act:
+                        continue
+                    len_b = e_b - s_b
+                    sub_landmarks[b, :len_b] = lm_norm[b, s_b:e_b]
+                    if d_full is not None and sub_d is not None:
+                        sub_d[b, :len_b] = d_full[b, s_b:e_b]
+                    if mask is not None:
+                        sub_mask[b, :, :len_b, :] = mask[b, :, s_b:e_b, :]
+                    else:
+                        sub_mask[b, :, :len_b, :] = 1.0
 
+            prev_kin_state = kin_state
             X_sub, next_kin_state, sub_frame_mask = self.fusion(
                 sub_landmarks,
                 d=sub_d,
                 mask=sub_mask,
-                kin_state=kin_state,
+                kin_state=prev_kin_state,
                 return_kin_state=True,
                 return_mask=True,
             )
+            if prev_kin_state is not None and not bool(active_mask.all().item()):
+                for k_kin, v_new in list(next_kin_state.items()):
+                    if k_kin in prev_kin_state and prev_kin_state[k_kin].shape == v_new.shape:
+                        act_view = active_mask.view(B, *([1] * (v_new.dim() - 1)))
+                        next_kin_state[k_kin] = torch.where(act_view, v_new, prev_kin_state[k_kin])
             kin_state = next_kin_state
 
-            if w_idx + 1 < len(ranges):
-                next_s = ranges[w_idx + 1][0]
-                tail_stride = max(1, next_s - s)
-                tail_overlap = max(0, e_valid - next_s)
-            else:
-                tail_stride = str_size
-                tail_overlap = max(0, win_size - str_size)
+            tail_strides: List[int] = []
+            tail_overlaps: List[int] = []
+            for b, (s_b, e_b, is_act) in enumerate(win_spans):
+                if is_act and (w_idx + 1 < len(per_sample_ranges[b])):
+                    next_s_b = per_sample_ranges[b][w_idx + 1][0]
+                    tail_strides.append(max(1, next_s_b - s_b))
+                    tail_overlaps.append(max(0, e_b - next_s_b))
+                else:
+                    tail_strides.append(str_size)
+                    tail_overlaps.append(0)
 
+            stride_arg: Union[int, torch.Tensor] = (
+                tail_strides[0]
+                if len(set(tail_strides)) == 1
+                else torch.tensor(tail_strides, dtype=torch.long, device=dev)
+            )
+            overlap_arg: Union[int, torch.Tensor] = (
+                tail_overlaps[0]
+                if len(set(tail_overlaps)) == 1
+                else torch.tensor(tail_overlaps, dtype=torch.long, device=dev)
+            )
+
+            prev_state_cur = state
             win_out = self.forward_stgl_from_fused(
                 X_sub,
                 lengths=sub_lengths,
-                prev_state=state,
-                overlap_size=tail_overlap,
-                stride_size=tail_stride,
+                prev_state=prev_state_cur,
+                overlap_size=overlap_arg,
+                stride_size=stride_arg,
                 kin_state=kin_state,
                 frame_mask=sub_frame_mask,
                 return_details=True,
             )
             state = win_out["state"]
+            if prev_state_cur is not None and not bool(active_mask.all().item()):
+                if "window_feat" in prev_state_cur and prev_state_cur["window_feat"] is not None:
+                    state["window_feat"] = torch.where(
+                        active_mask.view(B, 1),
+                        state["window_feat"],
+                        prev_state_cur["window_feat"],
+                    )
 
             w_frame_kss = win_out["frame_kss"].float()
             w_frame_logits = win_out["frame_logits"].float()
 
-            if sub_lengths is not None:
-                local_valid = (
-                    torch.arange(sub_len_span, device=dev).unsqueeze(0)
-                    < sub_lengths.unsqueeze(1)
-                )
-            else:
-                local_valid = torch.ones((B, sub_len_span), dtype=torch.bool, device=dev)
+            next_frame_kss = full_frame_kss.clone()
+            next_frame_logits = full_frame_logits.clone()
+            next_valid_mask = full_frame_valid_mask.clone()
 
-            if w_idx == 0:
-                if s > 0:
-                    full_frame_kss[:, :s] = w_frame_kss[:, :1]
-                    full_frame_logits[:, :s, :] = w_frame_logits[:, :1, :]
-                    full_frame_valid_mask[:, :s] = sub_frame_mask[:, :1]
-                    written_mask[:, :s] = True
-                full_frame_kss[:, s:e_valid] = w_frame_kss
-                full_frame_logits[:, s:e_valid, :] = w_frame_logits
-                full_frame_valid_mask[:, s:e_valid] = sub_frame_mask
-                written_mask[:, s:e_valid] = True
-            else:
-                update_mask = local_valid | (~written_mask[:, s:e_valid])
-                full_frame_kss[:, s:e_valid] = torch.where(
-                    update_mask,
-                    w_frame_kss,
-                    full_frame_kss[:, s:e_valid],
-                )
-                full_frame_logits[:, s:e_valid, :] = torch.where(
-                    update_mask.unsqueeze(-1),
-                    w_frame_logits,
-                    full_frame_logits[:, s:e_valid, :],
-                )
-                full_frame_valid_mask[:, s:e_valid] = torch.where(
-                    update_mask,
-                    sub_frame_mask,
-                    full_frame_valid_mask[:, s:e_valid],
-                )
-                written_mask[:, s:e_valid] = True
+            for b, (s_b, e_b, is_act) in enumerate(win_spans):
+                if not is_act:
+                    continue
+                len_b = e_b - s_b
+                w_fkss_b = w_frame_kss[b, :len_b]
+                w_flogits_b = w_frame_logits[b, :len_b, :]
+                w_fmask_b = sub_frame_mask[b, :len_b]
+
+                if w_idx == 0:
+                    if s_b > 0:
+                        next_frame_kss[b, :s_b] = w_fkss_b[:1]
+                        next_frame_logits[b, :s_b, :] = w_flogits_b[:1, :]
+                        next_valid_mask[b, :s_b] = w_fmask_b[:1]
+                        written_mask[b, :s_b] = True
+                    next_frame_kss[b, s_b:e_b] = w_fkss_b
+                    next_frame_logits[b, s_b:e_b, :] = w_flogits_b
+                    next_valid_mask[b, s_b:e_b] = w_fmask_b
+                    written_mask[b, s_b:e_b] = True
+                else:
+                    ov_slice = written_mask[b, s_b:e_b].clone()
+                    if ov_slice.any():
+                        ov_idx = torch.nonzero(ov_slice, as_tuple=False).squeeze(-1)
+                        blend_w = torch.ones((len_b,), dtype=torch.float32, device=dev)
+                        blend_w[ov_idx] = torch.linspace(0.25, 1.0, ov_idx.numel(), device=dev, dtype=torch.float32)
+                        old_kss_b = full_frame_kss[b, s_b:e_b]
+                        old_logits_b = full_frame_logits[b, s_b:e_b, :]
+                        next_frame_kss[b, s_b:e_b] = torch.where(
+                            ov_slice,
+                            (1.0 - blend_w) * old_kss_b + blend_w * w_fkss_b,
+                            w_fkss_b,
+                        )
+                        blend_w_3d = blend_w.unsqueeze(-1)
+                        next_frame_logits[b, s_b:e_b, :] = torch.where(
+                            ov_slice.unsqueeze(-1),
+                            (1.0 - blend_w_3d) * old_logits_b + blend_w_3d * w_flogits_b,
+                            w_flogits_b,
+                        )
+                        next_valid_mask[b, s_b:e_b] = full_frame_valid_mask[b, s_b:e_b] | w_fmask_b
+                    else:
+                        next_frame_kss[b, s_b:e_b] = w_fkss_b
+                        next_frame_logits[b, s_b:e_b, :] = w_flogits_b
+                        next_valid_mask[b, s_b:e_b] = w_fmask_b
+                    written_mask[b, s_b:e_b] = True
+
+            full_frame_kss = next_frame_kss
+            full_frame_logits = next_frame_logits
+            full_frame_valid_mask = next_valid_mask
 
             window_memories.append(state["memory_feat"])
             window_kss_list.append(win_out["clip_kss"])

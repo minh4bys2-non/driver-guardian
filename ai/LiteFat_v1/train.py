@@ -199,7 +199,7 @@ class LiteFatTrainer:
             window_smooth_weight=self.cfg.window_smooth_weight,
             boundary_margin_weight=float(getattr(self.cfg, "boundary_margin_weight", 0.15)),
             uta_ordinal_sigma=float(getattr(self.cfg, "uta_ordinal_sigma", 1.25)),
-            dann_weight=float(getattr(self.cfg, "dann_weight", 0.05)),
+            dann_weight=float(getattr(self.cfg, "dann_weight", 0.15)),
             huber_beta=self.cfg.huber_beta,
             ordinal_sigma=self.cfg.ordinal_sigma,
             label_smoothing=self.cfg.label_smoothing,
@@ -413,7 +413,7 @@ class LiteFatTrainer:
         num_batches = max(1, total_batches)
         total_train_steps = max(1, int(self.cfg.epochs) * num_batches)
         use_dann = bool(getattr(self.cfg, "use_dann", False))
-        dann_max_alpha = float(getattr(self.cfg, "dann_max_alpha", 0.20))
+        dann_max_alpha = float(getattr(self.cfg, "dann_max_alpha", 0.25))
         # Khi đã bật subject_balanced_sampling thì sampler đã cân bằng lớp/miền, tránh nhân chồng trọng số loss
         use_sample_weights = bool(getattr(self.cfg, "use_manifest_sample_weights", True)) and (
             not bool(getattr(self.cfg, "subject_balanced_sampling", False))

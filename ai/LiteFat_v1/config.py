@@ -95,7 +95,7 @@ class TrainConfig:
     kernel_size: int = 3
     dropout: float = 0.35
     pretrained_backbone: bool = True
-    static_shape_ratio: float = 0.35
+    static_shape_ratio: float = 0.15
 
     vertical_pairs: List[Tuple[int, int]] = field(default_factory=lambda: [
         (37, 41), (38, 40), (43, 47), (44, 46),
@@ -108,7 +108,7 @@ class TrainConfig:
     # =================================================================
     # 6. THAM SỐ HUẤN LUYỆN, TỐI ƯU HÓA & CHECKPOINT
     # =================================================================
-    epochs: int = 40
+    epochs: int = 35
     batch_size: int = 2
     grad_accum_steps: int = 8
     num_workers: int = 0
@@ -121,7 +121,7 @@ class TrainConfig:
 
     ema_decay: float = 0.990
     use_ema_eval: bool = True
-    early_stop_patience: int = 10
+    early_stop_patience: int = 8
 
     lr: float = 3e-4
     backbone_lr: float = 3e-5
@@ -161,8 +161,8 @@ class TrainConfig:
     # 8. THAM SỐ DOMAIN-ADVERSARIAL TRAINING (REGIME-CONDITIONED DANN)
     # =================================================================
     use_dann: bool = True
-    dann_weight: float = 0.02
-    dann_max_alpha: float = 0.15
+    dann_weight: float = 0.15
+    dann_max_alpha: float = 0.25
 
     def to_dict(self) -> Dict[str, Any]:
         """Chuyển cấu hình thành từ điển thuần JSON-serializable."""

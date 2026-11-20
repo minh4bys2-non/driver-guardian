@@ -44,7 +44,7 @@ class LiteFatLoss(nn.Module):
             window_smooth_weight: float = 0.05,
             boundary_margin_weight: float = 0.15,
             uta_ordinal_sigma: float = 1.25,
-            dann_weight: float = 0.02,
+            dann_weight: float = 0.15,
             huber_beta: float = 0.5,
             ordinal_sigma: float = 0.85,
             label_smoothing: float = 0.05,
@@ -136,11 +136,19 @@ class LiteFatLoss(nn.Module):
         if not is_uta.any():
             return loss_ul
 
-        # Với UTA-RLDD (chỉ có nhãn gộp {2,6,8}): dùng Gaussian rộng + NLL 3 vùng Regime
+        # Với UTA-RLDD (chỉ có nhãn gộp {2,6,8}): dùng Gaussian giới hạn trong từng vùng Regime + NLL 3 vùng
         view_shape = [1] * (logits.dim() - 1) + [self.num_classes]
         levels = self.kss_levels.view(*view_shape).to(logits.device)
         dist_sq = (levels - target_kss.float().unsqueeze(-1)).pow(2)
-        soft_uta = F.softmax(-dist_sq / (2.0 * (self.uta_ordinal_sigma ** 2)), dim=-1)
+        log_scores = -dist_sq / (2.0 * (self.uta_ordinal_sigma ** 2))
+        t_exp = target_kss.float().unsqueeze(-1)
+        regime_support = torch.where(
+            t_exp >= 6.5,
+            levels >= 6.5,
+            torch.where(t_exp >= 4.5, (levels >= 4.0) & (levels <= 6.0), levels <= 4.5),
+        )
+        log_scores = log_scores.masked_fill(~regime_support, -1e4)
+        soft_uta = F.softmax(log_scores, dim=-1)
         log_probs = F.log_softmax(logits.float(), dim=-1)
         ord_uta = -(soft_uta * log_probs).sum(dim=-1)
 
@@ -593,17 +601,46 @@ class LiteFatLoss(nn.Module):
             else:
                 loss_clip_reg = torch.tensor(0.0, device=dev, dtype=torch.float32)
 
-            # 1b. Drowsy Boundary Margin Penalty quanh ngưỡng phân loại nhị phân KSS = 6.5
+            # 1b. Drowsy Boundary Margin Penalty quanh ngưỡng phân loại nhị phân KSS = 6.5 (cấp clip & cửa sổ)
             if c_kss is not None and self.boundary_margin_weight > 0:
                 c_kss_32 = c_kss.float()
                 is_drowsy_tgt = clip_target_kss >= 6.5
                 is_non_drowsy_tgt = clip_target_kss <= 6.0
                 margin_err = torch.where(
                     is_drowsy_tgt,
-                    F.relu(6.65 - c_kss_32),
-                    torch.where(is_non_drowsy_tgt, F.relu(c_kss_32 - 6.35), torch.zeros_like(c_kss_32)),
+                    F.relu(6.70 - c_kss_32),
+                    torch.where(is_non_drowsy_tgt, F.relu(c_kss_32 - 6.20), torch.zeros_like(c_kss_32)),
                 )
-                loss_boundary = self._weighted_mean(margin_err.pow(2), sample_weights=sample_weights)
+                loss_bnd_clip = self._weighted_mean(margin_err.pow(2), sample_weights=sample_weights)
+
+                if w_kss is not None and w_kss.size(1) > 0:
+                    w_kss_32 = w_kss.float()
+                    B_bw, W_bw = w_kss_32.shape
+                    if w_valid_mask is not None and w_valid_mask.shape == (B_bw, W_bw):
+                        win_v_b = w_valid_mask.to(dev).bool()
+                    elif lengths is not None:
+                        lens_b = lengths.to(dev).long()
+                        ws_b = torch.arange(W_bw, device=dev) * self.stride_size
+                        win_v_b = lens_b.unsqueeze(1) > ws_b.unsqueeze(0)
+                        win_v_b[:, 0] = win_v_b[:, 0] | (lens_b > 0)
+                    else:
+                        win_v_b = torch.ones((B_bw, W_bw), dtype=torch.bool, device=dev)
+
+                    tgt_w_b = clip_target_kss.unsqueeze(1).expand(B_bw, W_bw)
+                    margin_err_w = torch.where(
+                        tgt_w_b >= 6.5,
+                        F.relu(6.70 - w_kss_32),
+                        torch.where(tgt_w_b <= 6.0, F.relu(w_kss_32 - 6.20), torch.zeros_like(w_kss_32)),
+                    )
+                    per_sample_bnd_w = (margin_err_w.pow(2) * win_v_b.float()).sum(dim=1) / win_v_b.float().sum(dim=1).clamp(min=1.0)
+                    loss_bnd_win = self._weighted_mean(
+                        per_sample_bnd_w,
+                        sample_weights=sample_weights,
+                        valid_mask=win_v_b.any(dim=1),
+                    )
+                    loss_boundary = 0.65 * loss_bnd_clip + 0.35 * loss_bnd_win
+                else:
+                    loss_boundary = loss_bnd_clip
             else:
                 loss_boundary = torch.tensor(0.0, device=dev, dtype=torch.float32)
 

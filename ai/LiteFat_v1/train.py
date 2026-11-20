@@ -197,9 +197,9 @@ class LiteFatTrainer:
             frame_loss_weight=self.cfg.frame_loss_weight,
             window_loss_weight=self.cfg.window_loss_weight,
             window_smooth_weight=self.cfg.window_smooth_weight,
-            boundary_margin_weight=float(getattr(self.cfg, "boundary_margin_weight", 0.15)),
+            boundary_margin_weight=float(getattr(self.cfg, "boundary_margin_weight", 0.05)),
             uta_ordinal_sigma=float(getattr(self.cfg, "uta_ordinal_sigma", 1.25)),
-            dann_weight=float(getattr(self.cfg, "dann_weight", 0.15)),
+            dann_weight=float(getattr(self.cfg, "dann_weight", 0.05)),
             huber_beta=self.cfg.huber_beta,
             ordinal_sigma=self.cfg.ordinal_sigma,
             label_smoothing=self.cfg.label_smoothing,
@@ -237,50 +237,84 @@ class LiteFatTrainer:
             self.load_checkpoint(self.cfg.resume)
 
     def _build_optimizer(self) -> torch.optim.Optimizer:
-        """Thiết lập AdamW với tốc độ học phân biệt (Differential LR)."""
-        backbone_params = []
-        matched_graph_params = []
-        new_graph_params = []
+        """Thiết lập AdamW với tốc độ học phân biệt (Differential LR) và tách nhóm no_decay."""
+        no_decay_keywords = (
+            "norm",
+            "bn",
+            "node_embed",
+            "E1",
+            "E2",
+            "alpha",
+            "temp_scale",
+            "kss_mix_logit",
+            "res_scale",
+            "init_",
+        )
+
+        def _is_no_decay(param_name: str, p: torch.Tensor) -> bool:
+            if p.ndim <= 1 or param_name.endswith(".bias"):
+                return True
+            return any(kw in param_name for kw in no_decay_keywords)
+
+        buckets: Dict[str, List[torch.Tensor]] = {
+            "pretrained_graph_decay": [],
+            "pretrained_graph_no_decay": [],
+            "new_graph_decay": [],
+            "new_graph_no_decay": [],
+            "backbone_decay": [],
+            "backbone_no_decay": [],
+        }
 
         pretrained_scale = float(self.cfg.pretrained_lr_scale)
         has_pretrained = bool(self.pretrained_param_names) and (pretrained_scale < 1.0)
 
         for name, param in self.model.named_parameters():
+            no_decay = _is_no_decay(name, param)
+            suffix = "no_decay" if no_decay else "decay"
             if "context_encoder.features" in name:
-                backbone_params.append(param)
+                buckets[f"backbone_{suffix}"].append(param)
                 continue
             if not param.requires_grad:
                 continue
             if has_pretrained and name in self.pretrained_param_names:
-                matched_graph_params.append(param)
+                buckets[f"pretrained_graph_{suffix}"].append(param)
             else:
-                new_graph_params.append(param)
+                buckets[f"new_graph_{suffix}"].append(param)
 
-        param_groups = []
-        if matched_graph_params:
-            param_groups.append({
-                "params": matched_graph_params,
-                "lr": self.cfg.lr * pretrained_scale,
-                "weight_decay": self.cfg.weight_decay,
-                "name": "pretrained_graph",
-            })
-        if new_graph_params:
-            param_groups.append({
-                "params": new_graph_params,
-                "lr": self.cfg.lr,
-                "weight_decay": self.cfg.weight_decay,
-                "name": "new_graph",
-            })
-        if backbone_params and self.cfg.use_visual_context:
+        param_groups: List[Dict[str, Any]] = []
+        group_specs = [
+            ("pretrained_graph_decay", self.cfg.lr * pretrained_scale, self.cfg.weight_decay, "pretrained_graph"),
+            ("pretrained_graph_no_decay", self.cfg.lr * pretrained_scale, 0.0, "pretrained_graph_no_decay"),
+            ("new_graph_decay", self.cfg.lr, self.cfg.weight_decay, "new_graph"),
+            ("new_graph_no_decay", self.cfg.lr, 0.0, "new_graph_no_decay"),
+        ]
+        for key, lr_val, wd_val, gname in group_specs:
+            if buckets[key]:
+                param_groups.append({
+                    "params": buckets[key],
+                    "lr": lr_val,
+                    "weight_decay": wd_val,
+                    "name": gname,
+                })
+
+        if self.cfg.use_visual_context and (buckets["backbone_decay"] or buckets["backbone_no_decay"]):
             initial_backbone_lr = (
                 self.cfg.backbone_lr if self.start_epoch > self.cfg.freeze_backbone_epochs else 0.0
             )
-            param_groups.append({
-                "params": backbone_params,
-                "lr": initial_backbone_lr,
-                "weight_decay": self.cfg.weight_decay,
-                "name": "backbone",
-            })
+            if buckets["backbone_decay"]:
+                param_groups.append({
+                    "params": buckets["backbone_decay"],
+                    "lr": initial_backbone_lr,
+                    "weight_decay": self.cfg.weight_decay,
+                    "name": "backbone",
+                })
+            if buckets["backbone_no_decay"]:
+                param_groups.append({
+                    "params": buckets["backbone_no_decay"],
+                    "lr": initial_backbone_lr,
+                    "weight_decay": 0.0,
+                    "name": "backbone_no_decay",
+                })
 
         return torch.optim.AdamW(param_groups)
 
@@ -413,7 +447,7 @@ class LiteFatTrainer:
         num_batches = max(1, total_batches)
         total_train_steps = max(1, int(self.cfg.epochs) * num_batches)
         use_dann = bool(getattr(self.cfg, "use_dann", False))
-        dann_max_alpha = float(getattr(self.cfg, "dann_max_alpha", 0.25))
+        dann_max_alpha = float(getattr(self.cfg, "dann_max_alpha", 0.15))
         # Khi đã bật subject_balanced_sampling thì sampler đã cân bằng lớp/miền, tránh nhân chồng trọng số loss
         use_sample_weights = bool(getattr(self.cfg, "use_manifest_sample_weights", True)) and (
             not bool(getattr(self.cfg, "subject_balanced_sampling", False))

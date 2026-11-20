@@ -1453,9 +1453,9 @@ def build_litefat_dataloaders(
                 reg = 0 if lbl <= 4 else (1 if lbl <= 6 else 2)
                 n_cls_in_reg = max(1, len(ds_reg_classes[(ds_name, reg)]))
                 w = 1.0 / (
-                    float(max(1, ds_label_counts[(ds_name, lbl)]))
-                    * float(n_cls_in_reg)
-                    * math.sqrt(float(max(1, sub_label_counts[(ds_name, sub, lbl)])))
+                    (float(max(1, ds_label_counts[(ds_name, lbl)])) ** 0.70)
+                    * (float(n_cls_in_reg) ** 0.50)
+                    * (float(max(1, sub_label_counts[(ds_name, sub, lbl)])) ** 0.50)
                 )
                 raw_weights.append(w)
                 ds_totals[ds_name] += w
@@ -1464,7 +1464,7 @@ def build_litefat_dataloaders(
             ds_quota: Dict[str, float] = {}
             if len(present_ds) == 2 and any(d.upper().startswith("UL") for d in present_ds):
                 for d in present_ds:
-                    ds_quota[d] = 0.60 if d.upper().startswith("UL") else 0.40
+                    ds_quota[d] = 0.65 if d.upper().startswith("UL") else 0.35
             else:
                 for d in present_ds:
                     ds_quota[d] = 1.0 / float(max(1, len(present_ds)))

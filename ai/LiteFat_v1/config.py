@@ -32,8 +32,8 @@ class TrainConfig:
     use_cache: bool = False
     selected_datasets: Optional[List[str]] = None
 
-    checkpoint_dir: str = "./checkpoints/LiteFat_v1"
-    log_dir: str = "./checkpoints/LiteFat_v1/logs"
+    checkpoint_dir: str = "./checkpoints/LiteFat_v1_novisual7"
+    log_dir: str = "./checkpoints/LiteFat_v1_novisual7/logs"
 
     # =================================================================
     # 2. CHẾ ĐỘ ĐA PHƯƠNG THỨC & TRÍCH XUẤT PIPNET
@@ -108,7 +108,7 @@ class TrainConfig:
     # =================================================================
     # 6. THAM SỐ HUẤN LUYỆN, TỐI ƯU HÓA & CHECKPOINT
     # =================================================================
-    epochs: int = 35
+    epochs: int = 45
     batch_size: int = 2
     grad_accum_steps: int = 8
     num_workers: int = 0
@@ -121,7 +121,7 @@ class TrainConfig:
 
     ema_decay: float = 0.990
     use_ema_eval: bool = True
-    early_stop_patience: int = 8
+    early_stop_patience: int = 10
 
     lr: float = 3e-4
     backbone_lr: float = 3e-5
@@ -145,7 +145,7 @@ class TrainConfig:
     frame_loss_weight: float = 0.3
     window_loss_weight: float = 0.25
     window_smooth_weight: float = 0.05
-    boundary_margin_weight: float = 0.15
+    boundary_margin_weight: float = 0.05
 
     huber_beta: float = 0.5
     ordinal_sigma: float = 0.85
@@ -161,8 +161,8 @@ class TrainConfig:
     # 8. THAM SỐ DOMAIN-ADVERSARIAL TRAINING (REGIME-CONDITIONED DANN)
     # =================================================================
     use_dann: bool = True
-    dann_weight: float = 0.15
-    dann_max_alpha: float = 0.25
+    dann_weight: float = 0.05
+    dann_max_alpha: float = 0.15
 
     def to_dict(self) -> Dict[str, Any]:
         """Chuyển cấu hình thành từ điển thuần JSON-serializable."""

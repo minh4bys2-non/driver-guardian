@@ -42,9 +42,9 @@ class LiteFatLoss(nn.Module):
             frame_loss_weight: float = 0.3,
             window_loss_weight: float = 0.25,
             window_smooth_weight: float = 0.05,
-            boundary_margin_weight: float = 0.15,
+            boundary_margin_weight: float = 0.05,
             uta_ordinal_sigma: float = 1.25,
-            dann_weight: float = 0.15,
+            dann_weight: float = 0.05,
             huber_beta: float = 0.5,
             ordinal_sigma: float = 0.85,
             label_smoothing: float = 0.05,
@@ -145,7 +145,7 @@ class LiteFatLoss(nn.Module):
         regime_support = torch.where(
             t_exp >= 6.5,
             levels >= 6.5,
-            torch.where(t_exp >= 4.5, (levels >= 4.0) & (levels <= 6.0), levels <= 4.5),
+            torch.where(t_exp >= 4.5, (levels >= 4.0) & (levels <= 6.5), levels <= 4.5),
         )
         log_scores = log_scores.masked_fill(~regime_support, -1e4)
         soft_uta = F.softmax(log_scores, dim=-1)
@@ -160,6 +160,49 @@ class LiteFatLoss(nn.Module):
         reg_idx = torch.where(target_kss >= 6.5, 2, torch.where(target_kss >= 4.5, 1, 0)).long()
         reg_ce = -torch.log(torch.gather(reg_probs, dim=-1, index=reg_idx.unsqueeze(-1)).squeeze(-1))
         loss_uta = 0.70 * ord_uta + 0.30 * reg_ce
+        return torch.where(is_uta, loss_uta, loss_ul)
+
+    def _regression_loss_per_element(
+            self,
+            pred_kss: torch.Tensor,
+            target_kss: torch.Tensor,
+            domain_targets: Optional[torch.Tensor] = None,
+            include_mse: bool = False,
+    ) -> torch.Tensor:
+        """
+        Hồi quy điểm cho UL-DD (domain=0) và Interval Regression Loss cho nhãn gộp UTA-RLDD (domain=1):
+          - Alert (KSS <= 4.0): khoảng hợp lệ [1.0, 4.0], tâm điều chuẩn 2.5
+          - Mid (4.5 <= KSS <= 6.2): khoảng hợp lệ [4.5, 6.2], tâm điều chuẩn 5.4
+          - Drowsy (KSS >= 6.5): khoảng hợp lệ [6.8, 9.0], tâm điều chuẩn 7.8
+        """
+        p = pred_kss.float()
+        t = target_kss.float()
+        smooth_l1 = F.smooth_l1_loss(p, t, beta=self.huber_beta, reduction="none")
+        if include_mse:
+            loss_ul = 0.75 * smooth_l1 + 0.25 * F.mse_loss(p, t, reduction="none")
+        else:
+            loss_ul = smooth_l1
+
+        if domain_targets is None:
+            return loss_ul
+
+        dom = domain_targets.to(p.device).long().view(-1)
+        while dom.dim() < p.dim():
+            dom = dom.unsqueeze(-1)
+        is_uta = (dom == 1).expand_as(p)
+        if not is_uta.any():
+            return loss_ul
+
+        lo = torch.where(t >= 6.5, 6.8, torch.where(t >= 4.5, 4.5, 1.0))
+        hi = torch.where(t >= 6.5, 9.0, torch.where(t >= 4.5, 6.2, 4.0))
+        center = torch.where(t >= 6.5, 7.8, torch.where(t >= 4.5, 5.4, 2.5))
+        dist_out = F.relu(lo - p) + F.relu(p - hi)
+        out_l1 = F.smooth_l1_loss(dist_out, torch.zeros_like(dist_out), beta=self.huber_beta, reduction="none")
+        center_l1 = F.smooth_l1_loss(p, center, beta=self.huber_beta, reduction="none")
+        if include_mse:
+            loss_uta = (0.75 * out_l1 + 0.25 * dist_out.pow(2)) + 0.15 * center_l1
+        else:
+            loss_uta = out_l1 + 0.15 * center_l1
         return torch.where(is_uta, loss_uta, loss_ul)
 
     def _unpack_predictions(
@@ -386,11 +429,11 @@ class LiteFatLoss(nn.Module):
 
         loss_reg_per = None
         if frame_kss is not None:
-            loss_reg_per = F.smooth_l1_loss(
+            loss_reg_per = self._regression_loss_per_element(
                 frame_kss.float(),
                 tgt_f_kss,
-                beta=self.huber_beta,
-                reduction="none",
+                domain_targets=domain_targets,
+                include_mse=False,
             )
 
         loss_cls_per = None
@@ -462,11 +505,11 @@ class LiteFatLoss(nn.Module):
 
         win_reg = None
         if window_kss is not None:
-            win_reg = F.smooth_l1_loss(
+            win_reg = self._regression_loss_per_element(
                 window_kss.float(),
                 tgt_w_kss,
-                beta=self.huber_beta,
-                reduction="none",
+                domain_targets=domain_targets,
+                include_mse=False,
             )
 
         win_cls = None
@@ -592,12 +635,16 @@ class LiteFatLoss(nn.Module):
                 else:
                     c_logits = f_logits.float().mean(dim=1)
 
-            # 1. Clip Regression Loss (SmoothL1 + MSE)
+            # 1. Clip Regression Loss (SmoothL1 + MSE cho UL-DD; Interval Regression cho UTA-RLDD)
             if c_kss is not None and self.clip_reg_weight > 0:
                 c_kss_32 = c_kss.float()
-                smooth_l1 = F.smooth_l1_loss(c_kss_32, clip_target_kss, beta=self.huber_beta, reduction="none")
-                mse = F.mse_loss(c_kss_32, clip_target_kss, reduction="none")
-                loss_clip_reg = self._weighted_mean(0.75 * smooth_l1 + 0.25 * mse, sample_weights=sample_weights)
+                reg_vec = self._regression_loss_per_element(
+                    c_kss_32,
+                    clip_target_kss,
+                    domain_targets=domain_targets,
+                    include_mse=True,
+                )
+                loss_clip_reg = self._weighted_mean(reg_vec, sample_weights=sample_weights)
             else:
                 loss_clip_reg = torch.tensor(0.0, device=dev, dtype=torch.float32)
 
@@ -608,8 +655,8 @@ class LiteFatLoss(nn.Module):
                 is_non_drowsy_tgt = clip_target_kss <= 6.0
                 margin_err = torch.where(
                     is_drowsy_tgt,
-                    F.relu(6.70 - c_kss_32),
-                    torch.where(is_non_drowsy_tgt, F.relu(c_kss_32 - 6.20), torch.zeros_like(c_kss_32)),
+                    F.relu(6.65 - c_kss_32),
+                    torch.where(is_non_drowsy_tgt, F.relu(c_kss_32 - 6.30), torch.zeros_like(c_kss_32)),
                 )
                 loss_bnd_clip = self._weighted_mean(margin_err.pow(2), sample_weights=sample_weights)
 
@@ -629,8 +676,8 @@ class LiteFatLoss(nn.Module):
                     tgt_w_b = clip_target_kss.unsqueeze(1).expand(B_bw, W_bw)
                     margin_err_w = torch.where(
                         tgt_w_b >= 6.5,
-                        F.relu(6.70 - w_kss_32),
-                        torch.where(tgt_w_b <= 6.0, F.relu(w_kss_32 - 6.20), torch.zeros_like(w_kss_32)),
+                        F.relu(6.65 - w_kss_32),
+                        torch.where(tgt_w_b <= 6.0, F.relu(w_kss_32 - 6.30), torch.zeros_like(w_kss_32)),
                     )
                     per_sample_bnd_w = (margin_err_w.pow(2) * win_v_b.float()).sum(dim=1) / win_v_b.float().sum(dim=1).clamp(min=1.0)
                     loss_bnd_win = self._weighted_mean(

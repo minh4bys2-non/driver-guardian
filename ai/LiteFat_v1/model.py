@@ -230,12 +230,8 @@ class KinematicFeatureExtractor(nn.Module):
         scale_left_eye = torch.maximum(w_left_eye, 0.22 * iod_scale).clamp(min=self.eps)
         scale_right_eye = torch.maximum(w_right_eye, 0.22 * iod_scale).clamp(min=self.eps)
         scale_mouth = torch.maximum(w_mouth, 0.32 * iod_scale).clamp(min=self.eps)
-        eye_y_scale_l = torch.maximum(
-            0.65 * eff_eye_open + 0.35 * (0.32 * scale_left_eye), 0.045 * iod_scale
-        ).clamp(min=self.eps)
-        eye_y_scale_r = torch.maximum(
-            0.65 * eff_eye_open + 0.35 * (0.32 * scale_right_eye), 0.045 * iod_scale
-        ).clamp(min=self.eps)
+        eye_y_scale_l = torch.maximum(eff_eye_open, 0.14 * scale_left_eye).clamp(min=self.eps)
+        eye_y_scale_r = torch.maximum(eff_eye_open, 0.14 * scale_right_eye).clamp(min=self.eps)
 
         pos_feat = pos_norm.clone()
         # Lông mày trái & phải (quy chiếu về tâm khóe mắt theo iod_scale)
@@ -330,6 +326,20 @@ class KinematicFeatureExtractor(nn.Module):
             if mask is not None:
                 pair_valid = mask[:, :, 1:, :] * mask[:, :, :-1, :]
                 vel_local = vel_local * pair_valid
+
+            # Lọc mượt nhân quả 2-frame cho vận tốc mi mắt (36..47) nhằm giảm gai nhiễu chớp mắt nhanh
+            if vel_local.size(2) >= 2:
+                eye_vel = vel_local[:, :, :, 36:48].clone()
+                if mask is not None:
+                    prev_valid = pair_valid[:, :, :-1, :]
+                    cur_valid = pair_valid[:, :, 1:, :]
+                    vel_local[:, :, 1:, 36:48] = torch.where(
+                        prev_valid > 0.5,
+                        0.5 * (eye_vel[:, :, 1:, :] + eye_vel[:, :, :-1, :]),
+                        eye_vel[:, :, 1:, :],
+                    ) * cur_valid
+                else:
+                    vel_local[:, :, 1:, 36:48] = 0.5 * (eye_vel[:, :, 1:, :] + eye_vel[:, :, :-1, :])
 
             # Gia tốc: Đạo hàm bậc 2 trên chuỗi vận tốc trước khi chèn số 0 (loại bỏ gai giả ở t=1)
             if T >= 3:
@@ -1006,13 +1016,21 @@ class CrossWindowFeatureAccumulator(nn.Module):
             self,
             window_states: torch.Tensor,
             window_valid_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+            return_weights: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Tổng hợp chuỗi trạng thái [B, W_num, D] qua các cửa sổ trượt thành vector đặc trưng cuối [B, D].
-        Kết hợp trạng thái tích lũy cuối cùng hợp lệ (65%) và Causal Window Attention (35%).
+        Kết hợp trạng thái tích lũy cuối cùng hợp lệ (45%) và Causal Window Attention (55%).
         """
         B, W_num, _ = window_states.shape
         if W_num == 1:
+            if return_weights:
+                w_one = (
+                    window_valid_mask.float().to(window_states.device)
+                    if window_valid_mask is not None
+                    else window_states.new_ones((B, 1), dtype=torch.float32)
+                )
+                return window_states[:, 0, :], w_one
             return window_states[:, 0, :]
 
         orig_dtype = window_states.dtype
@@ -1028,6 +1046,7 @@ class CrossWindowFeatureAccumulator(nn.Module):
                 last_state = ws_32[batch_idx, last_idx, :]
             else:
                 valid_bool = torch.ones((B, W_num), dtype=torch.bool, device=dev)
+                last_idx = torch.full((B,), W_num - 1, dtype=torch.long, device=dev)
                 last_state = ws_32[:, -1, :]
 
             valid_w_counts = valid_bool.float().sum(dim=1, keepdim=True).clamp(min=1.0)
@@ -1044,6 +1063,11 @@ class CrossWindowFeatureAccumulator(nn.Module):
             attn_state = (ws_32 * attn_w.unsqueeze(-1)).sum(dim=1)
 
             final_state = 0.45 * last_state + 0.55 * attn_state
+            if return_weights:
+                last_onehot = torch.zeros((B, W_num), device=dev, dtype=ws_32.dtype)
+                last_onehot.scatter_(1, last_idx.unsqueeze(1), 1.0)
+                win_comb_w = (0.45 * last_onehot + 0.55 * attn_w) * valid_bool.float()
+                return final_state.to(orig_dtype), win_comb_w
 
         return final_state.to(orig_dtype)
 
@@ -2006,14 +2030,14 @@ class LiteFatV1(nn.Module):
         window_attn_logits = torch.stack(window_attn_logits_list, dim=1)  # [B, W_num, num_classes]
         window_valid_mask = torch.stack(window_valid_list, dim=1)  # [B, W_num]
 
-        final_feat = self.accumulator.aggregate_window_states(
+        final_feat, win_comb_w = self.accumulator.aggregate_window_states(
             window_states,
             window_valid_mask=window_valid_mask,
+            return_weights=True,
         )
-        valid_w_float = window_valid_mask.float().unsqueeze(-1)
+        w_norm = win_comb_w / win_comb_w.sum(dim=1, keepdim=True).clamp(min=1e-6)
         final_attn_logits = (
-            (window_attn_logits.float() * valid_w_float).sum(dim=1)
-            / valid_w_float.sum(dim=1).clamp(min=1.0)
+            (window_attn_logits.float() * w_norm.unsqueeze(-1)).sum(dim=1)
         ).to(final_feat.dtype)
 
         clip_kss, clip_logits = self.kss_head.forward_clip(

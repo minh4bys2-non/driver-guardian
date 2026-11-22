@@ -36,6 +36,9 @@ def _infer_legacy_flags(cfg_dict: Dict[str, Any], ckpt_path: Path) -> Dict[str, 
     """
     merged = dict(cfg_dict)
     if "eye_vel_smooth" in merged and "uta_reg_mode" in merged:
+        merged.setdefault("use_alert_boundary_margin", False)
+        merged.setdefault("boundary_alert_max", 4.20)
+        merged.setdefault("boundary_mid_min", 4.70)
         return merged
 
     is_v7 = (
@@ -64,6 +67,9 @@ def _infer_legacy_flags(cfg_dict: Dict[str, Any], ckpt_path: Path) -> Dict[str, 
         merged.setdefault("window_attn_weighted_logits", False)
         merged.setdefault("sampler_uta_quota", 0.40)
         merged.setdefault("sampler_weight_exponents", [1.0, 1.0, 0.5])
+    merged.setdefault("use_alert_boundary_margin", False)
+    merged.setdefault("boundary_alert_max", 4.20)
+    merged.setdefault("boundary_mid_min", 4.70)
     return merged
 
 
@@ -245,6 +251,9 @@ def evaluate_checkpoint_split(
         uta_interval_center_weight=float(getattr(cfg, "uta_interval_center_weight", 0.50)),
         boundary_drowsy_min=float(getattr(cfg, "boundary_drowsy_min", 6.70)),
         boundary_nondrowsy_max=float(getattr(cfg, "boundary_nondrowsy_max", 6.20)),
+        use_alert_boundary_margin=bool(getattr(cfg, "use_alert_boundary_margin", False)),
+        boundary_alert_max=float(getattr(cfg, "boundary_alert_max", 4.20)),
+        boundary_mid_min=float(getattr(cfg, "boundary_mid_min", 4.70)),
     ).to(device)
 
     records: List[Dict[str, Any]] = []
@@ -366,6 +375,9 @@ def evaluate_checkpoint_split(
         "split": split,
         "flags": {
             "uta_reg_mode": cfg.uta_reg_mode,
+            "use_alert_boundary_margin": cfg.use_alert_boundary_margin,
+            "boundary_alert_max": cfg.boundary_alert_max,
+            "boundary_mid_min": cfg.boundary_mid_min,
             "eye_vel_smooth": cfg.eye_vel_smooth,
             "eye_y_scale_mode": cfg.eye_y_scale_mode,
             "window_attn_weighted_logits": cfg.window_attn_weighted_logits,

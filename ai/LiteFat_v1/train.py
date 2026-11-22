@@ -227,6 +227,9 @@ class LiteFatTrainer:
             uta_interval_center_weight=float(getattr(self.cfg, "uta_interval_center_weight", 0.50)),
             boundary_drowsy_min=float(getattr(self.cfg, "boundary_drowsy_min", 6.70)),
             boundary_nondrowsy_max=float(getattr(self.cfg, "boundary_nondrowsy_max", 6.20)),
+            use_alert_boundary_margin=bool(getattr(self.cfg, "use_alert_boundary_margin", False)),
+            boundary_alert_max=float(getattr(self.cfg, "boundary_alert_max", 4.20)),
+            boundary_mid_min=float(getattr(self.cfg, "boundary_mid_min", 4.70)),
         ).to(self.device)
 
         # Biến theo dõi thực nghiệm
@@ -1006,6 +1009,9 @@ class LiteFatTrainer:
             "uta_interval_center_weight",
             "boundary_drowsy_min",
             "boundary_nondrowsy_max",
+            "use_alert_boundary_margin",
+            "boundary_alert_max",
+            "boundary_mid_min",
             "sampler_uta_quota",
             "sampler_weight_exponents",
             "eye_vel_smooth",

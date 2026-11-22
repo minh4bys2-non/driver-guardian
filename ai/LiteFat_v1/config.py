@@ -171,6 +171,9 @@ class TrainConfig:
     uta_interval_center_weight: float = 0.50  # Chỉ dùng khi uta_reg_mode="interval_fixed"
     boundary_drowsy_min: float = 6.70  # v6: 6.70 | v7: 6.65
     boundary_nondrowsy_max: float = 6.20  # v6: 6.20 | v7: 6.30
+    use_alert_boundary_margin: bool = False  # v6/v8a/v8b: False | v8f: True (thêm tường biên Alert/Mid 4.20/4.70)
+    boundary_alert_max: float = 4.20  # Phạt Alert (KSS <= 4.0) nếu pred > 4.20
+    boundary_mid_min: float = 4.70  # Phạt Non-Alert (KSS >= 5.0) nếu pred < 4.70
     sampler_uta_quota: float = 0.40  # v6: 0.40 | v7: 0.35
     sampler_weight_exponents: Tuple[float, float, float] = (1.0, 1.0, 0.5)  # v6: (1.0, 1.0, 0.5) | v7: (0.70, 0.50, 0.50)
     eye_vel_smooth: bool = False  # v6: False | v7: True

@@ -60,6 +60,9 @@ class LiteFatLoss(nn.Module):
             uta_interval_center_weight: float = 0.50,
             boundary_drowsy_min: float = 6.70,
             boundary_nondrowsy_max: float = 6.20,
+            use_alert_boundary_margin: bool = False,
+            boundary_alert_max: float = 4.20,
+            boundary_mid_min: float = 4.70,
     ):
         super().__init__()
         if uta_reg_mode not in ("point", "interval", "interval_fixed"):
@@ -79,6 +82,9 @@ class LiteFatLoss(nn.Module):
         self.uta_interval_center_weight = float(uta_interval_center_weight)
         self.boundary_drowsy_min = float(boundary_drowsy_min)
         self.boundary_nondrowsy_max = float(boundary_nondrowsy_max)
+        self.use_alert_boundary_margin = bool(use_alert_boundary_margin)
+        self.boundary_alert_max = float(boundary_alert_max)
+        self.boundary_mid_min = float(boundary_mid_min)
 
         self.huber_beta = float(huber_beta)
         self.ordinal_sigma = float(max(1e-3, ordinal_sigma))
@@ -575,6 +581,35 @@ class LiteFatLoss(nn.Module):
 
         return loss_window, loss_smooth
 
+    def _boundary_margin_error_sq(
+            self,
+            pred_kss: torch.Tensor,
+            target_kss: torch.Tensor,
+    ) -> torch.Tensor:
+        """Tính bình phương sai số rào cản quanh KSS=6.5 (và tùy chọn Alert/Mid 4.5)."""
+        drowsy_err = torch.where(
+            target_kss >= 6.5,
+            F.relu(self.boundary_drowsy_min - pred_kss),
+            torch.where(
+                target_kss <= 6.0,
+                F.relu(pred_kss - self.boundary_nondrowsy_max),
+                torch.zeros_like(pred_kss),
+            ),
+        )
+        err_sq = drowsy_err.pow(2)
+        if self.use_alert_boundary_margin:
+            alert_err = torch.where(
+                target_kss <= 4.0,
+                F.relu(pred_kss - self.boundary_alert_max),
+                torch.where(
+                    target_kss >= 5.0,
+                    F.relu(self.boundary_mid_min - pred_kss),
+                    torch.zeros_like(pred_kss),
+                ),
+            )
+            err_sq = err_sq + alert_err.pow(2)
+        return err_sq
+
     def forward(
             self,
             predictions: Union[torch.Tensor, Dict[str, Any], Tuple[Any, ...]],
@@ -668,17 +703,13 @@ class LiteFatLoss(nn.Module):
             else:
                 loss_clip_reg = torch.tensor(0.0, device=dev, dtype=torch.float32)
 
-            # 1b. Drowsy Boundary Margin Penalty quanh ngưỡng phân loại nhị phân KSS = 6.5 (cấp clip & cửa sổ)
+            # 1b. Boundary Margin Penalty quanh KSS = 6.5 (và tùy chọn KSS = 4.5 khi bật use_alert_boundary_margin)
             if c_kss is not None and self.boundary_margin_weight > 0:
                 c_kss_32 = c_kss.float()
-                is_drowsy_tgt = clip_target_kss >= 6.5
-                is_non_drowsy_tgt = clip_target_kss <= 6.0
-                margin_err = torch.where(
-                    is_drowsy_tgt,
-                    F.relu(self.boundary_drowsy_min - c_kss_32),
-                    torch.where(is_non_drowsy_tgt, F.relu(c_kss_32 - self.boundary_nondrowsy_max), torch.zeros_like(c_kss_32)),
+                loss_bnd_clip = self._weighted_mean(
+                    self._boundary_margin_error_sq(c_kss_32, clip_target_kss),
+                    sample_weights=sample_weights,
                 )
-                loss_bnd_clip = self._weighted_mean(margin_err.pow(2), sample_weights=sample_weights)
 
                 if w_kss is not None and w_kss.size(1) > 0:
                     w_kss_32 = w_kss.float()
@@ -694,12 +725,8 @@ class LiteFatLoss(nn.Module):
                         win_v_b = torch.ones((B_bw, W_bw), dtype=torch.bool, device=dev)
 
                     tgt_w_b = clip_target_kss.unsqueeze(1).expand(B_bw, W_bw)
-                    margin_err_w = torch.where(
-                        tgt_w_b >= 6.5,
-                        F.relu(self.boundary_drowsy_min - w_kss_32),
-                        torch.where(tgt_w_b <= 6.0, F.relu(w_kss_32 - self.boundary_nondrowsy_max), torch.zeros_like(w_kss_32)),
-                    )
-                    per_sample_bnd_w = (margin_err_w.pow(2) * win_v_b.float()).sum(dim=1) / win_v_b.float().sum(dim=1).clamp(min=1.0)
+                    margin_err_w_sq = self._boundary_margin_error_sq(w_kss_32, tgt_w_b)
+                    per_sample_bnd_w = (margin_err_w_sq * win_v_b.float()).sum(dim=1) / win_v_b.float().sum(dim=1).clamp(min=1.0)
                     loss_bnd_win = self._weighted_mean(
                         per_sample_bnd_w,
                         sample_weights=sample_weights,

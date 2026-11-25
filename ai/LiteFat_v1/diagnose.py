@@ -25,7 +25,7 @@ from config import TrainConfig
 from dataset import LiteFatDataset, collate_litefat
 from loss import LiteFatLoss
 from model import LiteFatV1
-from ultis import compute_kss_metrics, seed_everything
+from ultis import compute_binary_metrics, compute_kss_metrics, seed_everything
 
 
 def _infer_legacy_flags(cfg_dict: Dict[str, Any], ckpt_path: Path) -> Dict[str, Any]:
@@ -324,19 +324,96 @@ def evaluate_checkpoint_split(
     for idx_r, r in enumerate(records):
         r["drowsy_prob"] = float(drowsy_probs[idx_r])
 
-    overall_m = compute_kss_metrics(
-        targets_np, preds_np, pred_logits=logits_np if len(logits_np) else None,
-        kss_min=cfg.kss_min, kss_max=cfg.kss_max,
+    overall_m, per_ds = _summarize_records(
+        records=records,
+        kss_min=cfg.kss_min,
+        kss_max=cfg.kss_max,
+        logits_np=logits_np if len(logits_np) else None,
+        domain_loss_sums=domain_loss_sums,
+        domain_loss_counts=domain_loss_counts,
+    )
+
+    return {
+        "checkpoint": str(ckpt_path),
+        "epoch": int(ckpt.get("epoch", -1)),
+        "split": split,
+        "flags": {
+            "uta_reg_mode": cfg.uta_reg_mode,
+            "use_alert_boundary_margin": cfg.use_alert_boundary_margin,
+            "boundary_alert_max": cfg.boundary_alert_max,
+            "boundary_mid_min": cfg.boundary_mid_min,
+            "eye_vel_smooth": cfg.eye_vel_smooth,
+            "eye_y_scale_mode": cfg.eye_y_scale_mode,
+            "window_attn_weighted_logits": cfg.window_attn_weighted_logits,
+            "boundary_margin_weight": cfg.boundary_margin_weight,
+            "dann_weight": cfg.dann_weight,
+        },
+        "overall_metrics": overall_m,
+        "per_dataset": per_ds,
+        "records": records,
+    }
+
+
+def _compute_metrics_with_probs(
+        targets_arr: np.ndarray,
+        preds_arr: np.ndarray,
+        kss_min: float,
+        kss_max: float,
+        logits_arr: Optional[np.ndarray] = None,
+        drowsy_arr: Optional[np.ndarray] = None,
+) -> Dict[str, float]:
+    """Tính đầy đủ KSS metrics và bảo toàn AUC theo drowsy_prob khi không có raw logits."""
+    metrics = compute_kss_metrics(
+        targets_arr,
+        preds_arr,
+        pred_logits=logits_arr,
+        kss_min=kss_min,
+        kss_max=kss_max,
+    )
+    if logits_arr is None and drowsy_arr is not None and len(targets_arr):
+        metrics.update(
+            compute_binary_metrics(
+                (targets_arr >= 7.0).astype(int),
+                (preds_arr >= 6.5).astype(int),
+                drowsy_arr,
+            )
+        )
+    return metrics
+
+
+def _summarize_records(
+        records: List[Dict[str, Any]],
+        kss_min: float = 1.0,
+        kss_max: float = 9.0,
+        logits_np: Optional[np.ndarray] = None,
+        domain_loss_sums: Optional[Dict[str, Dict[str, float]]] = None,
+        domain_loss_counts: Optional[Dict[str, int]] = None,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Tổng hợp overall metrics, per-dataset metrics, confusion matrix và phân bố KSS từ records."""
+    targets_np = np.asarray([float(r["target_kss"]) for r in records], dtype=np.float64)
+    preds_np = np.asarray([float(r["pred_kss"]) for r in records], dtype=np.float64)
+    drowsy_np = np.asarray([float(r.get("drowsy_prob", 0.5)) for r in records], dtype=np.float64)
+    has_logits = logits_np is not None and len(logits_np) == len(targets_np)
+
+    overall_m = _compute_metrics_with_probs(
+        targets_np,
+        preds_np,
+        kss_min=kss_min,
+        kss_max=kss_max,
+        logits_arr=logits_np if has_logits else None,
+        drowsy_arr=drowsy_np,
     )
 
     per_ds: Dict[str, Any] = {}
-    ds_names = sorted({r["dataset"] for r in records})
-    for ds_name in ds_names:
+    for ds_name in sorted({r["dataset"] for r in records}):
         mask = np.array([r["dataset"] == ds_name for r in records])
-        dm = compute_kss_metrics(
-            targets_np[mask], preds_np[mask],
-            pred_logits=logits_np[mask] if len(logits_np) == len(targets_np) else None,
-            kss_min=cfg.kss_min, kss_max=cfg.kss_max,
+        dm = _compute_metrics_with_probs(
+            targets_np[mask],
+            preds_np[mask],
+            kss_min=kss_min,
+            kss_max=kss_max,
+            logits_arr=logits_np[mask] if has_logits else None,
+            drowsy_arr=drowsy_np[mask],
         )
         yt_cls = [int(np.clip(np.rint(v), 1, 9)) for v in targets_np[mask]]
         yp_cls = [int(np.clip(np.rint(v), 1, 9)) for v in preds_np[mask]]
@@ -358,8 +435,10 @@ def evaluate_checkpoint_split(
                 "within_1": float(np.mean(np.abs(p_sub - t_sub) <= 1.0)),
             }
 
-        cnt = max(1, domain_loss_counts[ds_name])
-        avg_losses = {k: round(v / cnt, 4) for k, v in domain_loss_sums[ds_name].items()}
+        avg_losses: Dict[str, float] = {}
+        if domain_loss_sums is not None and domain_loss_counts is not None and domain_loss_counts.get(ds_name, 0) > 0:
+            cnt = max(1, domain_loss_counts[ds_name])
+            avg_losses = {k: round(v / cnt, 4) for k, v in domain_loss_sums[ds_name].items()}
 
         per_ds[ds_name] = {
             "metrics": dm,
@@ -368,26 +447,142 @@ def evaluate_checkpoint_split(
             "pred_by_true_kss": by_true_kss,
             "avg_losses_train_formula": avg_losses,
         }
+    return overall_m, per_ds
 
+
+def load_saved_predictions_split(ckpt_path: Path, split: str) -> Optional[Dict[str, Any]]:
+    """Nạp kết quả dự đoán từ {split}_predictions.csv để chẩn đoán nhanh không cần cache tensor."""
+    run_dir = ckpt_path.parent
+    csv_path = run_dir / f"{split}_predictions.csv"
+    if not csv_path.is_file():
+        print(f"[SKIP] Không tìm thấy tệp dự đoán: {csv_path}")
+        return None
+
+    raw_cfg: Dict[str, Any] = {}
+    cfg_json = run_dir / "config.json"
+    if cfg_json.is_file():
+        with open(cfg_json, "r", encoding="utf-8") as f:
+            raw_cfg = json.load(f)
+    raw_cfg = _infer_legacy_flags(raw_cfg, ckpt_path)
+    meta_json = run_dir / "run_meta.json"
+    if meta_json.is_file():
+        ab = json.loads(meta_json.read_text(encoding="utf-8")).get("ablation_flags", {})
+        raw_cfg.update(ab)
+
+    best_ep = -1
+    bm_path = run_dir / "best_metrics.json"
+    if bm_path.is_file():
+        best_ep = int(json.loads(bm_path.read_text(encoding="utf-8")).get("best_epoch", -1))
+
+    records: List[Dict[str, Any]] = []
+    with open(csv_path, "r", encoding="utf-8", newline="") as f:
+        for row in csv.DictReader(f):
+            ds_name = str(row.get("dataset", "unknown"))
+            t_kss = float(row["target_kss"])
+            p_kss = float(row["pred_kss"])
+            records.append({
+                "index": row.get("index", str(len(records))),
+                "key": str(row.get("key", "")),
+                "dataset": ds_name,
+                "subject_id": str(row.get("subject_id", "")),
+                "video_id": str(row.get("video_id", "")),
+                "domain_id": 0 if ds_name.upper().startswith("UL") else 1,
+                "target_kss": t_kss,
+                "pred_kss": p_kss,
+                "abs_err": float(row.get("abs_err", abs(p_kss - t_kss))),
+                "drowsy_prob": float(row.get("drowsy_prob", 0.5)),
+            })
+
+    kss_min = float(raw_cfg.get("kss_min", 1.0))
+    kss_max = float(raw_cfg.get("kss_max", 9.0))
+    overall_m, per_ds = _summarize_records(records, kss_min=kss_min, kss_max=kss_max)
     return {
         "checkpoint": str(ckpt_path),
-        "epoch": int(ckpt.get("epoch", -1)),
+        "epoch": best_ep,
         "split": split,
         "flags": {
-            "uta_reg_mode": cfg.uta_reg_mode,
-            "use_alert_boundary_margin": cfg.use_alert_boundary_margin,
-            "boundary_alert_max": cfg.boundary_alert_max,
-            "boundary_mid_min": cfg.boundary_mid_min,
-            "eye_vel_smooth": cfg.eye_vel_smooth,
-            "eye_y_scale_mode": cfg.eye_y_scale_mode,
-            "window_attn_weighted_logits": cfg.window_attn_weighted_logits,
-            "boundary_margin_weight": cfg.boundary_margin_weight,
-            "dann_weight": cfg.dann_weight,
+            "uta_reg_mode": raw_cfg.get("uta_reg_mode", "point"),
+            "use_alert_boundary_margin": bool(raw_cfg.get("use_alert_boundary_margin", False)),
+            "boundary_alert_max": float(raw_cfg.get("boundary_alert_max", 4.20)),
+            "boundary_mid_min": float(raw_cfg.get("boundary_mid_min", 4.70)),
+            "eye_vel_smooth": bool(raw_cfg.get("eye_vel_smooth", False)),
+            "eye_y_scale_mode": raw_cfg.get("eye_y_scale_mode", "v6"),
+            "window_attn_weighted_logits": bool(raw_cfg.get("window_attn_weighted_logits", False)),
+            "boundary_margin_weight": float(raw_cfg.get("boundary_margin_weight", 0.15)),
+            "dann_weight": float(raw_cfg.get("dann_weight", 0.15)),
         },
         "overall_metrics": overall_m,
         "per_dataset": per_ds,
         "records": records,
     }
+
+
+def _record_uid(r: Dict[str, Any], pos: int) -> str:
+    key = str(r.get("key", "")).strip()
+    if key:
+        return key
+    return f"{pos}:{r.get('dataset', '')}:{r.get('subject_id', '')}:{r.get('video_id', '')}"
+
+
+def _evaluate_ensemble(
+        split_results: List[Dict[str, Any]],
+        out_dir: Optional[Path],
+        split: str,
+        save_csv: bool = True,
+        print_report: bool = True,
+) -> Optional[Dict[str, Any]]:
+    """Tính dự đoán và chẩn đoán Ensemble trung bình đều từ >= 2 kết quả checkpoint."""
+    if len(split_results) < 2:
+        return None
+
+    run_names = [Path(r["checkpoint"]).parent.name for r in split_results]
+    maps = [{_record_uid(rec, idx): rec for idx, rec in enumerate(res["records"])} for res in split_results]
+    base_records = split_results[0]["records"]
+
+    ens_records: List[Dict[str, Any]] = []
+    for idx, r0 in enumerate(base_records):
+        uid = _record_uid(r0, idx)
+        matched = [m[uid] for m in maps if uid in m]
+        if len(matched) != len(split_results):
+            continue
+        p_mean = float(np.mean([float(m["pred_kss"]) for m in matched]))
+        dp_mean = float(np.mean([float(m.get("drowsy_prob", 0.5)) for m in matched]))
+        t_val = float(r0["target_kss"])
+        ens_records.append({
+            "key": r0.get("key", uid),
+            "dataset": r0["dataset"],
+            "subject_id": r0["subject_id"],
+            "video_id": r0["video_id"],
+            "domain_id": r0["domain_id"],
+            "target_kss": t_val,
+            "pred_kss": p_mean,
+            "abs_err": float(abs(p_mean - t_val)),
+            "drowsy_prob": dp_mean,
+        })
+
+    if not ens_records:
+        return None
+
+    overall_m, per_ds = _summarize_records(ens_records)
+    ens_res: Dict[str, Any] = {
+        "checkpoint": f"ENSEMBLE({'+'.join(run_names)})",
+        "members": run_names,
+        "epoch": -1,
+        "split": split,
+        "flags": {"ensemble_weights": f"uniform(1/{len(run_names)})"},
+        "overall_metrics": overall_m,
+        "per_dataset": per_ds,
+        "records": ens_records,
+    }
+    if print_report:
+        _print_report(ens_res)
+    if save_csv and out_dir is not None:
+        csv_name = f"ensemble_{'_'.join(run_names)}_{split}_preds.csv"
+        with open(out_dir / csv_name, "w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(ens_records[0].keys()))
+            writer.writeheader()
+            writer.writerows(ens_records)
+    return ens_res
 
 
 def _print_report(res: Dict[str, Any]) -> None:
@@ -470,13 +665,13 @@ def _compare_pair(base: Dict[str, Any], target: Dict[str, Any], out_dir: Path, s
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Chẩn đoán sai số & phân rã loss cho các checkpoint LiteFat_v1.")
+    parser = argparse.ArgumentParser(description="Chẩn đoán sai số, phân rã loss & Ensemble cho các checkpoint LiteFat_v1.")
     parser.add_argument(
         "--ckpts",
         nargs="+",
         default=[
-            "checkpoints/LiteFat_v1_novisual6/best.pt",
-            "checkpoints/LiteFat_v1_novisual7/best.pt",
+            "checkpoints/LiteFat_v1_novisual8/v8f/best.pt",
+            "checkpoints/LiteFat_v1_novisual8/v8b/best.pt",
         ],
         help="Danh sách đường dẫn checkpoint (.pt) cần chẩn đoán.",
     )
@@ -488,6 +683,12 @@ def main() -> None:
     parser.add_argument("--use-cache", dest="use_cache", action="store_true", default=None)
     parser.add_argument("--no-cache", dest="use_cache", action="store_false")
     parser.add_argument("--no-ema", action="store_true", help="Dùng model_state_dict thay vì ema_state_dict.")
+    parser.add_argument(
+        "--from-saved-preds",
+        action="store_true",
+        help="Đọc trực tiếp từ {ckpt_dir}/{split}_predictions.csv thay vì suy luận lại mô hình.",
+    )
+    parser.add_argument("--no-ensemble", action="store_true", help="Tắt đánh giá Ensemble khi có >= 2 checkpoint.")
     parser.add_argument("--out", type=str, default="./diagnose_out", help="Thư mục lưu báo cáo JSON/CSV.")
     args = parser.parse_args()
 
@@ -496,14 +697,20 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     full_report: Dict[str, Any] = {}
+    ensemble_report: Dict[str, Any] = {}
     for split in args.splits:
         split_results: List[Dict[str, Any]] = []
         for ckpt_str in args.ckpts:
             ckpt_path = Path(ckpt_str)
-            if not ckpt_path.is_file():
-                print(f"[SKIP] Không tìm thấy checkpoint: {ckpt_path}")
-                continue
-            res = evaluate_checkpoint_split(ckpt_path, split, args, device)
+            if args.from_saved_preds:
+                res = load_saved_predictions_split(ckpt_path, split)
+                if res is None:
+                    continue
+            else:
+                if not ckpt_path.is_file():
+                    print(f"[SKIP] Không tìm thấy checkpoint: {ckpt_path}")
+                    continue
+                res = evaluate_checkpoint_split(ckpt_path, split, args, device)
             split_results.append(res)
             _print_report(res)
 
@@ -519,11 +726,33 @@ def main() -> None:
             for i in range(1, len(split_results)):
                 _compare_pair(split_results[0], split_results[i], out_dir, split)
 
+            if not args.no_ensemble:
+                ens_list: List[Dict[str, Any]] = []
+                by_name = {Path(r["checkpoint"]).parent.name: r for r in split_results}
+                seen_groups: set[Tuple[str, ...]] = set()
+                # Tự động đánh giá cả các cặp v8 chủ chốt nếu cùng xuất hiện trong danh sách
+                for pair in (("v8f", "v8b"), ("v8f", "v8f_s7"), ("v8a", "v8b")):
+                    if pair[0] in by_name and pair[1] in by_name and len(split_results) > 2:
+                        seen_groups.add(pair)
+                        ens_sub = _evaluate_ensemble([by_name[pair[0]], by_name[pair[1]]], out_dir, split)
+                        if ens_sub is not None:
+                            ens_list.append({k: v for k, v in ens_sub.items() if k != "records"})
+                all_names = tuple(Path(r["checkpoint"]).parent.name for r in split_results)
+                if all_names not in seen_groups:
+                    ens_all = _evaluate_ensemble(split_results, out_dir, split)
+                    if ens_all is not None:
+                        ens_list.append({k: v for k, v in ens_all.items() if k != "records"})
+                if ens_list:
+                    ensemble_report[split] = ens_list
+
         # Lưu report không kèm list records dài dòng để dễ đọc JSON
         full_report[split] = [
             {k: v for k, v in r.items() if k != "records"}
             for r in split_results
         ]
+
+    if ensemble_report:
+        full_report["ensemble"] = ensemble_report
 
     report_path = out_dir / "diagnose_report.json"
     with open(report_path, "w", encoding="utf-8") as f:
